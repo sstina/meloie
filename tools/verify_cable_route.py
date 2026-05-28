@@ -1,29 +1,22 @@
-"""Stage 1 identity-path click-test latency tool.
+"""Stage 1 cable-route verification tool.
 
-Renders a short triangular click through the selected output device
-(default ``CABLE Input``) and captures from the selected input device
-(default ``CABLE Output``). Cross-correlates the captured signal
-against the rendered reference to estimate identity-path one-way
-latency from the click peak position.
+Renders a 440 Hz sine tone to the selected output device (default
+``CABLE Input``) while simultaneously capturing from the selected
+input device (default ``CABLE Output``). Confirms that the cable
+route is alive: the captured buffer must be non-silent.
 
-Hard rules:
-
-* sounddevice is imported lazily inside ``main()`` — importing this
-  module never touches hardware.
-* The capture device defaults to the VB-CABLE capture endpoint, which
-  is the *intended* loopback target for this diagnostic. The streams
-  layer's feedback-loop guard would normally refuse that selection, so
-  the click test passes ``allow_virtual_cable=True`` explicitly.
-* Reports are written ONLY when ``--save`` is given AND ``--report-dir``
-  is provided. The default report path (``eval_corpus/reports/...``)
-  is gitignored end-to-end.
+This is the through-cable transport check from the legacy validation
+ladder. It does NOT exercise the realtime identity worker — that is
+what ``python -m src.main --mode identity`` is for. It exercises the
+VB-CABLE pipe itself so that, when the identity worker is also alive,
+we know both halves are good.
 
 Run with::
 
-    python -m tools.click_test \\
+    python -m tools.verify_cable_route \\
         --output-device-substring "CABLE Input" \\
         --input-device-substring "CABLE Output" \\
-        --duration-seconds 2 --pulse-amplitude 0.5
+        --duration-seconds 2
 """
 
 from __future__ import annotations
@@ -39,8 +32,8 @@ from typing import List, Optional
 import numpy as np
 
 from src.audio.measurement import (
-    estimate_latency_samples,
-    generate_click_pulse,
+    DEFAULT_NON_SILENCE_THRESHOLD_DBFS,
+    generate_sine_tone,
     summarize_capture,
 )
 from src.audio.streams import resolve_input_device, resolve_output_device
@@ -48,23 +41,27 @@ from src.audio.streams import resolve_input_device, resolve_output_device
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="tvoice-click-test",
-        description="Measure identity-path latency via a click pulse.",
+        prog="tvoice-verify-cable-route",
+        description="Verify Python -> CABLE Input -> CABLE Output is non-silent.",
     )
     p.add_argument("--output-device-substring", default="CABLE Input")
     p.add_argument("--input-device-substring", default="CABLE Output")
     p.add_argument("--sample-rate", type=int, default=48000)
     p.add_argument(
         "--duration-seconds", type=float, default=2.0,
-        help="Total signal duration (pre-silence + click + post-silence).",
+        help="How long to render and capture the tone.",
     )
-    p.add_argument("--pulse-amplitude", type=float, default=0.5)
-    p.add_argument("--pre-silence-seconds", type=float, default=0.3)
-    p.add_argument("--click-samples", type=int, default=16)
+    p.add_argument("--frequency-hz", type=float, default=440.0)
+    p.add_argument("--amplitude", type=float, default=0.25)
+    p.add_argument(
+        "--threshold-dbfs", type=float,
+        default=DEFAULT_NON_SILENCE_THRESHOLD_DBFS,
+        help="Capture peak must exceed this for the route to be 'alive'.",
+    )
     p.add_argument(
         "--report-dir", default=None,
-        help="Directory for saved report (use a path under "
-             "eval_corpus/reports/ so the .gitignore covers it).",
+        help="Directory for saved report. Use a path under "
+             "eval_corpus/reports/ so the .gitignore covers it.",
     )
     p.add_argument(
         "--save", action="store_true",
@@ -99,9 +96,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     raw_devices = list(sd.query_devices())
 
-    # The click test deliberately captures from CABLE Output — that is
-    # the cable's capture endpoint and the legitimate loopback target
-    # here. Bypass the streams-layer feedback-loop guard explicitly.
     try:
         in_info = resolve_input_device(
             raw_devices, args.input_device_substring, allow_virtual_cable=True
@@ -117,24 +111,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
 
     sr = int(args.sample_rate)
-    pre_n = int(round(args.pre_silence_seconds * sr))
-    total_n = int(round(args.duration_seconds * sr))
-    post_n = max(0, total_n - pre_n - args.click_samples)
-
-    reference = generate_click_pulse(
+    tone = generate_sine_tone(
         sample_rate=sr,
-        pulse_amplitude=args.pulse_amplitude,
-        pre_silence_seconds=args.pre_silence_seconds,
-        post_silence_seconds=post_n / sr if sr > 0 else 0.0,
-        click_samples=args.click_samples,
+        duration_seconds=args.duration_seconds,
+        frequency_hz=args.frequency_hz,
+        amplitude=args.amplitude,
     )
-    play = reference.reshape(-1, 1).astype(np.float32)
+    play = tone.reshape(-1, 1).astype(np.float32)
 
     print(f"output device  [{out_info.index:>3}]: {out_info.name}")
     print(f"input device   [{in_info.index:>3}]: {in_info.name}")
     print(
-        f"sample_rate={sr} click_at_t={args.pre_silence_seconds:.3f}s "
-        f"({args.click_samples} samples) total_duration={args.duration_seconds:.2f}s"
+        f"sample_rate={sr} frequency_hz={args.frequency_hz:.1f} "
+        f"amplitude={args.amplitude:.3f} duration={args.duration_seconds:.2f}s"
     )
     print("rendering + capturing ...", flush=True)
 
@@ -148,17 +137,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     sd.wait()
     captured = np.asarray(captured_2d).reshape(-1)
 
-    lag_samples, peak_corr = estimate_latency_samples(reference, captured)
-    latency_ms = lag_samples / sr * 1000.0
-    summary = summarize_capture(captured)
+    summary = summarize_capture(captured, threshold_dbfs=args.threshold_dbfs)
 
     print("--- result ---")
-    print(f"  lag_samples         = {lag_samples}")
-    print(f"  latency_ms          = {latency_ms:.2f}")
-    print(f"  normalized_xcorr    = {peak_corr:.4f}")
     print(f"  captured_n_samples  = {summary['n_samples']}")
     print(f"  captured_peak_dbfs  = {summary['peak_dbfs']:.2f}")
     print(f"  captured_rms_dbfs   = {summary['rms_dbfs']:.2f}")
+    print(f"  threshold_dbfs      = {summary['threshold_dbfs']:.2f}")
     print(f"  non_silent          = {summary['non_silent']}")
 
     if args.save:
@@ -172,30 +157,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_dir = Path(args.report_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%dT%H%M%S")
-        wav_path = out_dir / f"click_test_{ts}.wav"
-        json_path = out_dir / f"click_test_{ts}.json"
+        wav_path = out_dir / f"verify_cable_{ts}.wav"
+        json_path = out_dir / f"verify_cable_{ts}.json"
         _write_wav(wav_path, captured, sr)
         payload = {
             "timestamp": ts,
             "sample_rate": sr,
-            "lag_samples": int(lag_samples),
-            "latency_ms": float(latency_ms),
-            "normalized_xcorr": float(peak_corr),
             "captured": summary,
             "input_device": {"index": in_info.index, "name": in_info.name},
             "output_device": {"index": out_info.index, "name": out_info.name},
             "config": {
-                "pulse_amplitude": args.pulse_amplitude,
-                "pre_silence_seconds": args.pre_silence_seconds,
-                "click_samples": args.click_samples,
+                "frequency_hz": args.frequency_hz,
+                "amplitude": args.amplitude,
                 "duration_seconds": args.duration_seconds,
+                "threshold_dbfs": args.threshold_dbfs,
             },
         }
         json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"saved: {wav_path}")
         print(f"saved: {json_path}")
 
-    return 0 if summary["non_silent"] else 5
+    return 0 if summary["non_silent"] else 6
 
 
 if __name__ == "__main__":  # pragma: no cover
