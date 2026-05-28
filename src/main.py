@@ -8,15 +8,17 @@ Subcommands / flags:
     --check-config PATH
         Load + validate a runtime JSON config and exit.
 
-    --mode identity --config PATH [--duration-seconds N]
-                                   [--input-device-substring STR]
-                                   [--output-device-substring STR]
-                                   [--allow-virtual-cable-input]
-        Run the Stage 1 realtime identity stream.
+    --mode identity --config PATH [...]
+        Stage 1 realtime identity stream.
+
+    --mode rvc --config PATH --model-path PATH [--index-path PATH] [...]
+        Stage 2 realtime RVC stream. Lazy-imports ``rvc_engine``;
+        a missing backend / model produces an actionable error before
+        any audio device is opened.
 
 Importing this module must NOT open audio devices and must NOT import
-``sounddevice``. The ``sounddevice`` import lives inside the streams
-layer's functions and only fires when audio is explicitly started.
+``sounddevice``, ``torch``, ``infer_rvc_python``, or ``rvc_engine``.
+Those imports live inside ``_cmd_mode_identity`` / ``_cmd_mode_rvc``.
 """
 
 from __future__ import annotations
@@ -29,51 +31,53 @@ from typing import List, Optional
 from .audio.streams import AudioRuntimeConfig
 
 
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tvoice-rvc",
-        description="Python realtime RVC voice changer (Stage 1).",
+        description="Python realtime RVC voice changer (Stage 1 + Stage 2).",
     )
-    parser.add_argument(
-        "--list-devices",
-        action="store_true",
-        help="List audio devices visible to sounddevice and exit.",
-    )
-    parser.add_argument(
-        "--check-config",
-        metavar="PATH",
-        help="Load and validate a runtime JSON config and exit.",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["identity"],
-        help="Run the realtime worker in the given mode.",
-    )
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        help="Runtime config JSON to use with --mode.",
-    )
-    parser.add_argument(
-        "--duration-seconds",
-        type=float,
-        default=None,
-        help="Stop the stream after N seconds. Omit to run until Ctrl+C.",
-    )
-    parser.add_argument(
-        "--input-device-substring",
-        help="Override the input device substring from the config.",
-    )
-    parser.add_argument(
-        "--output-device-substring",
-        help="Override the output device substring from the config.",
-    )
-    parser.add_argument(
-        "--allow-virtual-cable-input",
-        action="store_true",
-        help="Diagnostic only: allow the VB-CABLE capture endpoint as "
-             "the app's input. Risk of feedback loop with Discord/OBS.",
-    )
+    parser.add_argument("--list-devices", action="store_true",
+                        help="List audio devices visible to sounddevice and exit.")
+    parser.add_argument("--check-config", metavar="PATH",
+                        help="Load and validate a runtime JSON config and exit.")
+    parser.add_argument("--mode", choices=["identity", "rvc"],
+                        help="Run the realtime worker in the given mode.")
+    parser.add_argument("--config", metavar="PATH",
+                        help="Runtime config JSON to use with --mode.")
+    parser.add_argument("--duration-seconds", type=float, default=None,
+                        help="Stop the stream after N seconds. Omit to run until Ctrl+C.")
+    parser.add_argument("--input-device-substring",
+                        help="Override the input device substring from the config.")
+    parser.add_argument("--output-device-substring",
+                        help="Override the output device substring from the config.")
+    parser.add_argument("--allow-virtual-cable-input", action="store_true",
+                        help="Diagnostic only: allow VB-CABLE capture endpoint as input.")
+
+    # RVC-mode flags
+    rvc = parser.add_argument_group("RVC mode (--mode rvc)")
+    rvc.add_argument("--model-path", help="Path to RVC .pth model.")
+    rvc.add_argument("--index-path", default=None, help="Path to .index file (optional).")
+    rvc.add_argument("--backend", default="infer_rvc_python",
+                     help="RVC backend identifier (default: infer_rvc_python).")
+    rvc.add_argument("--f0-method", default="rmvpe")
+    rvc.add_argument("--index-rate", type=float, default=0.5)
+    rvc.add_argument("--protect", type=float, default=0.33)
+    rvc.add_argument("--filter-radius", type=int, default=3)
+    rvc.add_argument("--rms-mix-rate", type=float, default=0.25)
+    rvc.add_argument("--pitch-shift", type=int, default=0)
+    rvc.add_argument("--chunk-ms", type=float, default=180.0,
+                     help="RVC chunk size in milliseconds (default 180).")
+    rvc.add_argument("--crossfade-ms", type=float, default=20.0,
+                     help="Crossfade length at chunk boundaries (default 20; "
+                          "set 0 to disable, then expect occasional clicks "
+                          "until Stage 3 refines this).")
+    rvc.add_argument("--force-cpu", action="store_true",
+                     help="Force backend to CPU (skip CUDA).")
+
     return parser
 
 
@@ -95,6 +99,24 @@ def _load_config(path: str) -> AudioRuntimeConfig:
     )
     config.validate()
     return config
+
+
+def _apply_device_overrides(
+    config: AudioRuntimeConfig, args: argparse.Namespace
+) -> AudioRuntimeConfig:
+    in_sub = args.input_device_substring or config.input_device_substring
+    out_sub = args.output_device_substring or config.output_device_substring
+    if in_sub == config.input_device_substring and out_sub == config.output_device_substring:
+        return config
+    return AudioRuntimeConfig(
+        sample_rate=config.sample_rate,
+        block_size=config.block_size,
+        channels=config.channels,
+        input_device_substring=in_sub,
+        output_device_substring=out_sub,
+        queue_blocks=config.queue_blocks,
+        mode=config.mode,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,48 +157,31 @@ def _cmd_check_config(path: str) -> int:
     return 0
 
 
-def _cmd_mode_identity(args: argparse.Namespace) -> int:
+def _require_config(args: argparse.Namespace) -> Optional[AudioRuntimeConfig]:
     if not args.config:
         print(
-            "error: --mode identity requires --config PATH\n"
-            "example: python -m src.main --mode identity "
-            "--config config/runtime.example.json --duration-seconds 30",
+            f"error: --mode {args.mode} requires --config PATH\n"
+            "example: python -m src.main --mode identity --config "
+            "config/runtime.example.json --duration-seconds 30",
             file=sys.stderr,
         )
-        return 2
-
+        return None
     try:
-        config = _load_config(args.config)
+        return _load_config(args.config)
     except FileNotFoundError:
         print(f"error: config file not found: {args.config}", file=sys.stderr)
-        return 2
+        return None
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         print(f"error: invalid config in {args.config}: {exc}", file=sys.stderr)
+        return None
+
+
+def _cmd_mode_identity(args: argparse.Namespace) -> int:
+    config = _require_config(args)
+    if config is None:
         return 2
+    config = _apply_device_overrides(config, args)
 
-    # CLI overrides take precedence over the config file.
-    if args.input_device_substring:
-        config = AudioRuntimeConfig(
-            sample_rate=config.sample_rate,
-            block_size=config.block_size,
-            channels=config.channels,
-            input_device_substring=args.input_device_substring,
-            output_device_substring=config.output_device_substring,
-            queue_blocks=config.queue_blocks,
-            mode=config.mode,
-        )
-    if args.output_device_substring:
-        config = AudioRuntimeConfig(
-            sample_rate=config.sample_rate,
-            block_size=config.block_size,
-            channels=config.channels,
-            input_device_substring=config.input_device_substring,
-            output_device_substring=args.output_device_substring,
-            queue_blocks=config.queue_blocks,
-            mode=config.mode,
-        )
-
-    # Lazy import: hardware code is only reachable on this branch.
     from .audio.streams import run_identity_stream
     from .audio.devices import FeedbackLoopRisk
 
@@ -198,6 +203,82 @@ def _cmd_mode_identity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mode_rvc(args: argparse.Namespace) -> int:
+    config = _require_config(args)
+    if config is None:
+        return 2
+    config = _apply_device_overrides(config, args)
+
+    if not args.model_path:
+        print(
+            "error: --mode rvc requires --model-path /path/to/model.pth\n"
+            "Place local model files under models/local/ (gitignored).",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Lazy imports — engine pulls in numpy only at module load; the
+    # backend (torch + infer_rvc_python) is imported inside engine.load().
+    from .engine.rvc_engine import (
+        DependencyMissingError,
+        ModelLoadError,
+        RvcEngine,
+        RvcEngineConfig,
+        RvcInferenceError,
+    )
+    from .audio.devices import FeedbackLoopRisk
+    from .audio.streams import run_rvc_stream
+
+    rvc_config = RvcEngineConfig(
+        model_path=args.model_path,
+        index_path=args.index_path,
+        backend=args.backend,
+        f0_method=args.f0_method,
+        index_rate=args.index_rate,
+        protect=args.protect,
+        filter_radius=args.filter_radius,
+        rms_mix_rate=args.rms_mix_rate,
+        pitch_shift=args.pitch_shift,
+        sample_rate=config.sample_rate,
+        force_cpu=args.force_cpu,
+    )
+
+    engine = RvcEngine(rvc_config)
+    print(f"loading RVC backend={rvc_config.backend} ...")
+    try:
+        engine.load()
+    except DependencyMissingError as exc:
+        print(f"error: dependency missing: {exc}", file=sys.stderr)
+        return 10
+    except ModelLoadError as exc:
+        print(f"error: model load failed: {exc}", file=sys.stderr)
+        return 11
+    print("RVC engine loaded.")
+
+    try:
+        run_rvc_stream(
+            config,
+            engine=engine,
+            chunk_ms=args.chunk_ms,
+            crossfade_ms=args.crossfade_ms,
+            duration_seconds=args.duration_seconds,
+            allow_virtual_cable_input=args.allow_virtual_cable_input,
+        )
+    except FeedbackLoopRisk as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except LookupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 5
+    except RvcInferenceError as exc:
+        print(f"error: rvc inference fatal: {exc}", file=sys.stderr)
+        return 12
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -208,6 +289,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_check_config(args.check_config)
     if args.mode == "identity":
         return _cmd_mode_identity(args)
+    if args.mode == "rvc":
+        return _cmd_mode_rvc(args)
 
     parser.print_help()
     return 0

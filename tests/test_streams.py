@@ -119,6 +119,10 @@ def test_audio_runtime_config_rejects_three_channels():
         AudioRuntimeConfig(channels=3).validate()
 
 
+def test_audio_runtime_config_accepts_rvc_mode():
+    AudioRuntimeConfig(mode="rvc").validate()
+
+
 def test_audio_runtime_config_rejects_unknown_mode():
     with pytest.raises(ValueError):
-        AudioRuntimeConfig(mode="rvc").validate()
+        AudioRuntimeConfig(mode="totally_made_up").validate()

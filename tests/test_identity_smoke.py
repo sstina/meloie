@@ -168,26 +168,11 @@ def test_worker_loop_stop_event_exits_cleanly():
 
 
 # ---------------------------------------------------------------------------
-# RVC placeholders must fail loudly when called directly
+# RvcEngine is now Stage 2 (real adapter). The fallback-test path in the
+# identity worker still uses ``process_rvc`` -> NotImplementedError so the
+# identity-loop fallback semantics remain meaningful. The real engine
+# behaviour is covered by tests/test_rvc_engine.py + tests/test_rvc_worker.py.
 # ---------------------------------------------------------------------------
-
-def test_rvc_engine_infer_array_raises_not_implemented():
-    engine = RvcEngine()
-    block = np.zeros(1024, dtype=np.float32)
-    with pytest.raises(NotImplementedError) as excinfo:
-        engine.infer_array(block, sample_rate=48000)
-    assert (
-        "RVC inference is Stage 2 and is not implemented in this skeleton."
-        in str(excinfo.value)
-    )
-
-
-def test_rvc_engine_load_raises_not_implemented():
-    engine = RvcEngine()
-    assert engine.is_loaded is False
-    with pytest.raises(NotImplementedError):
-        engine.load()
-
 
 def test_worker_process_rvc_raises_not_implemented():
     block = np.zeros(480, dtype=np.float32)

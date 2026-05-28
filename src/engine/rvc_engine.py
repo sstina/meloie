@@ -1,57 +1,236 @@
-"""Stage 2 RVC engine placeholder.
+"""Stage 2 RVC engine adapter.
 
-This file deliberately does NOT import torch, infer_rvc_python, or
-rvc-python. Loading those is part of Stage 2 and is gated behind
-explicit Stage 2 work — this skeleton refuses to do it.
+Public surface:
 
-The class exists so callers and tests can refer to the future API
-surface; every operation that would require the real engine raises
-``NotImplementedError`` with the exact message demanded by the project
-plan.
+* ``RvcEngineConfig`` — paths, params, backend selection.
+* ``RvcEngine`` — ``load()`` + ``infer_array(audio, sample_rate)``.
+* Exceptions: ``DependencyMissingError``, ``ModelLoadError``,
+  ``RvcInferenceError``.
+
+Hard rules baked into this module:
+
+* No torch / infer_rvc_python imports at module load. The backend is
+  imported lazily inside the backend's ``load()`` method, so importing
+  this module is safe in CI / on machines without the RVC stack.
+* No disk I/O inside ``infer_array``. Input is a 1-D float32 numpy
+  array, output is a 1-D float32 numpy array; the realtime worker
+  feeds these directly.
+* If the backend or model is missing, fail with a clear actionable
+  exception rather than silently degrading or faking success.
+
+The preferred backend is `infer_rvc_python
+<https://github.com/r3gm/infer_rvc_python>`_ because it exposes
+``BaseLoader.generate_from_cache`` for in-memory array I/O — exactly
+what the realtime chunked worker needs. The adapter speaks to the
+documented public API:
+
+.. code-block:: python
+
+    from infer_rvc_python import BaseLoader
+    converter = BaseLoader(only_cpu=False, hubert_path=None, rmvpe_path=None)
+    converter.apply_conf(
+        tag=..., file_model=..., pitch_algo="rmvpe", pitch_lvl=0,
+        file_index=..., index_influence=0.5, respiration_median_filtering=3,
+        resample_sr=0, envelope_ratio=0.25, consonant_protection=0.33,
+    )
+    result_audio, result_sr = converter.generate_from_cache(
+        audio_data=(audio_array, sample_rate), tag=...,
+    )
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+import os
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import numpy as np
 
 
-_NOT_IMPLEMENTED_MSG = (
-    "RVC inference is Stage 2 and is not implemented in this skeleton."
-)
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
 
+class RvcEngineError(Exception):
+    """Base class for RVC engine errors."""
+
+
+class DependencyMissingError(RvcEngineError):
+    """The selected backend (e.g. ``infer_rvc_python``) is not installed."""
+
+
+class ModelLoadError(RvcEngineError):
+    """The model / index file is missing or could not be loaded."""
+
+
+class RvcInferenceError(RvcEngineError):
+    """A runtime inference call failed (CUDA OOM, NaN, backend exception)."""
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class RvcEngineConfig:
-    """Paths and parameters the future engine will use.
+    """Parameters the engine + backend need.
 
-    Storing them does not load anything; the engine constructor below
-    accepts a config and remembers it for the day Stage 2 lands.
+    Defaults match the starting points recommended in ``rvc.md`` and
+    the legacy dossier. They are deliberately conservative — tune
+    them per model after the realtime route works end-to-end.
     """
 
-    model_pth_path: Optional[str] = None
+    model_path: str = ""
     index_path: Optional[str] = None
-    sample_rate: int = 48000
+    backend: str = "infer_rvc_python"
     f0_method: str = "rmvpe"
     index_rate: float = 0.5
     protect: float = 0.33
-    chunk_ms: int = 160
+    filter_radius: int = 3
+    rms_mix_rate: float = 0.25
+    pitch_shift: int = 0
+    sample_rate: Optional[int] = None      # informational; backend decides
+    resample_sr: int = 0                   # 0 = let backend pick
+    force_cpu: bool = False
+    backend_tag: str = "tvoice_default"    # opaque label for backend cache
 
+    def validate(self) -> None:
+        if not (0.0 <= self.index_rate <= 1.0):
+            raise ValueError(f"index_rate must be in [0, 1]; got {self.index_rate}")
+        if not (0.0 <= self.protect <= 0.5):
+            raise ValueError(f"protect must be in [0, 0.5]; got {self.protect}")
+        if self.filter_radius < 0:
+            raise ValueError("filter_radius must be >= 0")
+        if not (0.0 <= self.rms_mix_rate <= 1.0):
+            raise ValueError(f"rms_mix_rate must be in [0, 1]; got {self.rms_mix_rate}")
+        if self.f0_method not in ("rmvpe", "rmvpe+", "fcpe", "crepe", "harvest", "pm"):
+            # Unknown methods may still work with the backend, but flag
+            # the common-typo case loudly.
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Backend abstraction
+# ---------------------------------------------------------------------------
+
+class RvcBackend:
+    """Abstract backend interface. One concrete impl per RVC library."""
+
+    name = "abstract"
+
+    def load(self, config: RvcEngineConfig) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def infer(
+        self, audio: np.ndarray, sample_rate: int
+    ) -> Tuple[np.ndarray, int]:  # pragma: no cover
+        raise NotImplementedError
+
+
+class _InferRvcPythonBackend(RvcBackend):
+    """Adapter for the ``infer_rvc_python`` library (preferred)."""
+
+    name = "infer_rvc_python"
+
+    def __init__(self) -> None:
+        self._converter = None
+
+    def load(self, config: RvcEngineConfig) -> None:
+        try:
+            from infer_rvc_python import BaseLoader  # noqa: WPS433
+        except ImportError as exc:  # backend not installed
+            raise DependencyMissingError(
+                "infer_rvc_python is not installed. Install it (and a "
+                "GPU-enabled torch build) with:\n"
+                "  pip install infer-rvc-python\n"
+                "Then retry."
+            ) from exc
+
+        if not config.model_path or not os.path.exists(config.model_path):
+            raise ModelLoadError(
+                f"model_path missing or not found: {config.model_path!r}.\n"
+                "Place local model files under models/local/ (gitignored) "
+                "and pass the full path."
+            )
+        if config.index_path and not os.path.exists(config.index_path):
+            raise ModelLoadError(
+                f"index_path not found: {config.index_path!r}"
+            )
+
+        try:
+            self._converter = BaseLoader(only_cpu=bool(config.force_cpu))
+            self._converter.apply_conf(
+                tag=config.backend_tag,
+                file_model=config.model_path,
+                pitch_algo=config.f0_method,
+                pitch_lvl=int(config.pitch_shift),
+                file_index=config.index_path or "",
+                index_influence=float(config.index_rate),
+                respiration_median_filtering=int(config.filter_radius),
+                resample_sr=int(config.resample_sr or 0),
+                envelope_ratio=float(config.rms_mix_rate),
+                consonant_protection=float(config.protect),
+            )
+        except Exception as exc:  # backend raised during config/load
+            raise ModelLoadError(
+                f"infer_rvc_python failed to load model: {exc}"
+            ) from exc
+
+    def infer(
+        self, audio: np.ndarray, sample_rate: int
+    ) -> Tuple[np.ndarray, int]:
+        if self._converter is None:
+            raise RvcInferenceError(
+                "backend not loaded; call RvcEngine.load() first"
+            )
+        try:
+            result_audio, result_sr = self._converter.generate_from_cache(
+                audio_data=(audio, int(sample_rate)),
+                tag=None,
+            )
+        except Exception as exc:
+            raise RvcInferenceError(
+                f"infer_rvc_python inference failed: {exc}"
+            ) from exc
+        out = np.asarray(result_audio).reshape(-1).astype(np.float32, copy=False)
+        return out, int(result_sr)
+
+
+# Registry of known backends. Tests / advanced users can register fakes
+# via :func:`register_backend`.
+_BACKENDS = {
+    "infer_rvc_python": _InferRvcPythonBackend,
+}
+
+
+def register_backend(name: str, factory) -> None:
+    """Register a backend factory keyed by ``RvcEngineConfig.backend``."""
+    if not callable(factory):
+        raise TypeError("factory must be callable returning an RvcBackend")
+    _BACKENDS[str(name)] = factory
+
+
+# ---------------------------------------------------------------------------
+# RvcEngine
+# ---------------------------------------------------------------------------
 
 class RvcEngine:
-    """Placeholder for the Stage 2 RVC engine.
+    """High-level RVC engine.
 
-    The constructor records config only. No model is loaded, no torch
-    import happens, no file is read. ``infer_array`` raises with the
-    Stage 2 sentinel message so any code path that reaches it during
-    Stage 1 fails loudly instead of silently doing nothing.
+    Construction is cheap and side-effect free. ``load()`` does the
+    heavy lifting; ``infer_array()`` runs one inference on a 1-D mono
+    float32 array.
     """
 
-    def __init__(self, config: Optional[RvcEngineConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[RvcEngineConfig] = None,
+        backend: Optional[RvcBackend] = None,
+    ) -> None:
         self._config = config or RvcEngineConfig()
-        self._loaded = False
+        self._config.validate()
+        self._backend = backend
+        self._loaded = backend is not None and getattr(backend, "_loaded_marker", False)
 
     @property
     def config(self) -> RvcEngineConfig:
@@ -61,9 +240,43 @@ class RvcEngine:
     def is_loaded(self) -> bool:
         return self._loaded
 
-    def load(self) -> None:
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+    @property
+    def backend_name(self) -> str:
+        if self._backend is not None:
+            return getattr(self._backend, "name", "custom")
+        return self._config.backend
 
-    def infer_array(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        """Will run RVC inference on ``audio`` at ``sample_rate`` once Stage 2 lands."""
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+    def load(self) -> None:
+        if self._loaded:
+            return
+        if self._backend is None:
+            factory = _BACKENDS.get(self._config.backend)
+            if factory is None:
+                raise DependencyMissingError(
+                    f"unknown RVC backend: {self._config.backend!r}. "
+                    f"Known: {sorted(_BACKENDS.keys())}"
+                )
+            self._backend = factory()
+        self._backend.load(self._config)
+        self._loaded = True
+
+    def infer_array(
+        self, audio: np.ndarray, sample_rate: int
+    ) -> Tuple[np.ndarray, int]:
+        if not self._loaded:
+            raise RvcInferenceError(
+                "engine not loaded; call RvcEngine.load() first"
+            )
+        if not isinstance(audio, np.ndarray):
+            raise TypeError(
+                f"audio must be a numpy array, got {type(audio).__name__}"
+            )
+        if audio.ndim != 1:
+            raise ValueError(
+                f"audio must be 1-D mono, got shape {audio.shape}"
+            )
+        if int(sample_rate) <= 0:
+            raise ValueError("sample_rate must be > 0")
+
+        audio_f32 = audio.astype(np.float32, copy=False)
+        return self._backend.infer(audio_f32, int(sample_rate))

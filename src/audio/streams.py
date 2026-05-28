@@ -1,40 +1,36 @@
-"""Realtime audio stream layer (Stage 1 identity passthrough).
+"""Realtime audio stream layer.
 
-Architecture:
-
-    physical microphone
-       -> sounddevice InputStream (callback, non-blocking)
-       -> in_queue (bounded)
-       -> worker thread (identity in Stage 1, RVC in Stage 2)
-       -> out_queue (bounded)
-       -> sounddevice OutputStream (callback, non-blocking)
-       -> CABLE Input
+Stage 1 ``run_identity_stream`` and Stage 2 ``run_rvc_stream`` share
+the same audio plumbing — the only difference is which worker thread
+is started. The shared core lives in ``_run_stream``; mode-specific
+metadata + the worker-startup callable are injected by the two public
+entry points.
 
 Hard rules baked into this module:
 
-  * Importing this module must NOT import sounddevice. The import is
-    lazy and lives inside the functions that actually touch hardware.
-  * Audio callbacks must never block. They do put_nowait/get_nowait
-    only; the worker thread does any meaningful work.
-  * The input device must be a physical microphone. The output device
-    must be ``CABLE Input``. Selecting ``CABLE Output`` for either side
-    is refused (it would feed the cable's capture endpoint back to its
-    render endpoint via Discord/OBS — a feedback loop).
-  * No system / device defaults are changed; no settings are written.
+* Importing this module must NOT import sounddevice. The import is
+  lazy and lives inside the functions that actually touch hardware.
+* Audio callbacks must never block. They do put_nowait/get_nowait
+  only; the worker thread does any meaningful work.
+* The input device must be a physical microphone. The output device
+  must be ``CABLE Input``. ``CABLE Output`` is refused for both sides
+  unless the diagnostic override is set.
+* No system / device defaults are changed.
 """
 
 from __future__ import annotations
 
+import os
 import queue
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, List, Mapping, Optional
+from typing import Callable, Iterable, List, Mapping, Optional
 
 import numpy as np
 
-from ..safety.guard import dbfs_peak, dbfs_rms, scrub_nan_inf
+from ..safety.guard import dbfs_peak, dbfs_rms
 from ..safety.metrics import RuntimeMetrics
 from .devices import (
     AudioDeviceInfo,
@@ -46,7 +42,6 @@ from .devices import (
 )
 
 
-# Sentinel placed on the input queue to tell the worker thread to exit.
 _SHUTDOWN_SENTINEL = object()
 
 
@@ -74,9 +69,9 @@ class AudioRuntimeConfig:
             raise ValueError("channels must be 1 or 2")
         if self.queue_blocks <= 0:
             raise ValueError("queue_blocks must be > 0")
-        if self.mode not in ("identity", "rvc_not_implemented"):
+        if self.mode not in ("identity", "rvc", "rvc_not_implemented"):
             raise ValueError(
-                f"mode must be 'identity' or 'rvc_not_implemented', "
+                f"mode must be 'identity', 'rvc', or 'rvc_not_implemented', "
                 f"got {self.mode!r}"
             )
 
@@ -92,29 +87,22 @@ class StreamStatusSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# Lazy enumeration helpers (sounddevice imported only when called)
+# Lazy enumeration helpers
 # ---------------------------------------------------------------------------
 
 def list_audio_devices() -> List[AudioDeviceInfo]:
-    """Return wrapped ``AudioDeviceInfo`` records for the host.
-
-    Lazy-imports ``sounddevice``; raises ``RuntimeError`` with a clear
-    message if it is not installed.
-    """
     try:
-        import sounddevice as sd  # noqa: WPS433  (deliberately lazy)
+        import sounddevice as sd  # noqa: WPS433
     except ImportError as exc:  # pragma: no cover  - env-dependent
         raise RuntimeError(
             "sounddevice is not installed; cannot enumerate devices. "
             "Install it with `pip install sounddevice` when ready."
         ) from exc
-
     raw = sd.query_devices()
     return list(iter_device_infos(raw))
 
 
 def describe_devices() -> str:
-    """Human-readable device listing. Lazy-imports ``sounddevice``."""
     infos = list_audio_devices()
     lines = ["index  in  out  name"]
     for info in infos:
@@ -128,7 +116,7 @@ def describe_devices() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Device-resolution helpers (pure; tests use these with fake device lists)
+# Pure device-resolution helpers
 # ---------------------------------------------------------------------------
 
 def resolve_input_device(
@@ -136,13 +124,6 @@ def resolve_input_device(
     substring: str,
     allow_virtual_cable: bool = False,
 ) -> AudioDeviceInfo:
-    """Pick an input device by substring.
-
-    By default refuses ``CABLE Output`` (the VB-CABLE capture endpoint)
-    as the app's microphone — using it would loop Discord's outbound
-    audio back into the app. ``allow_virtual_cable=True`` is the
-    diagnostic override used only for offline through-cable validation.
-    """
     if allow_virtual_cable:
         needle = normalize_device_name(substring)
         if not needle:
@@ -161,11 +142,6 @@ def resolve_output_device(
     devices: Iterable[Mapping],
     substring: str,
 ) -> AudioDeviceInfo:
-    """Pick an output device by substring, refusing ``CABLE Output``.
-
-    The app must render to ``CABLE Input`` (the cable's render
-    endpoint), not ``CABLE Output`` (the cable's capture endpoint).
-    """
     info = select_device_by_substring(devices, substring, kind="output")
     if is_probable_cable_output(info.name):
         raise FeedbackLoopRisk(
@@ -177,60 +153,86 @@ def resolve_output_device(
 
 
 # ---------------------------------------------------------------------------
-# Realtime identity stream
+# Shared stream runner
 # ---------------------------------------------------------------------------
 
-def _print_metrics_line(
-    metrics: RuntimeMetrics,
-    in_q: "queue.Queue",
-    out_q: "queue.Queue",
-) -> None:
-    print(
+def _print_metrics_line(metrics, in_q, out_q, mode_label: str) -> None:
+    base = (
         f"[{metrics.elapsed_seconds:6.1f}s] "
-        f"in={metrics.input_frames:>9d}f "
-        f"out={metrics.output_frames:>9d}f "
+        f"in={metrics.input_frames:>9d}f out={metrics.output_frames:>9d}f "
         f"qin={in_q.qsize():>3d} qout={out_q.qsize():>3d} "
         f"drop(in={metrics.input_queue_drops},out={metrics.output_queue_drops}) "
         f"under={metrics.output_underruns} "
-        f"in_pk={metrics.input_peak_dbfs:6.1f}dB "
-        f"in_rms={metrics.input_rms_dbfs:6.1f}dB "
-        f"out_pk={metrics.output_peak_dbfs:6.1f}dB "
-        f"out_rms={metrics.output_rms_dbfs:6.1f}dB "
-        f"fb={metrics.fallback_count} "
-        f"nan={metrics.nan_inf_scrub_count} "
-        f"status(in={metrics.input_status_flag_count},out={metrics.output_status_flag_count})",
-        flush=True,
+        f"in_pk={metrics.input_peak_dbfs:6.1f}dB out_pk={metrics.output_peak_dbfs:6.1f}dB "
+        f"fb={metrics.fallback_count} nan={metrics.nan_inf_scrub_count} "
+        f"st(in={metrics.input_status_flag_count},out={metrics.output_status_flag_count})"
     )
+    if mode_label == "rvc":
+        base += (
+            f" rvc_n={metrics.rvc_chunks_processed} "
+            f"infer_last={metrics.rvc_inference_last_ms:5.1f}ms "
+            f"mean={metrics.rvc_inference_mean_ms:5.1f}ms "
+            f"max={metrics.rvc_inference_max_ms:5.1f}ms "
+            f"rfb={metrics.rvc_fallback_count}"
+        )
+    print(base, flush=True)
 
 
-def run_identity_stream(
+def _print_summary(
+    metrics, input_info: AudioDeviceInfo, output_info: AudioDeviceInfo, mode_label: str
+) -> None:
+    print("\n--- final summary ---")
+    print(f"mode                     = {mode_label}")
+    print(f"elapsed_seconds          = {metrics.elapsed_seconds:.2f}")
+    print(f"input_frames             = {metrics.input_frames}")
+    print(f"output_frames            = {metrics.output_frames}")
+    print(f"input_queue_drops        = {metrics.input_queue_drops}")
+    print(f"output_queue_drops       = {metrics.output_queue_drops}")
+    print(f"output_underruns         = {metrics.output_underruns}")
+    print(f"fallback_count           = {metrics.fallback_count}")
+    print(f"nan_inf_scrub_count      = {metrics.nan_inf_scrub_count}")
+    print(f"input_status_flag_count  = {metrics.input_status_flag_count}")
+    print(f"output_status_flag_count = {metrics.output_status_flag_count}")
+    print(f"input_device             = [{input_info.index}] {input_info.name}")
+    print(f"output_device            = [{output_info.index}] {output_info.name}")
+    if mode_label == "rvc":
+        print(f"rvc_chunks_processed     = {metrics.rvc_chunks_processed}")
+        print(f"rvc_inference_count      = {metrics.rvc_inference_count}")
+        print(f"rvc_inference_mean_ms    = {metrics.rvc_inference_mean_ms:.2f}")
+        print(f"rvc_inference_max_ms     = {metrics.rvc_inference_max_ms:.2f}")
+        print(f"rvc_fallback_count       = {metrics.rvc_fallback_count}")
+        print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")
+        print(f"crossfade_ms             = {metrics.rvc_crossfade_ms}")
+        print(f"model                    = {metrics.rvc_model_basename or '(none)'}")
+        print(f"index                    = {metrics.rvc_index_basename or '(none)'}")
+        print(f"f0_method                = {metrics.rvc_f0_method}")
+        print(f"index_rate               = {metrics.rvc_index_rate}")
+        print(f"protect                  = {metrics.rvc_protect}")
+        print(f"pitch_shift              = {metrics.rvc_pitch_shift}")
+
+
+def _run_stream(
     config: AudioRuntimeConfig,
-    duration_seconds: Optional[float] = None,
-    allow_virtual_cable_input: bool = False,
-    metrics_interval_seconds: float = 1.0,
+    worker_factory: Callable,
+    mode_label: str,
+    duration_seconds: Optional[float],
+    allow_virtual_cable_input: bool,
+    metrics_interval_seconds: float,
+    intro_extra: Optional[List[str]] = None,
 ) -> RuntimeMetrics:
-    """Open the realtime identity audio loop and run it.
-
-    Blocks until ``duration_seconds`` elapses, the user presses Ctrl+C,
-    or an unrecoverable error occurs. Returns the final
-    :class:`RuntimeMetrics` snapshot so the CLI (or a future test
-    harness) can persist or print it.
-    """
     config.validate()
     if duration_seconds is not None and duration_seconds <= 0:
         raise ValueError("duration_seconds must be > 0 or None for unbounded")
 
-    # Lazy hardware imports — only happen when we actually start audio.
     try:
         import sounddevice as sd  # noqa: WPS433
-    except ImportError as exc:  # pragma: no cover  - env-dependent
+    except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "sounddevice is not installed; cannot run realtime stream. "
             "Install with `pip install sounddevice`."
         ) from exc
 
     raw_devices = list(sd.query_devices())
-
     input_info = resolve_input_device(
         raw_devices,
         config.input_device_substring,
@@ -245,8 +247,11 @@ def run_identity_stream(
         f"output device [{output_info.index:>3}]: {output_info.name}\n"
         f"sample_rate={config.sample_rate} block_size={config.block_size} "
         f"channels={config.channels} queue_blocks={config.queue_blocks} "
-        f"mode={config.mode}"
+        f"mode={mode_label}"
     )
+    if intro_extra:
+        for line in intro_extra:
+            print(line)
     if allow_virtual_cable_input:
         print(
             "WARNING: --allow-virtual-cable-input is ON. Diagnostic mode "
@@ -258,15 +263,10 @@ def run_identity_stream(
     metrics = RuntimeMetrics()
     stop_event = threading.Event()
 
-    # ---- Input callback (audio thread) -------------------------------
     def in_callback(indata, frames, time_info, status):  # noqa: ANN001
         if status:
             metrics.input_status_flag_count += 1
-        # indata is (frames, channels); take mono and copy (the buffer
-        # is reused by PortAudio).
         block = indata[:, 0].astype(np.float32, copy=True)
-        # Cheap level read for monitoring; np.max(abs) on ~480 samples
-        # is negligible vs the audio thread budget.
         metrics.input_peak_dbfs = dbfs_peak(block)
         metrics.input_rms_dbfs = dbfs_rms(block)
         metrics.input_frames += int(frames)
@@ -275,7 +275,6 @@ def run_identity_stream(
         except queue.Full:
             metrics.input_queue_drops += 1
 
-    # ---- Output callback (audio thread) ------------------------------
     def out_callback(outdata, frames, time_info, status):  # noqa: ANN001
         if status:
             metrics.output_status_flag_count += 1
@@ -297,19 +296,8 @@ def run_identity_stream(
         metrics.output_rms_dbfs = dbfs_rms(block[:n])
         metrics.output_frames += int(frames)
 
-    # ---- Worker thread -----------------------------------------------
-    from ..engine.worker import WorkerConfig, WorkerMode, worker_loop
+    worker_thread = worker_factory(in_q, out_q, metrics, stop_event, _SHUTDOWN_SENTINEL)
 
-    worker_config = WorkerConfig(mode=WorkerMode.IDENTITY)
-    worker_thread = threading.Thread(
-        target=worker_loop,
-        args=(worker_config, in_q, out_q, metrics, stop_event, _SHUTDOWN_SENTINEL),
-        name="identity-worker",
-        daemon=True,
-    )
-
-    # Try latency='low' first; fall back to default on TypeError-shaped
-    # backend issues. ``with`` ensures clean teardown even on Ctrl+C.
     common = dict(
         samplerate=config.sample_rate,
         channels=config.channels,
@@ -319,7 +307,6 @@ def run_identity_stream(
     )
 
     start_wall = time.monotonic()
-    worker_thread.start()
     try:
         with sd.InputStream(
             device=input_info.index, callback=in_callback, **common
@@ -334,7 +321,7 @@ def run_identity_stream(
                 if duration_seconds is not None and metrics.elapsed_seconds >= duration_seconds:
                     break
                 if now - last_print >= metrics_interval_seconds:
-                    _print_metrics_line(metrics, in_q, out_q)
+                    _print_metrics_line(metrics, in_q, out_q, mode_label)
                     last_print = now
                 time.sleep(0.05)
     except KeyboardInterrupt:
@@ -342,31 +329,133 @@ def run_identity_stream(
         print("\nKeyboardInterrupt — stopping.", file=sys.stderr, flush=True)
     finally:
         stop_event.set()
-        # Push sentinel so the worker can wake from a get() blocking on
-        # an empty queue. Best-effort — if the queue is full, drop it;
-        # stop_event will cause the worker to exit at the next poll.
         try:
             in_q.put_nowait(_SHUTDOWN_SENTINEL)
         except queue.Full:
             pass
         worker_thread.join(timeout=2.0)
         metrics.elapsed_seconds = time.monotonic() - start_wall
-        _print_metrics_line(metrics, in_q, out_q)
-        print(
-            "\n--- final summary ---\n"
-            f"elapsed_seconds         = {metrics.elapsed_seconds:.2f}\n"
-            f"input_frames            = {metrics.input_frames}\n"
-            f"output_frames           = {metrics.output_frames}\n"
-            f"input_queue_drops       = {metrics.input_queue_drops}\n"
-            f"output_queue_drops      = {metrics.output_queue_drops}\n"
-            f"output_underruns        = {metrics.output_underruns}\n"
-            f"fallback_count          = {metrics.fallback_count}\n"
-            f"nan_inf_scrub_count     = {metrics.nan_inf_scrub_count}\n"
-            f"input_status_flag_count = {metrics.input_status_flag_count}\n"
-            f"output_status_flag_count= {metrics.output_status_flag_count}\n"
-            f"input_device            = [{input_info.index}] {input_info.name}\n"
-            f"output_device           = [{output_info.index}] {output_info.name}",
-            flush=True,
-        )
+        _print_metrics_line(metrics, in_q, out_q, mode_label)
+        _print_summary(metrics, input_info, output_info, mode_label)
 
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+def run_identity_stream(
+    config: AudioRuntimeConfig,
+    duration_seconds: Optional[float] = None,
+    allow_virtual_cable_input: bool = False,
+    metrics_interval_seconds: float = 1.0,
+) -> RuntimeMetrics:
+    """Open the realtime identity audio loop and run it."""
+
+    def factory(in_q, out_q, metrics, stop_event, sentinel):
+        from ..engine.worker import WorkerConfig, WorkerMode, worker_loop
+        wc = WorkerConfig(mode=WorkerMode.IDENTITY)
+        t = threading.Thread(
+            target=worker_loop,
+            args=(wc, in_q, out_q, metrics, stop_event, sentinel),
+            name="identity-worker",
+            daemon=True,
+        )
+        t.start()
+        return t
+
+    return _run_stream(
+        config, factory, "identity",
+        duration_seconds, allow_virtual_cable_input, metrics_interval_seconds,
+    )
+
+
+def run_rvc_stream(
+    config: AudioRuntimeConfig,
+    engine,
+    chunk_ms: float,
+    crossfade_ms: float = 0.0,
+    duration_seconds: Optional[float] = None,
+    allow_virtual_cable_input: bool = False,
+    metrics_interval_seconds: float = 1.0,
+) -> RuntimeMetrics:
+    """Open the realtime RVC chunk loop and run it.
+
+    The caller owns ``engine`` and must have already called
+    ``engine.load()`` (so that any DependencyMissing / ModelLoad
+    failure happens *before* we touch any audio device).
+    """
+    if engine is None:
+        raise ValueError("engine must be provided for run_rvc_stream")
+    if not getattr(engine, "is_loaded", False):
+        raise RuntimeError(
+            "engine.load() must be called before run_rvc_stream (so model "
+            "/ dependency errors fail before any audio device opens)."
+        )
+    if chunk_ms <= 0:
+        raise ValueError("chunk_ms must be > 0")
+    if crossfade_ms < 0:
+        raise ValueError("crossfade_ms must be >= 0")
+
+    chunk_size = max(1, int(round(chunk_ms / 1000.0 * config.sample_rate)))
+    crossfade_size = max(0, int(round(crossfade_ms / 1000.0 * config.sample_rate)))
+    output_block_size = int(config.block_size)
+
+    model_basename = os.path.basename(engine.config.model_path or "")
+    index_basename = (
+        os.path.basename(engine.config.index_path) if engine.config.index_path else ""
+    )
+
+    intro_extra = [
+        f"chunk_ms={chunk_ms:.1f} ({chunk_size} samples)  "
+        f"crossfade_ms={crossfade_ms:.1f} ({crossfade_size} samples)",
+        f"model={model_basename or '(none)'}  "
+        f"index={index_basename or '(none)'}  "
+        f"backend={engine.backend_name}",
+        f"f0_method={engine.config.f0_method}  "
+        f"index_rate={engine.config.index_rate}  "
+        f"protect={engine.config.protect}  "
+        f"pitch_shift={engine.config.pitch_shift}  "
+        f"filter_radius={engine.config.filter_radius}  "
+        f"rms_mix_rate={engine.config.rms_mix_rate}",
+    ]
+    if crossfade_size == 0:
+        intro_extra.append(
+            "NOTE: crossfade_ms=0 — chunk-boundary clicks possible "
+            "(Stage 3 will refine; current safety: identity fallback on error)."
+        )
+
+    def factory(in_q, out_q, metrics, stop_event, sentinel):
+        from ..engine.worker import rvc_worker_loop
+        # Seed session metadata into metrics so the summary has it even
+        # if the run is short.
+        metrics.rvc_chunk_ms = float(chunk_ms)
+        metrics.rvc_crossfade_ms = float(crossfade_ms)
+        metrics.rvc_model_basename = model_basename
+        metrics.rvc_index_basename = index_basename
+        metrics.rvc_f0_method = engine.config.f0_method
+        metrics.rvc_index_rate = float(engine.config.index_rate)
+        metrics.rvc_protect = float(engine.config.protect)
+        metrics.rvc_pitch_shift = int(engine.config.pitch_shift)
+
+        t = threading.Thread(
+            target=rvc_worker_loop,
+            args=(engine, in_q, out_q, metrics, stop_event, sentinel),
+            kwargs={
+                "sample_rate": int(config.sample_rate),
+                "chunk_size": int(chunk_size),
+                "output_block_size": int(output_block_size),
+                "crossfade_size": int(crossfade_size),
+            },
+            name="rvc-worker",
+            daemon=True,
+        )
+        t.start()
+        return t
+
+    return _run_stream(
+        config, factory, "rvc",
+        duration_seconds, allow_virtual_cable_input, metrics_interval_seconds,
+        intro_extra=intro_extra,
+    )
