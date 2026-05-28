@@ -1,0 +1,25 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+*.pyo
+*.pyd
+
+# generated audio / reports / models / logs — never commit
+eval_corpus/reports/
+models/local/
+*.wav
+*.flac
+*.mp3
+*.jsonl
+*.log
+*.pt
+*.pth
+*.index
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+{
+  "sample_rate": 48000,
+  "block_size": 480,
+  "channels": 1,
+  "input_device_substring": "Microphone",
+  "output_device_substring": "CABLE Input",
+  "queue_blocks": 64,
+  "mode": "identity",
+  "safety": {
+    "limiter_enabled": true,
+    "limiter_ceiling_dbfs": -1.0
+  },
+  "rvc": {
+    "enabled": false,
+    "note": "Stage 2 placeholder. RVC inference is not implemented in this skeleton."
+  }
+}
