@@ -44,6 +44,7 @@ class RuntimeMetrics:
 
     # queue health
     input_queue_drops: int = 0
+    output_queue_drops: int = 0
     output_underruns: int = 0
 
     # levels (filled in periodically from safety.guard helpers)
@@ -58,8 +59,10 @@ class RuntimeMetrics:
     clip_count: int = 0
     limiter_engagement_count: int = 0
 
-    # device health
+    # device + callback health
     device_invalidation_count: int = 0
+    input_status_flag_count: int = 0
+    output_status_flag_count: int = 0
 
     # free-form notes appended over the session (kept short / non-PII)
     notes: list = field(default_factory=list)

@@ -1,16 +1,21 @@
 """Stage 1 identity smoke test + import-safety guard.
 
-This test protects two invariants that the rest of the project relies on:
+This test protects three invariants that the rest of the project
+relies on:
 
 1. The Stage 1 identity worker is a true passthrough.
-2. Importing the top-level ``src.main`` CLI does not open any audio
-   devices (it must be safe to import in test runners, CI, GUIs, etc.).
+2. The worker loop drains an input queue, processes via identity, and
+   emits to an output queue without opening audio devices.
+3. Importing the top-level ``src.main`` CLI does not open any audio
+   devices and does not import ``sounddevice``.
 """
 
 from __future__ import annotations
 
 import importlib
+import queue
 import sys
+import threading
 
 import numpy as np
 import pytest
@@ -25,10 +30,11 @@ from src.engine.worker import (
     process_rvc,
     worker_loop,
 )
+from src.safety.metrics import RuntimeMetrics
 
 
 # ---------------------------------------------------------------------------
-# Identity worker
+# Identity worker (pure function)
 # ---------------------------------------------------------------------------
 
 def test_identity_processing_returns_equivalent_audio():
@@ -53,7 +59,116 @@ def test_identity_processing_rejects_non_array():
 
 
 # ---------------------------------------------------------------------------
-# RVC placeholders must fail loudly
+# worker_loop end-to-end (with fake queues, no audio hardware)
+# ---------------------------------------------------------------------------
+
+SENTINEL = object()
+
+
+def _drain(q: "queue.Queue"):
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
+def test_worker_loop_identity_passthrough_via_queues():
+    in_q: "queue.Queue" = queue.Queue(maxsize=8)
+    out_q: "queue.Queue" = queue.Queue(maxsize=8)
+    metrics = RuntimeMetrics()
+    stop_event = threading.Event()
+
+    rng = np.random.default_rng(1)
+    block_a = rng.standard_normal(480).astype(np.float32)
+    block_b = rng.standard_normal(480).astype(np.float32)
+    in_q.put(block_a)
+    in_q.put(block_b)
+    in_q.put(SENTINEL)  # tells the worker to exit
+
+    worker_loop(
+        WorkerConfig(mode=WorkerMode.IDENTITY),
+        in_q,
+        out_q,
+        metrics,
+        stop_event,
+        SENTINEL,
+        poll_timeout_seconds=0.05,
+    )
+
+    produced = _drain(out_q)
+    assert len(produced) == 2
+    np.testing.assert_array_equal(produced[0], block_a)
+    np.testing.assert_array_equal(produced[1], block_b)
+    assert metrics.fallback_count == 0
+    assert metrics.output_queue_drops == 0
+    assert metrics.nan_inf_scrub_count == 0
+
+
+def test_worker_loop_scrubs_nan_inf_and_counts():
+    in_q: "queue.Queue" = queue.Queue(maxsize=4)
+    out_q: "queue.Queue" = queue.Queue(maxsize=4)
+    metrics = RuntimeMetrics()
+    stop_event = threading.Event()
+
+    dirty = np.array([0.1, np.nan, np.inf, -np.inf, 0.5], dtype=np.float32)
+    in_q.put(dirty)
+    in_q.put(SENTINEL)
+
+    worker_loop(
+        WorkerConfig(mode=WorkerMode.IDENTITY),
+        in_q, out_q, metrics, stop_event, SENTINEL,
+        poll_timeout_seconds=0.05,
+    )
+
+    produced = _drain(out_q)
+    assert len(produced) == 1
+    assert np.all(np.isfinite(produced[0]))
+    assert metrics.nan_inf_scrub_count == 3
+
+
+def test_worker_loop_rvc_mode_falls_back_to_identity():
+    in_q: "queue.Queue" = queue.Queue(maxsize=4)
+    out_q: "queue.Queue" = queue.Queue(maxsize=4)
+    metrics = RuntimeMetrics()
+    stop_event = threading.Event()
+
+    block = np.full(480, 0.25, dtype=np.float32)
+    in_q.put(block)
+    in_q.put(SENTINEL)
+
+    worker_loop(
+        WorkerConfig(
+            mode=WorkerMode.RVC_NOT_IMPLEMENTED,
+            fallback_to_identity_on_error=True,
+        ),
+        in_q, out_q, metrics, stop_event, SENTINEL,
+        poll_timeout_seconds=0.05,
+    )
+
+    produced = _drain(out_q)
+    assert len(produced) == 1
+    np.testing.assert_array_equal(produced[0], block)
+    assert metrics.fallback_count == 1
+
+
+def test_worker_loop_stop_event_exits_cleanly():
+    in_q: "queue.Queue" = queue.Queue(maxsize=4)
+    out_q: "queue.Queue" = queue.Queue(maxsize=4)
+    metrics = RuntimeMetrics()
+    stop_event = threading.Event()
+    stop_event.set()  # already signalled — loop should exit immediately
+
+    worker_loop(
+        WorkerConfig(mode=WorkerMode.IDENTITY),
+        in_q, out_q, metrics, stop_event, SENTINEL,
+        poll_timeout_seconds=0.01,
+    )
+    # No work done; no exception.
+    assert metrics.fallback_count == 0
+
+
+# ---------------------------------------------------------------------------
+# RVC placeholders must fail loudly when called directly
 # ---------------------------------------------------------------------------
 
 def test_rvc_engine_infer_array_raises_not_implemented():
@@ -80,12 +195,6 @@ def test_worker_process_rvc_raises_not_implemented():
         process_rvc(block)
 
 
-def test_worker_loop_scaffold_raises_not_implemented():
-    # Calling the loop must raise rather than silently start a thread.
-    with pytest.raises(NotImplementedError):
-        worker_loop(WorkerConfig(mode=WorkerMode.IDENTITY), None, None)
-
-
 # ---------------------------------------------------------------------------
 # Chunker sanity
 # ---------------------------------------------------------------------------
@@ -93,7 +202,7 @@ def test_worker_loop_scaffold_raises_not_implemented():
 def test_chunker_emits_full_chunks_only():
     acc = BlockAccumulator(ChunkerConfig(chunk_size=1000))
     out = acc.feed(np.zeros(400, dtype=np.float32))
-    assert out == []          # not enough yet
+    assert out == []
     assert acc.pending_samples == 400
     out = acc.feed(np.ones(700, dtype=np.float32))
     assert len(out) == 1
@@ -125,15 +234,14 @@ def test_linear_crossfade_endpoints_match_inputs():
 # ---------------------------------------------------------------------------
 
 def test_importing_src_main_does_not_open_audio_devices(monkeypatch):
-    """If src.main even *imported* sounddevice on import we would notice
-    a top-level ``sounddevice`` module after the import. Guard against
-    that by ensuring no such module was added to ``sys.modules`` purely
-    as a side effect of importing src.main."""
-    sys.modules.pop("src.main", None)
+    """Trip-wire: importing src.main must not import sounddevice."""
+    # Drop cached modules under src.* so the import is exercised fresh,
+    # which lets the trip-wire actually see the import attempts.
+    for name in list(sys.modules):
+        if name == "src.main" or name.startswith("src.main."):
+            del sys.modules[name]
     had_sounddevice_before = "sounddevice" in sys.modules
 
-    # Trip-wire: if anything tries to import sounddevice during this
-    # import, surface it loudly instead of silently opening a device.
     def _forbidden_import(name, *args, **kwargs):
         if name == "sounddevice" or name.startswith("sounddevice."):
             raise AssertionError(
@@ -148,10 +256,7 @@ def test_importing_src_main_does_not_open_audio_devices(monkeypatch):
 
     module = importlib.import_module("src.main")
 
-    # If sounddevice was NOT already present before, it still shouldn't
-    # be present as a side effect of importing src.main.
     if not had_sounddevice_before:
         assert "sounddevice" not in sys.modules
 
-    # The module loaded; quick sanity check that the CLI is wired.
     assert hasattr(module, "main")
