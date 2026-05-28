@@ -20,7 +20,12 @@ import threading
 import numpy as np
 import pytest
 
-from src.audio.chunker import BlockAccumulator, ChunkerConfig, linear_resample
+from src.audio.chunker import (
+    BlockAccumulator,
+    ChunkerConfig,
+    linear_resample,
+    resample_audio,
+)
 from src.engine.crossfade import linear_crossfade
 from src.engine.rvc_engine import RvcEngine
 from src.engine.worker import (
@@ -242,6 +247,77 @@ def test_linear_resample_rejects_zero_or_negative_sr():
 def test_linear_resample_rejects_stereo():
     with pytest.raises(ValueError):
         linear_resample(np.zeros((100, 2), dtype=np.float32), 44100, 48000)
+
+
+# ---------------------------------------------------------------------------
+# resample_audio (preferred resampler used by the realtime worker)
+# ---------------------------------------------------------------------------
+
+def test_resample_audio_same_rate_is_noop_copy():
+    audio = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+    out = resample_audio(audio, 48000, 48000)
+    np.testing.assert_array_equal(out, audio)
+    # Must be a copy.
+    out[0] = 99.0
+    assert audio[0] == pytest.approx(0.1)
+
+
+def test_resample_audio_40k_to_48k_changes_length_and_is_finite():
+    audio = np.sin(
+        2.0 * np.pi * 440.0 * np.arange(40000) / 40000.0
+    ).astype(np.float32)
+    out = resample_audio(audio, 40000, 48000)
+    assert out.size == 48000
+    assert out.dtype == np.float32
+    assert np.all(np.isfinite(out))
+    # Peak stays close to the input peak (sinc resamplers preserve
+    # peaks within a few % overshoot at most).
+    assert 0.85 <= float(np.max(np.abs(out))) <= 1.15
+
+
+def test_resample_audio_48k_to_40k_changes_length_down():
+    audio = np.full(48000, 0.5, dtype=np.float32)
+    out = resample_audio(audio, 48000, 40000)
+    assert out.size == 40000
+    # The center is stable; edge taps may carry a small sinc-window
+    # transient, so only check the interior.
+    interior = out[200:-200]
+    np.testing.assert_allclose(
+        interior, np.full_like(interior, 0.5), atol=5e-3
+    )
+
+
+def test_resample_audio_rejects_zero_or_negative_sr():
+    audio = np.zeros(100, dtype=np.float32)
+    with pytest.raises(ValueError):
+        resample_audio(audio, 0, 48000)
+    with pytest.raises(ValueError):
+        resample_audio(audio, 48000, -1)
+
+
+def test_resample_audio_rejects_stereo():
+    with pytest.raises(ValueError):
+        resample_audio(np.zeros((100, 2), dtype=np.float32), 44100, 48000)
+
+
+def test_resample_audio_falls_back_when_scipy_missing(monkeypatch):
+    """If scipy is unavailable, resample_audio must still work via
+    np.interp. Simulate by hiding scipy.signal from the import system."""
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "scipy.signal" or name.startswith("scipy.signal."):
+            raise ImportError("simulated missing scipy.signal")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    audio = np.full(40000, 0.5, dtype=np.float32)
+    out = resample_audio(audio, 40000, 48000)
+    assert out.size == 48000
+    np.testing.assert_allclose(
+        out, np.full(48000, 0.5, dtype=np.float32), atol=1e-6
+    )
 
 
 # ---------------------------------------------------------------------------

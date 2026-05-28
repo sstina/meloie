@@ -65,8 +65,8 @@ These shape stability, latency, and correctness — not voice character:
 | Flag | Default | What it controls |
 | --- | --- | --- |
 | `--device` | `auto` | Inference device (`auto` / `cuda` / `cpu`) |
-| `--chunk-ms` | 1000 | RVC chunk size — accumulation latency |
-| `--crossfade-ms` | 20 | Chunk-boundary smoothing |
+| `--chunk-ms` | 180 | RVC chunk size — accumulation latency. Recommended realtime value is 1000 (longer = more model context per call). |
+| `--crossfade-ms` | **0** | Stitched output-only crossfade. OFF by default — see "What the realtime path does NOT do" below. |
 | `--rvc-queue-ms` | 6000 | Per-direction queue capacity |
 | `--rvc-prebuffer-ms` | `2 × chunk_ms` | Startup silence inserted before first real audio |
 | `--warmup-rvc-count` | 2 | Dummy inferences run before opening audio stream |
@@ -74,6 +74,51 @@ These shape stability, latency, and correctness — not voice character:
 | `--duration-seconds` | (none — run until Ctrl+C) | Stop after N seconds |
 | `--input-device-substring` | from config | Mic device name fragment |
 | `--output-device-substring` | from config | Output device name fragment (must be `CABLE Input`) |
+
+## What the realtime path does NOT do
+
+The realtime worker is intentionally a thin carrier for the trained
+model. Between `engine.infer_array(...)` returning a chunk and the
+audio reaching `CABLE Input` it does only what is required:
+
+- **No EQ, no limiter, no normalizer, no compressor.** The chunk goes
+  out at the amplitude the model returned (one defensive int16-scale
+  rescale lives in the engine adapter to match `infer_rvc_python`'s
+  documented contract; that one is required).
+- **No "smoothing" or "warming" of the model output.**
+- **Stitched output-side crossfade is OFF by default.** An audit (run
+  via `tools/pseudo_stream.py`) showed the previous 20 ms default
+  shifted the output timeline by one crossfade length per chunk and
+  blended chunk N's tail with chunk N+1's head — two
+  temporally-disjoint regions, since the input chunks themselves do
+  not overlap. The audit measured no faithfulness improvement vs
+  no-crossfade. Re-enable with `--crossfade-ms N` for legacy
+  comparison only; a proper input-overlap crossfade is a deferred
+  Stage 3 task.
+- **Resampling between model-native SR and stream SR uses
+  `scipy.signal.resample_poly`** (sinc-windowed polyphase) when scipy
+  is importable, falling back to `np.interp` otherwise. The polyphase
+  path measured ~+11 dB output SNR vs the linear fallback on
+  kiki 40→48 kHz. Both run in well under a millisecond per chunk on
+  this hardware.
+- **`drop_stale_input` is ON** as a fail-safe: if inference falls
+  behind faster than the mic feeds, the worker discards older queued
+  chunks and processes the freshest one. In normal steady-state (mean
+  inference ~370 ms at chunk_ms=1000 on RTX 4080 Laptop) this never
+  fires; the `rvc_stale_chunk_drops` metric tells you if it does.
+- **Identity fallback** runs only when the backend raises or returns
+  garbage. The user hears their own voice for that one chunk instead
+  of silence or a crash. The `rvc_fallback_count` metric tells you if
+  it fires.
+
+The structural quality ceiling is **per-chunk inference vs offline
+whole-file inference**. The model has no context across chunk
+boundaries (HuBERT / RMVPE re-initialise each call), so chunked
+output is fundamentally less smooth than the offline reference —
+even with a perfect post-model chain. A future revision can address
+this with input-overlap crossfade (chunk N includes the last K ms of
+chunk N−1's input; the model's output overlap region is faded
+across); this is deferred.
 
 ## VB-CABLE routing rules
 
@@ -92,6 +137,31 @@ These shape stability, latency, and correctness — not voice character:
 .\.venv310\Scripts\python.exe -m tools.verify_cable_route --duration-seconds 2
 .\.venv310\Scripts\python.exe -m tools.click_test --duration-seconds 2 --pulse-amplitude 0.5
 ```
+
+## Audit tool — reproducing the model-faithfulness comparison
+
+`tools/pseudo_stream.py` runs the same model the realtime path uses,
+but in pure offline mode (no audio devices, no worker thread, no
+queues). It exists so a regression in the realtime chain can be
+isolated end-to-end without bringing the audio stack online.
+
+```
+.\.venv310\Scripts\python.exe -m tools.pseudo_stream `
+    --input-wav test.wav `
+    --output-wav audit_pseudo_stream.wav `
+    --model-profile config/model_profiles/kiki.example.json `
+    --device cuda `
+    --chunk-ms 1000 `
+    --crossfade-ms 0 `
+    --resampler polyphase `
+    --stream-sr 48000 `
+    --report-json audit_pseudo_stream.json
+```
+
+A/B the resulting WAV against `tools.offline_infer`'s output (the
+offline whole-file reference). The output is gitignored under
+`*.wav`. The JSON report captures per-chunk inference timing and
+amplitude metrics for regression tracking.
 
 ## Stage 2 — offline RVC sanity (recommended invocation)
 
@@ -116,12 +186,13 @@ device. No tuning knobs appear in this command.
     --output-device-substring "CABLE Input" `
     --device cuda `
     --chunk-ms 1000 `
-    --crossfade-ms 20 `
     --rvc-queue-ms 6000 `
     --rvc-prebuffer-ms 3000 `
     --warmup-rvc-count 2 `
     --duration-seconds 60
 ```
+
+`--crossfade-ms` is omitted — the model-faithful default is 0.
 
 Discord / OBS / your recorder mic must be `CABLE Output (VB-Audio
 Virtual Cable)`.

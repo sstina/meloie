@@ -34,7 +34,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..audio.chunker import BlockAccumulator, ChunkerConfig, linear_resample
+from ..audio.chunker import BlockAccumulator, ChunkerConfig, resample_audio
 from ..audio.devices import iter_device_infos  # noqa: F401  (re-export friendliness)
 from ..engine.crossfade import linear_crossfade
 from ..safety.guard import scrub_nan_inf
@@ -264,17 +264,20 @@ def rvc_worker_loop(
 
             # SR handling. The kiki model returns 40 kHz natively while the
             # stream is 48 kHz; asking infer_rvc_python to resample
-            # internally (resample_sr=stream_sr) is too slow for realtime.
-            # Faster: take the model's native SR back and resample here.
+            # internally (resample_sr=stream_sr) is too slow for realtime
+            # (Stage 2D benchmark: +230 ms / chunk). The worker resamples
+            # post-model instead, using ``resample_audio`` which prefers
+            # scipy polyphase (sinc-windowed) and falls back to np.interp
+            # if scipy is unavailable. Audit measurement (tools/pseudo_
+            # stream) showed polyphase yields ~+11 dB output-vs-reference
+            # SNR upgrade vs np.interp at negligible CPU cost.
             if processed.size == 0 or result_sr <= 0:
                 # Genuine garbage from backend -> identity fallback.
                 processed = chunk.astype(np.float32, copy=True)
                 metrics.rvc_fallback_count += 1
             elif result_sr != int(sample_rate):
-                # Valid audio at a different SR -> rate-match it. The
-                # worker now stays correct without sacrificing chunks.
                 t_rs = time.perf_counter()
-                processed = linear_resample(processed, result_sr, int(sample_rate))
+                processed = resample_audio(processed, result_sr, int(sample_rate))
                 metrics.record_resample_ms((time.perf_counter() - t_rs) * 1000.0)
 
             # NaN/Inf scrub — RVC can produce these on edge cases.

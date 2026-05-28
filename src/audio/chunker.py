@@ -1,4 +1,4 @@
-"""Pure block -> chunk accumulator helpers + a fast linear resampler.
+"""Pure block -> chunk accumulator helpers + resampling helpers.
 
 RVC inference operates on chunks of ~150-200 ms (Stage 1) up to
 ~1000 ms (Stage 2D first-usable realtime config), but ``sounddevice``
@@ -6,13 +6,21 @@ callbacks deliver small blocks (~10 ms). The accumulator here collects
 small mono float32 blocks until a fixed chunk size is reached, then
 emits the chunk.
 
-``linear_resample`` exists because some RVC models return audio at a
+Resampling is needed because some RVC models return audio at a
 different sample rate than the realtime stream uses (the kiki model
-returns 40 kHz natively; our stream is 48 kHz). The worker uses it to
-re-rate model output to the stream rate. Linear interpolation is not
-top-shelf audio resampling — it's a pragmatic "fast enough for first
-usable realtime" choice; a Stage 3 follow-up should swap in a proper
-polyphase / sinc resampler if quality dictates.
+returns 40 kHz natively; our stream is 48 kHz). Two implementations
+live here:
+
+* :func:`linear_resample` — pure ``np.interp``. Stable, no edge
+  transients, but linear interpolation imprints a low-pass roll-off
+  that is not anti-aliased to the destination Nyquist. Kept because
+  the test suite pins exact values for the constant-signal case.
+* :func:`resample_audio` — preferred. Uses
+  ``scipy.signal.resample_poly`` (sinc-windowed polyphase) when scipy
+  is importable, falling back to :func:`linear_resample` otherwise.
+  The realtime worker uses this one; the audit (tools/pseudo_stream)
+  measured a ~+11 dB output-vs-reference SNR upgrade vs linear interp
+  on the kiki 40 kHz -> 48 kHz path at negligible CPU cost.
 
 This module is intentionally free of realtime / threading complexity.
 It is just numpy buffers + interp, so it can be unit tested without
@@ -127,3 +135,49 @@ def linear_resample(
     x_old = np.arange(audio.size, dtype=np.float64)
     x_new = np.linspace(0.0, audio.size - 1, new_len, dtype=np.float64)
     return np.interp(x_new, x_old, audio).astype(np.float32)
+
+
+def resample_audio(
+    audio: np.ndarray, from_sr: int, to_sr: int
+) -> np.ndarray:
+    """Resample 1-D mono float32 audio with the best available kernel.
+
+    Prefers ``scipy.signal.resample_poly`` (sinc-windowed polyphase)
+    when scipy is importable, otherwise delegates to
+    :func:`linear_resample`. The function signature and dtype contract
+    mirror ``linear_resample`` exactly so the worker / pseudo-stream
+    can call this without conditionals.
+
+    Edge transients: polyphase resampling introduces a small ringing
+    transient at the start/end of each *invocation* (a few taps wide).
+    For chunked realtime, this means every chunk boundary acquires a
+    short ringing region. Empirically (audit run) the cumulative
+    effect is still ~+11 dB cleaner than linear interpolation on
+    speech material. If a future revision adds input-overlap
+    crossfade, those transients fall inside the overlap region and
+    become inaudible.
+    """
+    if not isinstance(audio, np.ndarray):
+        raise TypeError(
+            f"audio must be a numpy array, got {type(audio).__name__}"
+        )
+    if audio.ndim != 1:
+        raise ValueError(f"audio must be 1-D mono, got shape {audio.shape}")
+    if int(from_sr) <= 0 or int(to_sr) <= 0:
+        raise ValueError(
+            f"sample rates must be > 0; got from_sr={from_sr} to_sr={to_sr}"
+        )
+    if int(from_sr) == int(to_sr) or audio.size == 0:
+        return audio.astype(np.float32, copy=True)
+
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly  # type: ignore  # noqa: WPS433
+    except ImportError:
+        return linear_resample(audio, int(from_sr), int(to_sr))
+
+    g = gcd(int(from_sr), int(to_sr))
+    up = int(to_sr) // g
+    down = int(from_sr) // g
+    out = resample_poly(audio.astype(np.float64, copy=False), up, down)
+    return out.astype(np.float32, copy=False)

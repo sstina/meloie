@@ -517,7 +517,7 @@ def run_rvc_stream(
         + (f" / {engine.cuda_device_name}" if engine.cuda_device_name else ""),
         f"resample_sr={engine.config.resample_sr}  "
         f"stream_sr={config.sample_rate}  "
-        f"(SR mismatch -> worker linear_resample, not fallback)",
+        "(SR mismatch -> worker resample_audio, sinc-polyphase if scipy)",
         f"rvc_queue_blocks={rvc_queue_blocks}  "
         f"rvc_prebuffer_blocks={prebuffer_blocks}  "
         f"drop_stale_input={drop_stale_input}",
@@ -527,11 +527,18 @@ def run_rvc_stream(
         f"pitch_shift={engine.config.pitch_shift}  "
         f"filter_radius={engine.config.filter_radius}  "
         f"rms_mix_rate={engine.config.rms_mix_rate}",
+        "model-faithful posture: no post-model EQ / limiter / normalize. "
+        "Identity fallback only on hard backend error. "
+        "Per-chunk inference = the structural quality ceiling vs offline "
+        "whole-file (no input-overlap; deferred).",
     ]
     if crossfade_size == 0:
         intro_extra.append(
-            "NOTE: crossfade_ms=0 — chunk-boundary clicks possible "
-            "(Stage 3 will refine; current safety: identity fallback on error)."
+            "NOTE: stitched crossfade is OFF (model-faithful default). "
+            "The OUTPUT timeline is therefore not shifted; chunk boundaries "
+            "may produce occasional clicks on plosive onsets. Set "
+            "--crossfade-ms >0 only to reproduce legacy stitched-blend "
+            "behaviour."
         )
 
     def factory(in_q, out_q, metrics, stop_event, sentinel):

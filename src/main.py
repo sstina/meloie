@@ -97,10 +97,18 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="DEVELOPER OVERRIDE: pitch shift in semitones.")
     rvc.add_argument("--chunk-ms", type=float, default=180.0,
                      help="RVC chunk size in milliseconds (default 180).")
-    rvc.add_argument("--crossfade-ms", type=float, default=20.0,
-                     help="Crossfade length at chunk boundaries (default 20; "
-                          "set 0 to disable, then expect occasional clicks "
-                          "until Stage 3 refines this).")
+    rvc.add_argument("--crossfade-ms", type=float, default=0.0,
+                     help="Stitched crossfade at chunk boundaries in ms "
+                          "(default 0 -- OFF). The current implementation "
+                          "blends chunk N's tail with chunk N+1's head "
+                          "purely on the OUTPUT side, with no INPUT-side "
+                          "overlap. Audit measurement showed that smears "
+                          "two temporally-disjoint regions together and "
+                          "shifts the output timeline by one crossfade "
+                          "length per chunk for zero faithfulness win. "
+                          "Set >0 only to reproduce the legacy stitched-"
+                          "blend behaviour. A future revision may add "
+                          "true input-overlap crossfade.")
     rvc.add_argument("--device", default="auto",
                      choices=["auto", "cpu", "cuda", "directml_experimental"],
                      help="Inference device. 'auto' picks cuda if available, "

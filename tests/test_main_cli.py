@@ -23,7 +23,7 @@ def test_parser_accepts_rvc_mode_with_dev_override_flags():
     assert args.model_path == "models/local/example.pth"
     assert args.index_path == "models/local/example.index"
     assert args.chunk_ms == 180.0
-    assert args.crossfade_ms == 20.0
+    assert args.crossfade_ms == 20.0   # explicit value still parsed
     # Voice-identity defaults are now None so we can detect explicit
     # CLI overrides vs profile values vs hard-coded fallbacks.
     assert args.f0_method is None
@@ -44,6 +44,24 @@ def test_parser_accepts_cuda_device_and_explicit_resample_sr():
     ])
     assert args.device == "cuda"
     assert args.resample_sr == 48000
+
+
+def test_parser_crossfade_default_is_zero():
+    """Model-faithful default: stitched OUTPUT-side crossfade is OFF.
+
+    The previous default (20 ms) inserted a fixed one-crossfade-length
+    timeline shift per chunk and blended two temporally-disjoint
+    regions with no input-overlap. The audit (tools/pseudo_stream)
+    showed this delivered no measurable faithfulness gain vs the
+    offline whole-file reference. Set to >0 only as a debug override.
+    """
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+    ])
+    assert args.crossfade_ms == 0.0
 
 
 def test_parser_warmup_default_is_two():

@@ -19,6 +19,8 @@ models/local/
 *.pt
 *.pth
 *.index
+# audit / pseudo-stream report sidecars (see tools/pseudo_stream.py)
+audit_*.json
 
 # editor / OS
 .vscode/
