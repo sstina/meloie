@@ -168,6 +168,13 @@ def _print_metrics_line(metrics, in_q, out_q, mode_label: str) -> None:
         f"st(in={metrics.input_status_flag_count},out={metrics.output_status_flag_count})"
     )
     if mode_label == "rvc":
+        # Stage 4-C: cumulative input-vs-output frame delta. Positive
+        # means the output queue is behind the input -- expected to grow
+        # slowly with the per-chunk framing deficit; a sudden spike means
+        # the worker stalled and the prebuffer is being eaten.
+        delta = metrics.cumulative_frame_delta
+        min_qo = metrics.min_output_queue_depth_after_steady
+        min_qo_str = "n/a" if min_qo is None else str(min_qo)
         base += (
             f" rvc_n={metrics.rvc_chunks_processed} "
             f"infer_last={metrics.rvc_inference_last_ms:5.0f}ms "
@@ -177,6 +184,10 @@ def _print_metrics_line(metrics, in_q, out_q, mode_label: str) -> None:
             f"stale={metrics.rvc_stale_chunk_drops} "
             f"enq={metrics.rvc_output_blocks_enqueued} "
             f"odrop={metrics.rvc_output_blocks_dropped} "
+            f"ob={metrics.rvc_inference_over_budget_count} "
+            f"ne={metrics.output_queue_near_empty_events} "
+            f"minq={min_qo_str} "
+            f"delta={delta:+d}f "
             f"rs_mean={metrics.rvc_resample_mean_ms:4.1f}ms"
         )
     print(base, flush=True)
@@ -206,6 +217,13 @@ def _print_summary(
         print(f"rvc_inference_median_ms  = {metrics.inference_median_ms():.2f}")
         print(f"rvc_inference_p95_ms     = {metrics.inference_percentile_ms(95.0):.2f}")
         print(f"rvc_inference_max_ms     = {metrics.rvc_inference_max_ms:.2f}")
+        # Stage 4-C: spike protection counters.
+        print(f"rvc_chunk_ms_budget      = {metrics.rvc_chunk_ms_budget:.2f}")
+        print(f"rvc_inference_over_budget_count = {metrics.rvc_inference_over_budget_count}")
+        print(f"rvc_inference_over_budget_max_consecutive = "
+              f"{metrics.rvc_inference_over_budget_max_consecutive}")
+        print(f"rvc_inference_over_budget_total_ms = "
+              f"{metrics.rvc_inference_over_budget_total_ms:.1f}")
         print(f"rvc_fallback_count       = {metrics.rvc_fallback_count}")
         print(f"rvc_stale_chunk_drops    = {metrics.rvc_stale_chunk_drops}")
         print(f"rvc_output_blocks_enqueued = {metrics.rvc_output_blocks_enqueued}")
@@ -214,6 +232,14 @@ def _print_summary(
         print(f"rvc_resample_mean_ms     = {metrics.rvc_resample_mean_ms:.2f}")
         print(f"max_input_queue_depth    = {metrics.max_input_queue_depth}")
         print(f"max_output_queue_depth   = {metrics.max_output_queue_depth}")
+        # Stage 4-C: queue-health + frame-delta accounting.
+        min_qo = metrics.min_output_queue_depth_after_steady
+        print(f"min_output_queue_depth_after_steady = "
+              f"{'n/a (no steady-state samples yet)' if min_qo is None else min_qo}")
+        print(f"output_queue_near_empty_threshold_blocks = "
+              f"{metrics.output_queue_near_empty_threshold_blocks}")
+        print(f"output_queue_near_empty_events = {metrics.output_queue_near_empty_events}")
+        print(f"cumulative_frame_delta   = {metrics.cumulative_frame_delta}")
         print(f"startup_output_underruns = {metrics.startup_output_underruns}")
         print(f"steady_state_output_underruns = {metrics.steady_state_output_underruns}")
         print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")
@@ -282,6 +308,14 @@ def _run_stream(
     out_q: "queue.Queue" = queue.Queue(maxsize=out_cap)
     metrics = RuntimeMetrics()
     stop_event = threading.Event()
+
+    # Stage 4-C: output-queue near-empty threshold = 50 ms of buffered
+    # audio. Anything at or below this depth is reported as a near-empty
+    # event (edge-triggered) and pulls down min_output_queue_depth.
+    near_empty_threshold_blocks = max(
+        1,
+        int(round(50.0 * config.sample_rate / 1000.0 / config.block_size)),
+    )
 
     in_q_ms = in_cap * config.block_size * 1000.0 / max(1, config.sample_rate)
     out_q_ms = out_cap * config.block_size * 1000.0 / max(1, config.sample_rate)
@@ -377,6 +411,13 @@ def _run_stream(
                     metrics.max_input_queue_depth = qi
                 if qo > metrics.max_output_queue_depth:
                     metrics.max_output_queue_depth = qo
+                # Stage 4-C: also feed qo into the steady-state
+                # min/near-empty tracker. record_output_queue_depth no-
+                # ops until first_real_output_seen=True, so the prebuffer
+                # drain doesn't count.
+                metrics.record_output_queue_depth(
+                    qo, near_empty_threshold_blocks=near_empty_threshold_blocks
+                )
                 if duration_seconds is not None and metrics.elapsed_seconds >= duration_seconds:
                     break
                 if now - last_print >= metrics_interval_seconds:
@@ -495,12 +536,16 @@ def run_rvc_stream(
     )
     # Prebuffer: silence blocks placed in out_q before opening the audio
     # stream. Hides the first-chunk inference time at the cost of that
-    # much added latency. Default = 2 × chunk_ms (one chunk to accumulate,
-    # roughly one chunk to infer).
+    # much added latency. Stage 4-C default = 5 × chunk_ms (quality-first):
+    # absorbs (a) the per-chunk framing deficit that drains the queue over
+    # time and (b) a single inference outlier up to ~2 × chunk_ms before
+    # the queue runs dry. The Stage 4-B failure (1713 ms inference spike
+    # at t=47s with 3000 ms prebuffer -> 167 underruns) is the empirical
+    # justification. Override via --rvc-prebuffer-ms for latency tradeoffs.
     prebuffer_ms = (
         float(rvc_prebuffer_ms)
         if rvc_prebuffer_ms is not None
-        else float(chunk_ms) * 2.0
+        else float(chunk_ms) * 5.0
     )
     prebuffer_blocks = max(
         0, int(round(prebuffer_ms * config.sample_rate / 1000.0 / config.block_size))

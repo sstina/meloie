@@ -112,6 +112,88 @@ audio reaching `CABLE Input` it does only what is required:
   of silence or a crash. The `rvc_fallback_count` metric tells you if
   it fires.
 
+## Stage 4-C — headless quality-first runtime
+
+`src.main --mode rvc` is the complete non-GUI realtime RVC runtime.
+"Quality-first" means defaults trade latency for continuity: the
+runtime would rather start ~5 seconds later and stay glitch-free than
+start fast and hiccup mid-conversation. There is no other mode — the
+runtime IS the quality-first runtime.
+
+**Defaults that shape continuity (Stage 4-C)**:
+
+- `--rvc-prebuffer-ms` defaults to **5 × chunk_ms** (= 5000 ms at the
+  recommended `chunk_ms=1000`). This is the silence inserted into the
+  output queue before the first real RVC chunk lands. It survives
+  (a) the per-chunk framing deficit that slowly drains the queue and
+  (b) a single inference outlier up to ~2 × chunk_ms. Empirical
+  justification: a Stage 4-B spoken run with `--rvc-prebuffer-ms 3000`
+  hit a 1713 ms inference spike at t=47 s and produced 167 underruns
+  (~1.67 s of silence on `CABLE Output`). 5000 ms would have left
+  ~2 s of margin under the same spike. Override with
+  `--rvc-prebuffer-ms` only when you're consciously trading stability
+  for latency.
+
+- `--rvc-queue-ms` (default 6000 ms) is the per-direction queue
+  capacity. It must be ≥ `--rvc-prebuffer-ms`.
+
+- `--rvc-context-ms` (default 200 ms) is unchanged — Stage 3 left-context
+  is still the chunk-boundary continuity strategy. Tuning is deferred.
+
+- `--crossfade-ms` (default 0) — output-side crossfade stays off. Do
+  not re-enable it for "smoothing"; the Stage 3 audit showed it
+  blends temporally-disjoint regions and introduces timeline drift
+  for no faithfulness gain.
+
+**Spike-protection metrics (new in Stage 4-C)**:
+
+| Metric | Meaning |
+| --- | --- |
+| `rvc_chunk_ms_budget` | Per-chunk audio budget (= chunk_size / sample_rate × 1000). Any single inference taking longer than this is "over budget". |
+| `rvc_inference_over_budget_count` | How many inferences exceeded the budget. |
+| `rvc_inference_over_budget_max_consecutive` | Longest streak of consecutive over-budget calls. Streaks ≥ 2 are the highest-risk pattern for underruns. |
+| `rvc_inference_over_budget_total_ms` | Sum of wall-clock debt vs the audio stream (ms). |
+| `min_output_queue_depth_after_steady` | Lowest output-queue depth ever seen after the prebuffer drained. Useful drain-trend indicator. |
+| `output_queue_near_empty_threshold_blocks` | Threshold for the next counter (= 50 ms worth of blocks at the configured sample rate / block size). |
+| `output_queue_near_empty_events` | Edge-triggered count of times the output queue transitioned into "near-empty" territory. |
+| `cumulative_frame_delta` | Net `input_frames - output_frames` at session end. Positive = output behind input (= queue is being drained over time). |
+
+The per-second metrics line now shows `ob=N` (over-budget count),
+`ne=N` (near-empty events), `minq=N` (current minimum-after-steady),
+and `delta=±Nf` (cumulative frame delta) so drains are visible in
+real time, not just at shutdown.
+
+**Failure-class taxonomy** (when a counter fails a gate, classify
+into one of these — never tune voice identity):
+
+1. **Runtime continuity** — inference spike(s), queue drain, near-
+   empty events, underruns. Mitigate via larger prebuffer or
+   identifying the source of the spike (GPU contention, etc.).
+2. **Chunk / context artifact** — visible in pseudo-stream A/B with
+   different `context_ms` values. Out of scope for Stage 4-C.
+3. **Model / backend limitation** — same artifact in offline whole-
+   file inference, not specific to realtime.
+4. **Training / model quality** — voice doesn't sound right even
+   offline. Re-train; do not tune identity params.
+5. **Audio device / CABLE monitoring** — input is silent or
+   downstream app isn't reading `CABLE Output`. Re-check routing.
+
+**PASS / FAIL / BLOCKED definition for a spoken validation run**:
+
+- **PASS**: real speech was present (input peak dBFS regularly above
+  −60 dBFS) AND all engineering gates clean: `input_queue_drops = 0`,
+  `output_queue_drops = 0`, `rvc_output_blocks_dropped = 0`,
+  `rvc_fallback_count = 0`, `nan_inf_scrub_count = 0`,
+  `steady_state_output_underruns = 0` (or extremely low and clearly
+  explained), `rvc_inference_over_budget_max_consecutive ≤ 1`,
+  `output_queue_near_empty_events = 0`, `cumulative_frame_delta`
+  growing only at the documented per-chunk framing rate.
+- **FAIL**: speech present but one or more engineering gates dirty
+  (e.g. an inference spike caused underruns). Classify per the
+  taxonomy above.
+- **BLOCKED**: no real speech detected, audio device unavailable, or
+  `CABLE Output` could not be monitored.
+
 ## Note: `--rvc-context-ms` is a deferred engineering optimization point
 
 `--rvc-context-ms` is a continuity / boundary-quality knob, **not** a
@@ -281,7 +363,6 @@ issue} — but do NOT tune voice identity parameters.
     --chunk-ms 1000 `
     --rvc-context-ms 200 `
     --rvc-queue-ms 6000 `
-    --rvc-prebuffer-ms 3000 `
     --warmup-rvc-count 2 `
     --duration-seconds 60
 ```
@@ -291,8 +372,14 @@ the model 200 ms of real previous input audio as warmup left-context
 before each chunk, and the worker trims the corresponding region of
 model output proportionally so emit duration stays ≈ chunk_ms (no
 timeline drift). See "Stage 3 — input-side left-context" below for
-the audit measurements. `--crossfade-ms` is omitted; the model-
-faithful default is 0.
+the audit measurements.
+
+`--rvc-prebuffer-ms` is omitted on purpose — it now defaults to
+5 × chunk_ms = 5000 ms (the Stage 4-C quality-first policy). Passing
+a smaller value here would silently re-introduce the Stage 4-B
+failure mode where a single inference spike consumed the prebuffer
+and produced ~1.7 s of silence on `CABLE Output`. `--crossfade-ms`
+is also omitted; the model-faithful default is 0.
 
 Discord / OBS / your recorder mic must be `CABLE Output (VB-Audio
 Virtual Cable)`.

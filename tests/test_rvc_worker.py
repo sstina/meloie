@@ -675,6 +675,58 @@ def test_rvc_worker_rejects_negative_context_size():
         )
 
 
+class _SlowEngine:
+    """Engine that sleeps for a configurable wall-clock duration on each
+    inference call so we can test Stage 4-C over-budget tracking without
+    actually loading a model."""
+
+    def __init__(self, sleep_seconds: float) -> None:
+        self.sleep_seconds = float(sleep_seconds)
+
+    def infer_array(self, audio, sample_rate):
+        import time as _time
+        _time.sleep(self.sleep_seconds)
+        return audio.astype(np.float32, copy=False), int(sample_rate)
+
+
+def test_rvc_worker_passes_chunk_ms_budget_into_record_inference_ms():
+    """Stage 4-C: the worker derives the per-chunk budget from
+    chunk_size / sample_rate and passes it into record_inference_ms,
+    so an over-budget inference shows up in the spike counters.
+
+    Uses a small chunk and a 50 ms sleep so the inference reliably
+    exceeds the ~10 ms budget."""
+    chunk_size = 480       # 10 ms @ 48 kHz -> budget = 10 ms
+    block_size = 480
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=8)
+    out_q: "queue.Queue" = queue.Queue(maxsize=8)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _SlowEngine(sleep_seconds=0.05)   # 50 ms >> 10 ms budget
+
+    in_q.put(np.full(chunk_size, 0.1, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.01,
+    )
+
+    assert metrics.rvc_chunk_ms_budget == pytest.approx(10.0)
+    assert metrics.rvc_inference_count == 1
+    assert metrics.rvc_inference_over_budget_count == 1
+    assert metrics.rvc_inference_over_budget_max_consecutive == 1
+    # The over-budget debt should be roughly (50 - 10) = 40 ms
+    # but with timing slop, just check it's positive and < the
+    # actual measured last-inference time.
+    assert 30.0 < metrics.rvc_inference_over_budget_total_ms <= metrics.rvc_inference_last_ms
+
+
 def test_rvc_worker_context_preserved_across_stale_drop():
     """When drop_stale_input drops intermediate chunks, the context
     buffer must carry forward from the LAST processed chunk (we never

@@ -171,3 +171,158 @@ def test_inference_times_list_is_capped():
     assert len(m.rvc_inference_times_ms) == 5
     # but the running counters still count all 20
     assert m.rvc_inference_count == 20
+
+
+# ---------------------------------------------------------------------------
+# Stage 4-C: inference-budget spike protection
+# ---------------------------------------------------------------------------
+
+def test_record_inference_ms_no_budget_skips_over_budget_tracking():
+    """The legacy signature (no budget) must remain a no-op for spike
+    counters so old callsites keep working."""
+    m = RuntimeMetrics()
+    m.record_inference_ms(99999.0)  # huge but no budget passed
+    assert m.rvc_inference_over_budget_count == 0
+    assert m.rvc_inference_over_budget_max_consecutive == 0
+    assert m.rvc_inference_over_budget_total_ms == 0.0
+
+
+def test_record_inference_ms_tracks_over_budget_count_and_debt():
+    """Each ms > budget bumps the over-budget count and adds the excess
+    to the total-debt counter; on-budget calls don't."""
+    m = RuntimeMetrics()
+    budget = 1000.0
+    m.record_inference_ms(500.0, budget_ms=budget)     # on budget
+    m.record_inference_ms(1500.0, budget_ms=budget)    # over by 500
+    m.record_inference_ms(900.0, budget_ms=budget)     # on budget
+    m.record_inference_ms(1200.0, budget_ms=budget)    # over by 200
+    assert m.rvc_inference_over_budget_count == 2
+    assert m.rvc_inference_over_budget_total_ms == pytest.approx(700.0)
+
+
+def test_record_inference_ms_tracks_max_consecutive_over_budget():
+    """A streak of over-budget calls pulls up max_consecutive; the
+    streak resets when an on-budget call lands."""
+    m = RuntimeMetrics()
+    budget = 100.0
+    # streak of 3
+    m.record_inference_ms(200.0, budget_ms=budget)
+    m.record_inference_ms(150.0, budget_ms=budget)
+    m.record_inference_ms(300.0, budget_ms=budget)
+    assert m.rvc_inference_over_budget_max_consecutive == 3
+    assert m.rvc_inference_consecutive_over_budget_current == 3
+    # break the streak
+    m.record_inference_ms(50.0, budget_ms=budget)
+    assert m.rvc_inference_consecutive_over_budget_current == 0
+    # smaller streak of 2 -- max stays at 3
+    m.record_inference_ms(200.0, budget_ms=budget)
+    m.record_inference_ms(150.0, budget_ms=budget)
+    assert m.rvc_inference_over_budget_max_consecutive == 3
+    assert m.rvc_inference_consecutive_over_budget_current == 2
+
+
+def test_record_inference_ms_budget_equal_is_on_budget():
+    """ms == budget is exactly on budget, not over (strict > test)."""
+    m = RuntimeMetrics()
+    m.record_inference_ms(1000.0, budget_ms=1000.0)
+    assert m.rvc_inference_over_budget_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 4-C: output queue health
+# ---------------------------------------------------------------------------
+
+def test_record_output_queue_depth_noop_before_steady_state():
+    """Before first_real_output_seen=True the prebuffer is draining;
+    we must not pollute the steady-state min with that."""
+    m = RuntimeMetrics()
+    m.record_output_queue_depth(5, near_empty_threshold_blocks=10)
+    assert m.min_output_queue_depth_after_steady is None
+    assert m.output_queue_near_empty_events == 0
+
+
+def test_record_output_queue_depth_tracks_min_after_steady():
+    m = RuntimeMetrics()
+    m.first_real_output_seen = True
+    m.record_output_queue_depth(50)
+    m.record_output_queue_depth(30)
+    m.record_output_queue_depth(40)
+    m.record_output_queue_depth(20)
+    assert m.min_output_queue_depth_after_steady == 20
+
+
+def test_record_output_queue_depth_near_empty_edge_triggered():
+    """One sustained drain should only tick the near-empty counter once,
+    not on every sample. The counter advances each time the queue
+    transitions from above-threshold to at-or-below-threshold."""
+    m = RuntimeMetrics()
+    m.first_real_output_seen = True
+    threshold = 10
+    m.record_output_queue_depth(50, threshold)   # above
+    m.record_output_queue_depth(40, threshold)   # above
+    m.record_output_queue_depth(5,  threshold)   # transition -> near (count++)
+    m.record_output_queue_depth(3,  threshold)   # still near (no count)
+    m.record_output_queue_depth(8,  threshold)   # still near (no count)
+    m.record_output_queue_depth(50, threshold)   # above again
+    m.record_output_queue_depth(2,  threshold)   # transition -> near (count++)
+    assert m.output_queue_near_empty_events == 2
+    assert m.output_queue_near_empty_threshold_blocks == threshold
+
+
+def test_record_output_queue_depth_skipped_when_threshold_zero():
+    """If threshold is 0 (caller doesn't want this), the min still
+    updates but no near-empty events accumulate."""
+    m = RuntimeMetrics()
+    m.first_real_output_seen = True
+    m.record_output_queue_depth(2, near_empty_threshold_blocks=0)
+    m.record_output_queue_depth(1, near_empty_threshold_blocks=0)
+    assert m.output_queue_near_empty_events == 0
+    assert m.min_output_queue_depth_after_steady == 1
+
+
+# ---------------------------------------------------------------------------
+# Stage 4-C: cumulative frame delta
+# ---------------------------------------------------------------------------
+
+def test_cumulative_frame_delta_zero_at_start():
+    m = RuntimeMetrics()
+    assert m.cumulative_frame_delta == 0
+
+
+def test_cumulative_frame_delta_positive_when_output_behind_input():
+    m = RuntimeMetrics()
+    m.input_frames = 1000
+    m.output_frames = 950
+    assert m.cumulative_frame_delta == 50  # output behind input
+
+
+def test_cumulative_frame_delta_negative_when_output_ahead_of_input():
+    m = RuntimeMetrics()
+    m.input_frames = 100
+    m.output_frames = 300  # eg. prebuffer of silence
+    assert m.cumulative_frame_delta == -200
+
+
+def test_runtime_metrics_dict_includes_new_stage4c_fields_and_is_json_safe():
+    """Sidecar JSON consumers depend on the dataclass shape; make sure
+    the new Stage 4-C fields are present, JSON-encodable (None ->
+    null), and that no field accidentally ended up as a numpy type."""
+    m = RuntimeMetrics()
+    m.first_real_output_seen = True
+    m.record_inference_ms(1500.0, budget_ms=1000.0)
+    m.record_output_queue_depth(2, near_empty_threshold_blocks=5)
+    d = m.to_dict()
+    for k in (
+        "rvc_chunk_ms_budget",
+        "rvc_inference_over_budget_count",
+        "rvc_inference_over_budget_total_ms",
+        "rvc_inference_over_budget_max_consecutive",
+        "min_output_queue_depth_after_steady",
+        "output_queue_near_empty_threshold_blocks",
+        "output_queue_near_empty_events",
+    ):
+        assert k in d, f"missing {k}"
+    encoded = json.dumps(d)
+    decoded = json.loads(encoded)
+    assert decoded["rvc_inference_over_budget_count"] == 1
+    assert decoded["min_output_queue_depth_after_steady"] == 2

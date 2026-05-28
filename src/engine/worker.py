@@ -226,6 +226,14 @@ def rvc_worker_loop(
         np.zeros(int(context_size), dtype=np.float32) if context_size > 0 else None
     )
 
+    # Stage 4-C: per-chunk wall-clock budget for the inference call.
+    # If an inference exceeds this it consumes part of the output-queue
+    # safety margin. ``record_inference_ms(..., budget_ms=)`` tracks how
+    # often this happens, the longest consecutive streak, and the total
+    # over-budget debt in ms.
+    chunk_ms_budget: float = float(chunk_size) * 1000.0 / float(sample_rate)
+    metrics.rvc_chunk_ms_budget = chunk_ms_budget
+
     def _emit(buf: np.ndarray) -> None:
         if buf.size == 0:
             return
@@ -314,7 +322,10 @@ def rvc_worker_loop(
                 processed = chunk.astype(np.float32, copy=True)
                 metrics.rvc_fallback_count += 1
                 used_fallback = True
-            metrics.record_inference_ms((time.perf_counter() - t0) * 1000.0)
+            metrics.record_inference_ms(
+                (time.perf_counter() - t0) * 1000.0,
+                budget_ms=chunk_ms_budget,
+            )
 
             # Trim the leading region that corresponds to the context
             # input. Skipped when context is off, when the model failed

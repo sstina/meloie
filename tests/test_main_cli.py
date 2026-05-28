@@ -121,7 +121,13 @@ def test_parser_rvc_queue_and_prebuffer_defaults():
         "--model-path", "models/local/x.pth",
     ])
     assert args.rvc_queue_ms == 6000.0
-    assert args.rvc_prebuffer_ms is None  # main computes 2 * chunk_ms
+    # Stage 4-C quality-first default: streams.py now computes
+    # 5 * chunk_ms when this flag is left unset. Increased from the
+    # Stage 2E default of 2 * chunk_ms after the Stage 4-B spoken-
+    # live run showed 3000 ms was not enough to absorb a 1713 ms
+    # inference spike. The CLI default itself stays None so the
+    # internal policy is overridable in one place.
+    assert args.rvc_prebuffer_ms is None
     assert args.drop_stale_input is True
 
 
