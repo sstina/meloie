@@ -97,6 +97,21 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="Number of dummy inference calls to run BEFORE "
                           "opening the audio stream. Avoids the cold-start "
                           "stall (~30 s first call). Set 0 to disable.")
+    rvc.add_argument("--rvc-queue-ms", type=float, default=6000.0,
+                     help="Per-direction queue capacity in milliseconds. "
+                          "Identity-era default (640 ms) is too small for "
+                          "1 s chunks; output blocks get dropped. Default "
+                          "6000 ms = ~600 blocks at 48 kHz / 480-frame "
+                          "blocks.")
+    rvc.add_argument("--rvc-prebuffer-ms", type=float, default=None,
+                     help="Silence prebuffered into the OutputStream before "
+                          "real audio arrives. Default: 2 * chunk_ms. Adds "
+                          "this much latency but hides startup underruns.")
+    rvc.add_argument("--drop-stale-input",
+                     action=argparse.BooleanOptionalAction, default=True,
+                     help="If inference falls behind, drop older queued "
+                          "chunks and keep only the latest. Reduces "
+                          "perceived latency drift. Default: on for RVC.")
 
     return parser
 
@@ -313,6 +328,9 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
             crossfade_ms=args.crossfade_ms,
             duration_seconds=args.duration_seconds,
             allow_virtual_cable_input=args.allow_virtual_cable_input,
+            rvc_queue_ms=args.rvc_queue_ms,
+            rvc_prebuffer_ms=args.rvc_prebuffer_ms,
+            drop_stale_input=args.drop_stale_input,
         )
     except FeedbackLoopRisk as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -215,6 +215,7 @@ def test_rvc_worker_crossfade_preserves_output_length():
         output_block_size=block_size,
         crossfade_size=crossfade,
         poll_timeout_seconds=0.05,
+        drop_stale_input=False,
     )
 
     assert engine.call_count == 2
@@ -358,3 +359,125 @@ def test_rvc_worker_accepts_matching_sr():
 
     assert metrics.rvc_fallback_count == 0
     assert metrics.rvc_chunks_processed == 1
+
+
+# ---------------------------------------------------------------------------
+# Stage 2E: stale-input drop, output enqueue counting, resample timing,
+# first_real_output_seen flag
+# ---------------------------------------------------------------------------
+
+def test_rvc_worker_drops_stale_chunks_when_multiple_ready():
+    """When drained input produces more than one chunk in a single
+    worker cycle, only the latest is processed; the older ones are
+    counted as stale drops."""
+    chunk_size = 480     # 10 ms @ 48 kHz, tiny on purpose
+    block_size = 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _FakeEngine(gain=1.0)
+
+    # Pre-load 3 chunks worth of input before the worker starts so the
+    # initial drain will produce 3 chunks at once.
+    for i in range(3):
+        in_q.put(np.full(block_size, 0.1 * (i + 1), dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=True,
+    )
+
+    # Engine should have been called only for the latest chunk.
+    assert engine.call_count == 1
+    assert metrics.rvc_stale_chunk_drops == 2
+    assert metrics.rvc_chunks_processed == 1
+
+
+def test_rvc_worker_does_not_drop_when_drop_stale_off():
+    chunk_size = 480
+    block_size = 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _FakeEngine(gain=1.0)
+
+    for i in range(3):
+        in_q.put(np.full(block_size, 0.1 * (i + 1), dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=False,
+    )
+
+    assert engine.call_count == 3
+    assert metrics.rvc_stale_chunk_drops == 0
+
+
+def test_rvc_worker_counts_output_blocks_enqueued():
+    chunk_size = 2400      # 5 blocks at 480
+    block_size = 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _FakeEngine(gain=1.0)
+
+    for _ in range(5):
+        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+    )
+
+    # One chunk produced 5 output blocks.
+    assert metrics.rvc_output_blocks_enqueued == 5
+    assert metrics.rvc_output_blocks_dropped == 0
+    assert metrics.first_real_output_seen is True
+    assert metrics.max_output_queue_depth >= 1
+
+
+def test_rvc_worker_records_resample_timing_on_sr_mismatch():
+    chunk_size = 4800
+    block_size = 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _WrongSrEngine(returned_sr=40000)
+
+    for _ in range(chunk_size // block_size):
+        in_q.put(np.full(block_size, 0.3, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+    )
+
+    assert metrics.rvc_resample_count == 1
+    assert metrics.rvc_resample_total_ms >= 0.0
+    assert metrics.rvc_resample_mean_ms >= 0.0

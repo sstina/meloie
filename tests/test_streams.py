@@ -16,6 +16,7 @@ import pytest
 from src.audio.devices import FeedbackLoopRisk
 from src.audio.streams import (
     AudioRuntimeConfig,
+    queue_blocks_from_ms,
     resolve_input_device,
     resolve_output_device,
 )
@@ -126,3 +127,36 @@ def test_audio_runtime_config_accepts_rvc_mode():
 def test_audio_runtime_config_rejects_unknown_mode():
     with pytest.raises(ValueError):
         AudioRuntimeConfig(mode="totally_made_up").validate()
+
+
+# ---------------------------------------------------------------------------
+# Stage 2E: queue_blocks_from_ms
+# ---------------------------------------------------------------------------
+
+def test_queue_blocks_from_ms_basic_48k_480():
+    # 1000 ms at 48 kHz / 480 sample blocks = 1000 / 10 = 100 blocks
+    assert queue_blocks_from_ms(1000.0, 480, 48000, minimum=1) == 100
+
+
+def test_queue_blocks_from_ms_default_minimum_clamps_small_input():
+    # tiny ms request should still give at least the minimum
+    assert queue_blocks_from_ms(50.0, 480, 48000, minimum=64) == 64
+
+
+def test_queue_blocks_from_ms_six_seconds_at_48k_480():
+    # 6000 ms = 600 blocks (this is the new RVC default)
+    assert queue_blocks_from_ms(6000.0, 480, 48000, minimum=64) == 600
+
+
+def test_queue_blocks_from_ms_zero_yields_minimum():
+    assert queue_blocks_from_ms(0.0, 480, 48000, minimum=64) == 64
+
+
+def test_queue_blocks_from_ms_rejects_zero_block_size():
+    with pytest.raises(ValueError):
+        queue_blocks_from_ms(1000.0, 0, 48000)
+
+
+def test_queue_blocks_from_ms_rejects_zero_sample_rate():
+    with pytest.raises(ValueError):
+        queue_blocks_from_ms(1000.0, 480, 0)

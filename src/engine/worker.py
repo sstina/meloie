@@ -148,6 +148,7 @@ def rvc_worker_loop(
     crossfade_size: int = 0,
     fallback_to_identity_on_error: bool = True,
     poll_timeout_seconds: float = 0.1,
+    drop_stale_input: bool = True,
 ) -> None:
     """Chunked RVC worker.
 
@@ -181,6 +182,7 @@ def rvc_worker_loop(
     input_acc = BlockAccumulator(ChunkerConfig(chunk_size=int(chunk_size)))
     output_acc = BlockAccumulator(ChunkerConfig(chunk_size=int(output_block_size)))
     pending_tail: Optional[np.ndarray] = None
+    saw_shutdown = False
 
     def _emit(buf: np.ndarray) -> None:
         if buf.size == 0:
@@ -188,23 +190,63 @@ def rvc_worker_loop(
         for sub in output_acc.feed(buf):
             try:
                 out_queue.put_nowait(sub)
+                metrics.rvc_output_blocks_enqueued += 1
+                if not metrics.first_real_output_seen:
+                    metrics.first_real_output_seen = True
+                qd = out_queue.qsize()
+                if qd > metrics.max_output_queue_depth:
+                    metrics.max_output_queue_depth = qd
             except queue.Full:
                 metrics.output_queue_drops += 1
+                metrics.rvc_output_blocks_dropped += 1
 
     while not stop_event.is_set():
+        # Wait for at least one input block. ``poll_timeout_seconds`` keeps
+        # the loop responsive to ``stop_event`` even when the mic is silent.
         try:
-            block = in_queue.get(timeout=poll_timeout_seconds)
+            first_block = in_queue.get(timeout=poll_timeout_seconds)
         except queue.Empty:
             continue
-        if block is shutdown_sentinel:
+        if first_block is shutdown_sentinel:
             break
 
+        # Drain everything that arrived while we were busy with the
+        # previous chunk's inference. This is the fix for the live-vs-
+        # benchmark gap: without this drain, we processed 640 ms-stale
+        # audio on every cycle.
+        pulled_blocks = [first_block]
+        while True:
+            try:
+                b = in_queue.get_nowait()
+                if b is shutdown_sentinel:
+                    saw_shutdown = True
+                    break
+                pulled_blocks.append(b)
+            except queue.Empty:
+                break
+        # Sample max input queue depth right after we just drained — qsize
+        # is sticky-low at that point, so we count what we just removed.
+        observed_depth = len(pulled_blocks) + in_queue.qsize()
+        if observed_depth > metrics.max_input_queue_depth:
+            metrics.max_input_queue_depth = observed_depth
+
+        # Feed all pulled blocks into the chunk accumulator.
+        chunks: list = []
         try:
-            chunks = input_acc.feed(block)
+            for b in pulled_blocks:
+                chunks.extend(input_acc.feed(b))
         except Exception:
-            # Bad block shape — count as fallback and drop.
             metrics.rvc_fallback_count += 1
+            if saw_shutdown:
+                break
             continue
+
+        # If multiple chunks are ready and stale-drop is on, keep only the
+        # latest — the older chunks would otherwise add latency without
+        # adding listenable content (we'd never catch up).
+        if drop_stale_input and len(chunks) > 1:
+            metrics.rvc_stale_chunk_drops += len(chunks) - 1
+            chunks = chunks[-1:]
 
         for chunk in chunks:
             t0 = time.perf_counter()
@@ -231,7 +273,9 @@ def rvc_worker_loop(
             elif result_sr != int(sample_rate):
                 # Valid audio at a different SR -> rate-match it. The
                 # worker now stays correct without sacrificing chunks.
+                t_rs = time.perf_counter()
                 processed = linear_resample(processed, result_sr, int(sample_rate))
+                metrics.record_resample_ms((time.perf_counter() - t_rs) * 1000.0)
 
             # NaN/Inf scrub — RVC can produce these on edge cases.
             scrub = scrub_nan_inf(processed)
@@ -261,6 +305,9 @@ def rvc_worker_loop(
                 _emit(processed[crossfade_size:-crossfade_size])
                 pending_tail = processed[-crossfade_size:].astype(np.float32, copy=True)
 
+        if saw_shutdown:
+            break
+
     # Shutdown: emit any held tail and partial block leftover.
     if pending_tail is not None:
         _emit(pending_tail)
@@ -268,5 +315,7 @@ def rvc_worker_loop(
     if leftover.size > 0:
         try:
             out_queue.put_nowait(leftover)
+            metrics.rvc_output_blocks_enqueued += 1
         except queue.Full:
             metrics.output_queue_drops += 1
+            metrics.rvc_output_blocks_dropped += 1

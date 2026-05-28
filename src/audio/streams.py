@@ -170,10 +170,14 @@ def _print_metrics_line(metrics, in_q, out_q, mode_label: str) -> None:
     if mode_label == "rvc":
         base += (
             f" rvc_n={metrics.rvc_chunks_processed} "
-            f"infer_last={metrics.rvc_inference_last_ms:5.1f}ms "
-            f"mean={metrics.rvc_inference_mean_ms:5.1f}ms "
-            f"max={metrics.rvc_inference_max_ms:5.1f}ms "
-            f"rfb={metrics.rvc_fallback_count}"
+            f"infer_last={metrics.rvc_inference_last_ms:5.0f}ms "
+            f"mean={metrics.rvc_inference_mean_ms:5.0f}ms "
+            f"max={metrics.rvc_inference_max_ms:5.0f}ms "
+            f"rfb={metrics.rvc_fallback_count} "
+            f"stale={metrics.rvc_stale_chunk_drops} "
+            f"enq={metrics.rvc_output_blocks_enqueued} "
+            f"odrop={metrics.rvc_output_blocks_dropped} "
+            f"rs_mean={metrics.rvc_resample_mean_ms:4.1f}ms"
         )
     print(base, flush=True)
 
@@ -199,8 +203,19 @@ def _print_summary(
         print(f"rvc_chunks_processed     = {metrics.rvc_chunks_processed}")
         print(f"rvc_inference_count      = {metrics.rvc_inference_count}")
         print(f"rvc_inference_mean_ms    = {metrics.rvc_inference_mean_ms:.2f}")
+        print(f"rvc_inference_median_ms  = {metrics.inference_median_ms():.2f}")
+        print(f"rvc_inference_p95_ms     = {metrics.inference_percentile_ms(95.0):.2f}")
         print(f"rvc_inference_max_ms     = {metrics.rvc_inference_max_ms:.2f}")
         print(f"rvc_fallback_count       = {metrics.rvc_fallback_count}")
+        print(f"rvc_stale_chunk_drops    = {metrics.rvc_stale_chunk_drops}")
+        print(f"rvc_output_blocks_enqueued = {metrics.rvc_output_blocks_enqueued}")
+        print(f"rvc_output_blocks_dropped  = {metrics.rvc_output_blocks_dropped}")
+        print(f"rvc_resample_count       = {metrics.rvc_resample_count}")
+        print(f"rvc_resample_mean_ms     = {metrics.rvc_resample_mean_ms:.2f}")
+        print(f"max_input_queue_depth    = {metrics.max_input_queue_depth}")
+        print(f"max_output_queue_depth   = {metrics.max_output_queue_depth}")
+        print(f"startup_output_underruns = {metrics.startup_output_underruns}")
+        print(f"steady_state_output_underruns = {metrics.steady_state_output_underruns}")
         print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")
         print(f"crossfade_ms             = {metrics.rvc_crossfade_ms}")
         print(f"model                    = {metrics.rvc_model_basename or '(none)'}")
@@ -219,6 +234,9 @@ def _run_stream(
     allow_virtual_cable_input: bool,
     metrics_interval_seconds: float,
     intro_extra: Optional[List[str]] = None,
+    input_queue_capacity: Optional[int] = None,
+    output_queue_capacity: Optional[int] = None,
+    output_prebuffer_blocks: int = 0,
 ) -> RuntimeMetrics:
     config.validate()
     if duration_seconds is not None and duration_seconds <= 0:
@@ -258,10 +276,38 @@ def _run_stream(
             "only. Verify there is no feedback loop with Discord/OBS."
         )
 
-    in_q: "queue.Queue" = queue.Queue(maxsize=config.queue_blocks)
-    out_q: "queue.Queue" = queue.Queue(maxsize=config.queue_blocks)
+    in_cap = int(input_queue_capacity or config.queue_blocks)
+    out_cap = int(output_queue_capacity or config.queue_blocks)
+    in_q: "queue.Queue" = queue.Queue(maxsize=in_cap)
+    out_q: "queue.Queue" = queue.Queue(maxsize=out_cap)
     metrics = RuntimeMetrics()
     stop_event = threading.Event()
+
+    in_q_ms = in_cap * config.block_size * 1000.0 / max(1, config.sample_rate)
+    out_q_ms = out_cap * config.block_size * 1000.0 / max(1, config.sample_rate)
+    print(
+        f"queues: input {in_cap} blocks (~{in_q_ms:.0f} ms)  "
+        f"output {out_cap} blocks (~{out_q_ms:.0f} ms)"
+    )
+
+    # Optional silence prebuffer for the output stream so the first ~N
+    # output blocks have something to play while the worker spins up
+    # / finishes its first chunk's inference. Audible as "extra
+    # latency" but masks startup underruns.
+    if output_prebuffer_blocks > 0:
+        silence_block = np.zeros(config.block_size, dtype=np.float32)
+        actually_buffered = 0
+        for _ in range(output_prebuffer_blocks):
+            try:
+                out_q.put_nowait(silence_block.copy())
+                actually_buffered += 1
+            except queue.Full:
+                break
+        pre_ms = actually_buffered * config.block_size * 1000.0 / max(1, config.sample_rate)
+        print(
+            f"prebuffered {actually_buffered} silence blocks "
+            f"(~{pre_ms:.0f} ms of safety margin before first real audio)"
+        )
 
     def in_callback(indata, frames, time_info, status):  # noqa: ANN001
         if status:
@@ -283,6 +329,12 @@ def _run_stream(
         except queue.Empty:
             outdata.fill(0.0)
             metrics.output_underruns += 1
+            # Bin into startup vs steady-state by checking whether the
+            # worker has yet emitted any real audio.
+            if metrics.first_real_output_seen:
+                metrics.steady_state_output_underruns += 1
+            else:
+                metrics.startup_output_underruns += 1
             metrics.output_peak_dbfs = dbfs_peak(np.zeros(frames, dtype=np.float32))
             metrics.output_rms_dbfs = dbfs_rms(np.zeros(frames, dtype=np.float32))
             metrics.output_frames += int(frames)
@@ -318,6 +370,13 @@ def _run_stream(
             while True:
                 now = time.monotonic()
                 metrics.elapsed_seconds = now - start_wall
+                # Track high-water marks of queue depths.
+                qi = in_q.qsize()
+                qo = out_q.qsize()
+                if qi > metrics.max_input_queue_depth:
+                    metrics.max_input_queue_depth = qi
+                if qo > metrics.max_output_queue_depth:
+                    metrics.max_output_queue_depth = qo
                 if duration_seconds is not None and metrics.elapsed_seconds >= duration_seconds:
                     break
                 if now - last_print >= metrics_interval_seconds:
@@ -371,6 +430,23 @@ def run_identity_stream(
     )
 
 
+def queue_blocks_from_ms(
+    queue_ms: float, block_size: int, sample_rate: int, minimum: int = 64
+) -> int:
+    """Convert a queue capacity in ms to a number of blocks.
+
+    Caps to at least ``minimum`` blocks so identity-era defaults still
+    work even with very small ``queue_ms`` values.
+    """
+    if block_size <= 0 or sample_rate <= 0:
+        raise ValueError("block_size and sample_rate must be > 0")
+    if queue_ms <= 0:
+        return int(minimum)
+    block_ms = float(block_size) * 1000.0 / float(sample_rate)
+    n = int(round(float(queue_ms) / block_ms))
+    return max(int(minimum), n)
+
+
 def run_rvc_stream(
     config: AudioRuntimeConfig,
     engine,
@@ -379,6 +455,9 @@ def run_rvc_stream(
     duration_seconds: Optional[float] = None,
     allow_virtual_cable_input: bool = False,
     metrics_interval_seconds: float = 1.0,
+    rvc_queue_ms: float = 6000.0,
+    rvc_prebuffer_ms: Optional[float] = None,
+    drop_stale_input: bool = True,
 ) -> RuntimeMetrics:
     """Open the realtime RVC chunk loop and run it.
 
@@ -402,6 +481,27 @@ def run_rvc_stream(
     crossfade_size = max(0, int(round(crossfade_ms / 1000.0 * config.sample_rate)))
     output_block_size = int(config.block_size)
 
+    # RVC mode needs much larger queues than identity. The identity-era
+    # default of 64 blocks (~640 ms at 48 kHz / 480-frame blocks) is too
+    # small to hold a single ~1 s chunk's worth of output blocks, so
+    # post-inference audio gets discarded.
+    rvc_queue_blocks = queue_blocks_from_ms(
+        float(rvc_queue_ms), config.block_size, config.sample_rate,
+        minimum=config.queue_blocks,
+    )
+    # Prebuffer: silence blocks placed in out_q before opening the audio
+    # stream. Hides the first-chunk inference time at the cost of that
+    # much added latency. Default = 2 × chunk_ms (one chunk to accumulate,
+    # roughly one chunk to infer).
+    prebuffer_ms = (
+        float(rvc_prebuffer_ms)
+        if rvc_prebuffer_ms is not None
+        else float(chunk_ms) * 2.0
+    )
+    prebuffer_blocks = max(
+        0, int(round(prebuffer_ms * config.sample_rate / 1000.0 / config.block_size))
+    )
+
     model_basename = os.path.basename(engine.config.model_path or "")
     index_basename = (
         os.path.basename(engine.config.index_path) if engine.config.index_path else ""
@@ -417,7 +517,10 @@ def run_rvc_stream(
         + (f" / {engine.cuda_device_name}" if engine.cuda_device_name else ""),
         f"resample_sr={engine.config.resample_sr}  "
         f"stream_sr={config.sample_rate}  "
-        f"(must match for safe enqueue; mismatch -> rvc_fallback_count)",
+        f"(SR mismatch -> worker linear_resample, not fallback)",
+        f"rvc_queue_blocks={rvc_queue_blocks}  "
+        f"rvc_prebuffer_blocks={prebuffer_blocks}  "
+        f"drop_stale_input={drop_stale_input}",
         f"f0_method={engine.config.f0_method}  "
         f"index_rate={engine.config.index_rate}  "
         f"protect={engine.config.protect}  "
@@ -452,6 +555,7 @@ def run_rvc_stream(
                 "chunk_size": int(chunk_size),
                 "output_block_size": int(output_block_size),
                 "crossfade_size": int(crossfade_size),
+                "drop_stale_input": bool(drop_stale_input),
             },
             name="rvc-worker",
             daemon=True,
@@ -463,4 +567,7 @@ def run_rvc_stream(
         config, factory, "rvc",
         duration_seconds, allow_virtual_cable_input, metrics_interval_seconds,
         intro_extra=intro_extra,
+        input_queue_capacity=rvc_queue_blocks,
+        output_queue_capacity=rvc_queue_blocks,
+        output_prebuffer_blocks=prebuffer_blocks,
     )

@@ -137,3 +137,37 @@ def test_audio_level_metrics_default_to_silence_floor():
     assert al.peak_dbfs == DBFS_SILENCE_FLOOR
     assert al.rms_dbfs == DBFS_SILENCE_FLOOR
     json.dumps(al.to_dict())  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Stage 2E: median / p95 helpers and resample mean
+# ---------------------------------------------------------------------------
+
+def test_inference_median_and_p95_use_recorded_times():
+    m = RuntimeMetrics()
+    for ms in (100.0, 200.0, 300.0, 400.0, 500.0):
+        m.record_inference_ms(ms)
+    assert m.rvc_inference_count == 5
+    assert m.inference_median_ms() == pytest.approx(300.0)
+    # p95 of 5 samples with default numpy linear interp lands near max
+    assert m.inference_percentile_ms(95.0) > m.inference_median_ms()
+
+
+def test_record_resample_ms_updates_mean():
+    m = RuntimeMetrics()
+    m.record_resample_ms(2.0)
+    m.record_resample_ms(4.0)
+    m.record_resample_ms(6.0)
+    assert m.rvc_resample_count == 3
+    assert m.rvc_resample_mean_ms == pytest.approx(4.0)
+    assert m.rvc_resample_last_ms == pytest.approx(6.0)
+
+
+def test_inference_times_list_is_capped():
+    m = RuntimeMetrics()
+    m.rvc_inference_times_cap = 5
+    for _ in range(20):
+        m.record_inference_ms(1.0)
+    assert len(m.rvc_inference_times_ms) == 5
+    # but the running counters still count all 20
+    assert m.rvc_inference_count == 20

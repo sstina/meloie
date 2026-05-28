@@ -66,6 +66,42 @@ def test_parser_warmup_disable_via_zero():
     assert args.warmup_rvc_count == 0
 
 
+def test_parser_rvc_queue_and_prebuffer_defaults():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+    ])
+    assert args.rvc_queue_ms == 6000.0
+    assert args.rvc_prebuffer_ms is None  # main computes 2 * chunk_ms
+    assert args.drop_stale_input is True
+
+
+def test_parser_can_disable_stale_drop():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+        "--no-drop-stale-input",
+    ])
+    assert args.drop_stale_input is False
+
+
+def test_parser_accepts_explicit_queue_and_prebuffer():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+        "--rvc-queue-ms", "8000",
+        "--rvc-prebuffer-ms", "1500",
+    ])
+    assert args.rvc_queue_ms == 8000.0
+    assert args.rvc_prebuffer_ms == 1500.0
+
+
 def test_parser_rejects_unknown_device():
     parser = _build_parser()
     import pytest
