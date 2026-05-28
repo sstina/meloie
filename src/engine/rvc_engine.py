@@ -41,8 +41,9 @@ documented public API:
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -414,3 +415,46 @@ class RvcEngine:
 
         audio_f32 = audio.astype(np.float32, copy=False)
         return self._backend.infer(audio_f32, int(sample_rate))
+
+    def warmup(
+        self, chunk_samples: int, sample_rate: int, count: int = 2
+    ) -> List[float]:
+        """Run ``count`` dummy inference calls to trigger backend init.
+
+        The first call after ``load()`` is dominated by GPU memory upload
+        + cuDNN autotune for the input shape (observed ~30 s on RTX 4080
+        for kiki at 48 kHz / 1 s chunks). Subsequent calls drop to
+        ~640 ms steady-state. Calling this *before* opening the audio
+        stream prevents the first realtime chunk from underrunning.
+
+        Returns per-call wall-clock times in milliseconds (CUDA-synced
+        if available).
+        """
+        if not self._loaded:
+            raise RvcInferenceError(
+                "engine not loaded; call RvcEngine.load() first"
+            )
+        if int(chunk_samples) <= 0:
+            raise ValueError("chunk_samples must be > 0")
+        if int(sample_rate) <= 0:
+            raise ValueError("sample_rate must be > 0")
+        if int(count) <= 0:
+            return []
+
+        # Tiny sine so F0 / HuBERT have actual signal to process. Pure
+        # silence sometimes makes RMVPE return NaN.
+        t = np.arange(int(chunk_samples), dtype=np.float64) / float(sample_rate)
+        audio = (0.01 * np.sin(2.0 * np.pi * 200.0 * t)).astype(np.float32)
+
+        timings: List[float] = []
+        for _ in range(int(count)):
+            t0 = time.perf_counter()
+            self.infer_array(audio, int(sample_rate))
+            try:
+                import torch  # noqa: WPS433
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except ImportError:
+                pass
+            timings.append((time.perf_counter() - t0) * 1000.0)
+        return timings

@@ -20,7 +20,7 @@ import threading
 import numpy as np
 import pytest
 
-from src.audio.chunker import BlockAccumulator, ChunkerConfig
+from src.audio.chunker import BlockAccumulator, ChunkerConfig, linear_resample
 from src.engine.crossfade import linear_crossfade
 from src.engine.rvc_engine import RvcEngine
 from src.engine.worker import (
@@ -199,6 +199,49 @@ def test_chunker_rejects_stereo_block():
     acc = BlockAccumulator(ChunkerConfig(chunk_size=100))
     with pytest.raises(ValueError):
         acc.feed(np.zeros((50, 2), dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# linear_resample (Stage 2D)
+# ---------------------------------------------------------------------------
+
+def test_linear_resample_same_rate_is_noop_copy():
+    audio = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+    out = linear_resample(audio, 48000, 48000)
+    np.testing.assert_array_equal(out, audio)
+    # must be a copy
+    out[0] = 99.0
+    assert audio[0] == pytest.approx(0.1)
+
+
+def test_linear_resample_40k_to_48k_changes_length():
+    # 40 kHz -> 48 kHz: 1.0 second of audio
+    audio = np.sin(2 * np.pi * 440.0 * np.arange(40000) / 40000).astype(np.float32)
+    out = linear_resample(audio, 40000, 48000)
+    assert out.size == 48000
+    assert out.dtype == np.float32
+    # peak should still be ~1.0 (we don't lose energy at the peaks)
+    assert float(np.max(np.abs(out))) == pytest.approx(1.0, abs=2e-2)
+
+
+def test_linear_resample_48k_to_40k_changes_length_down():
+    audio = np.ones(48000, dtype=np.float32) * 0.5
+    out = linear_resample(audio, 48000, 40000)
+    assert out.size == 40000
+    np.testing.assert_allclose(out, 0.5 * np.ones(40000, dtype=np.float32), atol=1e-6)
+
+
+def test_linear_resample_rejects_zero_or_negative_sr():
+    audio = np.zeros(100, dtype=np.float32)
+    with pytest.raises(ValueError):
+        linear_resample(audio, 0, 48000)
+    with pytest.raises(ValueError):
+        linear_resample(audio, 48000, -1)
+
+
+def test_linear_resample_rejects_stereo():
+    with pytest.raises(ValueError):
+        linear_resample(np.zeros((100, 2), dtype=np.float32), 44100, 48000)
 
 
 # ---------------------------------------------------------------------------

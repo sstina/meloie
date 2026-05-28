@@ -34,7 +34,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..audio.chunker import BlockAccumulator, ChunkerConfig
+from ..audio.chunker import BlockAccumulator, ChunkerConfig, linear_resample
 from ..audio.devices import iter_device_infos  # noqa: F401  (re-export friendliness)
 from ..engine.crossfade import linear_crossfade
 from ..safety.guard import scrub_nan_inf
@@ -208,12 +208,11 @@ def rvc_worker_loop(
 
         for chunk in chunks:
             t0 = time.perf_counter()
-            sr_mismatch = False
+            result_sr = int(sample_rate)
             try:
-                processed, result_sr = engine.infer_array(chunk, int(sample_rate))
+                processed, result_sr_raw = engine.infer_array(chunk, int(sample_rate))
                 processed = np.asarray(processed, dtype=np.float32).reshape(-1)
-                if int(result_sr) != int(sample_rate):
-                    sr_mismatch = True
+                result_sr = int(result_sr_raw)
             except Exception:
                 if not fallback_to_identity_on_error:
                     raise
@@ -221,15 +220,18 @@ def rvc_worker_loop(
                 metrics.rvc_fallback_count += 1
             metrics.record_inference_ms((time.perf_counter() - t0) * 1000.0)
 
-            # Safety: if the backend returned audio at a different sample
-            # rate than the stream expects, we cannot safely enqueue it
-            # (downstream OutputStream is fixed at ``sample_rate``;
-            # mismatched audio would play back at the wrong pitch/length
-            # and desynchronise the chunk -> block splitter). Fall back
-            # to identity for this chunk so the audio link stays alive.
-            if sr_mismatch:
+            # SR handling. The kiki model returns 40 kHz natively while the
+            # stream is 48 kHz; asking infer_rvc_python to resample
+            # internally (resample_sr=stream_sr) is too slow for realtime.
+            # Faster: take the model's native SR back and resample here.
+            if processed.size == 0 or result_sr <= 0:
+                # Genuine garbage from backend -> identity fallback.
                 processed = chunk.astype(np.float32, copy=True)
                 metrics.rvc_fallback_count += 1
+            elif result_sr != int(sample_rate):
+                # Valid audio at a different SR -> rate-match it. The
+                # worker now stays correct without sacrificing chunks.
+                processed = linear_resample(processed, result_sr, int(sample_rate))
 
             # NaN/Inf scrub — RVC can produce these on edge cases.
             scrub = scrub_nan_inf(processed)

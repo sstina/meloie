@@ -88,9 +88,15 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="DEPRECATED: equivalent to --device cpu.")
     rvc.add_argument("--resample-sr", type=int, default=None,
                      help="Ask the RVC backend to resample its output to this "
-                          "sample rate. Default for realtime is the stream's "
-                          "sample_rate (e.g. 48000) so the OutputStream sees "
-                          "matching audio.")
+                          "sample rate. Default for realtime is 0 (model's "
+                          "native rate; the worker resamples to the stream "
+                          "SR with a cheap linear interpolator). Override "
+                          "to a positive SR to make the backend resample "
+                          "internally (slower in our benchmarks).")
+    rvc.add_argument("--warmup-rvc-count", type=int, default=2,
+                     help="Number of dummy inference calls to run BEFORE "
+                          "opening the audio stream. Avoids the cold-start "
+                          "stall (~30 s first call). Set 0 to disable.")
 
     return parser
 
@@ -243,10 +249,12 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
     from .audio.devices import FeedbackLoopRisk
     from .audio.streams import run_rvc_stream
 
-    # For realtime, default --resample-sr to the stream's sample rate so the
-    # OutputStream sees matching audio (the kiki model natively returns 40 kHz;
-    # without this, a 40 kHz buffer would be played as if it were 48 kHz).
-    resample_sr = args.resample_sr if args.resample_sr is not None else config.sample_rate
+    # Stage 2D default: resample_sr=0 (model's native SR) and let the
+    # worker linear-resample to the stream SR. The Stage 2D benchmark
+    # showed that asking infer_rvc_python to resample internally added
+    # ~230 ms/chunk on kiki @ chunk_ms=1000, pushing rt > 1. Worker-side
+    # linear resample costs ~1 ms.
+    resample_sr = args.resample_sr if args.resample_sr is not None else 0
 
     rvc_config = RvcEngineConfig(
         model_path=args.model_path,
@@ -281,6 +289,21 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
         f"cuda_device={engine.cuda_device_name or '(n/a)'} "
         f"resample_sr={resample_sr}"
     )
+
+    if args.warmup_rvc_count > 0:
+        warmup_chunk_samples = max(1, int(round(args.chunk_ms / 1000.0 * config.sample_rate)))
+        print(
+            f"warming up RVC ({args.warmup_rvc_count} calls, "
+            f"chunk_samples={warmup_chunk_samples} at {config.sample_rate} Hz)..."
+        )
+        try:
+            timings = engine.warmup(
+                warmup_chunk_samples, config.sample_rate, args.warmup_rvc_count
+            )
+            for i, ms in enumerate(timings):
+                print(f"  warmup #{i + 1}: {ms:.0f} ms")
+        except (RvcInferenceError, ValueError) as exc:
+            print(f"warning: warmup failed (continuing): {exc}", file=sys.stderr)
 
     try:
         run_rvc_stream(

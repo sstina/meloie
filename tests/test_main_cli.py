@@ -45,6 +45,27 @@ def test_parser_accepts_cuda_device_and_explicit_resample_sr():
     assert args.resample_sr == 48000
 
 
+def test_parser_warmup_default_is_two():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+    ])
+    assert args.warmup_rvc_count == 2
+
+
+def test_parser_warmup_disable_via_zero():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+        "--warmup-rvc-count", "0",
+    ])
+    assert args.warmup_rvc_count == 0
+
+
 def test_parser_rejects_unknown_device():
     parser = _build_parser()
     import pytest

@@ -265,21 +265,22 @@ class _WrongSrEngine:
         return audio.astype(np.float32, copy=True), self.returned_sr
 
 
-def test_rvc_worker_falls_back_when_returned_sr_mismatches_stream_sr():
-    """If the backend returns audio at a different SR than the stream is
-    using, the worker must refuse to enqueue it (would otherwise corrupt
-    pitch and chunk-block alignment) and use identity instead."""
-    chunk_size = 1920
+def test_rvc_worker_resamples_when_returned_sr_mismatches_stream_sr():
+    """Stage 2D: if the backend returns valid audio at a different SR
+    than the stream uses, the worker now resamples to match (cheap
+    linear interp) instead of falling back to identity. This unlocks
+    the kiki@native_sr=40k path which is the only realtime-fits config."""
+    chunk_size = 4800        # 100 ms @ 48 kHz
     block_size = 480
-    in_q: "queue.Queue" = queue.Queue(maxsize=32)
-    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
     metrics = RuntimeMetrics()
     stop = threading.Event()
-    engine = _WrongSrEngine(returned_sr=40000)  # stream is 48000
+    engine = _WrongSrEngine(returned_sr=40000)  # model native SR
 
-    expected = np.full(chunk_size, 0.3, dtype=np.float32)
+    input_audio = np.full(chunk_size, 0.3, dtype=np.float32)
     for i in range(chunk_size // block_size):
-        in_q.put(expected[i * block_size:(i + 1) * block_size])
+        in_q.put(input_audio[i * block_size:(i + 1) * block_size])
     in_q.put(SENTINEL)
 
     rvc_worker_loop(
@@ -292,11 +293,46 @@ def test_rvc_worker_falls_back_when_returned_sr_mismatches_stream_sr():
     )
 
     assert engine.call_count == 1
+    # No fallback — the resample path took over.
+    assert metrics.rvc_fallback_count == 0
+    # The fake engine returns the input audio at 40 kHz; the worker
+    # resamples back to 48 kHz, so the output length should match the
+    # original input chunk length when rounded.
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    # 4800 samples at 40 kHz -> resampled to 48 kHz -> 5760 samples,
+    # then chunked into 480-sample blocks; output_block_size divides it.
+    assert total == 5760
+
+
+def test_rvc_worker_falls_back_when_backend_returns_invalid_sr():
+    """A backend returning result_sr <= 0 is a hard error -> identity."""
+    chunk_size = 4800
+    block_size = 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _WrongSrEngine(returned_sr=0)  # invalid
+
+    input_audio = np.full(chunk_size, 0.3, dtype=np.float32)
+    for i in range(chunk_size // block_size):
+        in_q.put(input_audio[i * block_size:(i + 1) * block_size])
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+    )
+
     assert metrics.rvc_fallback_count == 1
-    # output should be the identity (input) audio
     out_blocks = _drain(out_q)
     concat = np.concatenate(out_blocks)
-    np.testing.assert_allclose(concat, expected, atol=1e-6)
+    np.testing.assert_allclose(concat, input_audio, atol=1e-6)
 
 
 def test_rvc_worker_accepts_matching_sr():

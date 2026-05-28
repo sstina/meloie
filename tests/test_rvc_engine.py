@@ -207,6 +207,47 @@ def test_engine_rejects_zero_sample_rate():
 
 
 # ---------------------------------------------------------------------------
+# Stage 2D: warmup() helper
+# ---------------------------------------------------------------------------
+
+def test_warmup_runs_count_inferences():
+    backend = _FakeBackend()
+    engine = RvcEngine(RvcEngineConfig(model_path="/fake/m.pth"), backend=backend)
+    engine.load()
+    timings = engine.warmup(chunk_samples=4800, sample_rate=48000, count=3)
+    assert len(timings) == 3
+    assert all(t >= 0.0 for t in timings)
+    assert backend.infer_calls == 3
+    # Each warmup call used the requested chunk size
+    assert backend.last_size == 4800
+
+
+def test_warmup_zero_count_returns_empty_list():
+    backend = _FakeBackend()
+    engine = RvcEngine(RvcEngineConfig(model_path="/fake/m.pth"), backend=backend)
+    engine.load()
+    timings = engine.warmup(chunk_samples=4800, sample_rate=48000, count=0)
+    assert timings == []
+    assert backend.infer_calls == 0
+
+
+def test_warmup_requires_loaded_engine():
+    engine = RvcEngine(RvcEngineConfig(model_path="/fake/m.pth"))
+    with pytest.raises(RvcInferenceError):
+        engine.warmup(chunk_samples=480, sample_rate=48000, count=1)
+
+
+def test_warmup_rejects_bad_args():
+    backend = _FakeBackend()
+    engine = RvcEngine(RvcEngineConfig(model_path="/fake/m.pth"), backend=backend)
+    engine.load()
+    with pytest.raises(ValueError):
+        engine.warmup(chunk_samples=0, sample_rate=48000, count=1)
+    with pytest.raises(ValueError):
+        engine.warmup(chunk_samples=480, sample_rate=0, count=1)
+
+
+# ---------------------------------------------------------------------------
 # Import safety
 # ---------------------------------------------------------------------------
 
