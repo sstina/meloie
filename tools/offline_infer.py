@@ -45,6 +45,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Path to RVC .pth (place local models under models/local/).")
     p.add_argument("--index-path", default=None,
                    help="Path to .index (optional).")
+    p.add_argument("--hubert-path", default=None,
+                   help="Path to hubert_base.pt (optional; backend "
+                        "downloads it if omitted).")
+    p.add_argument("--rmvpe-path", default=None,
+                   help="Path to rmvpe.pt (optional; backend "
+                        "downloads it if omitted).")
     p.add_argument("--backend", default="infer_rvc_python")
     p.add_argument("--f0-method", default="rmvpe")
     p.add_argument("--index-rate", type=float, default=0.5)
@@ -108,6 +114,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         rms_mix_rate=args.rms_mix_rate,
         pitch_shift=args.pitch_shift,
         force_cpu=args.force_cpu,
+        hubert_path=args.hubert_path,
+        rmvpe_path=args.rmvpe_path,
     )
     engine = RvcEngine(cfg)
 

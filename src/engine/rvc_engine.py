@@ -94,6 +94,12 @@ class RvcEngineConfig:
     force_cpu: bool = False
     backend_tag: str = "tvoice_default"    # opaque label for backend cache
 
+    # Optional explicit paths to the shared assets infer_rvc_python
+    # otherwise downloads. Set these when the model bundle already
+    # ships hubert_base.pt / rmvpe.pt next to the .pth.
+    hubert_path: Optional[str] = None
+    rmvpe_path: Optional[str] = None
+
     def validate(self) -> None:
         if not (0.0 <= self.index_rate <= 1.0):
             raise ValueError(f"index_rate must be in [0, 1]; got {self.index_rate}")
@@ -134,6 +140,7 @@ class _InferRvcPythonBackend(RvcBackend):
 
     def __init__(self) -> None:
         self._converter = None
+        self._tag = None
 
     def load(self, config: RvcEngineConfig) -> None:
         try:
@@ -156,9 +163,21 @@ class _InferRvcPythonBackend(RvcBackend):
             raise ModelLoadError(
                 f"index_path not found: {config.index_path!r}"
             )
+        if config.hubert_path and not os.path.exists(config.hubert_path):
+            raise ModelLoadError(
+                f"hubert_path not found: {config.hubert_path!r}"
+            )
+        if config.rmvpe_path and not os.path.exists(config.rmvpe_path):
+            raise ModelLoadError(
+                f"rmvpe_path not found: {config.rmvpe_path!r}"
+            )
 
         try:
-            self._converter = BaseLoader(only_cpu=bool(config.force_cpu))
+            self._converter = BaseLoader(
+                only_cpu=bool(config.force_cpu),
+                hubert_path=config.hubert_path,
+                rmvpe_path=config.rmvpe_path,
+            )
             self._converter.apply_conf(
                 tag=config.backend_tag,
                 file_model=config.model_path,
@@ -169,8 +188,9 @@ class _InferRvcPythonBackend(RvcBackend):
                 respiration_median_filtering=int(config.filter_radius),
                 resample_sr=int(config.resample_sr or 0),
                 envelope_ratio=float(config.rms_mix_rate),
-                consonant_protection=float(config.protect),
+                consonant_breath_protection=float(config.protect),
             )
+            self._tag = config.backend_tag
         except Exception as exc:  # backend raised during config/load
             raise ModelLoadError(
                 f"infer_rvc_python failed to load model: {exc}"
@@ -186,13 +206,28 @@ class _InferRvcPythonBackend(RvcBackend):
         try:
             result_audio, result_sr = self._converter.generate_from_cache(
                 audio_data=(audio, int(sample_rate)),
-                tag=None,
+                tag=self._tag,
             )
         except Exception as exc:
             raise RvcInferenceError(
                 f"infer_rvc_python inference failed: {exc}"
             ) from exc
-        out = np.asarray(result_audio).reshape(-1).astype(np.float32, copy=False)
+
+        out = np.asarray(result_audio).reshape(-1)
+        # infer_rvc_python returns audio at int16 magnitude (peak ~32768),
+        # not normalised to [-1, 1]. Convert defensively: integer dtypes
+        # use the dtype's full scale; floats that are clearly outside
+        # [-1.5, 1.5] are assumed to be int16-scale and rescaled.
+        if np.issubdtype(out.dtype, np.integer):
+            info = np.iinfo(out.dtype)
+            scale = float(max(abs(int(info.min)), abs(int(info.max))))
+            out = out.astype(np.float32) / scale
+        else:
+            out = out.astype(np.float32, copy=False)
+            if out.size:
+                peak = float(np.max(np.abs(out)))
+                if peak > 1.5:
+                    out = out / np.float32(32768.0)
         return out, int(result_sr)
 
 

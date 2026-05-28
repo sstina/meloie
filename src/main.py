@@ -61,6 +61,10 @@ def _build_parser() -> argparse.ArgumentParser:
     rvc = parser.add_argument_group("RVC mode (--mode rvc)")
     rvc.add_argument("--model-path", help="Path to RVC .pth model.")
     rvc.add_argument("--index-path", default=None, help="Path to .index file (optional).")
+    rvc.add_argument("--hubert-path", default=None,
+                     help="Path to hubert_base.pt (optional; backend downloads it if omitted).")
+    rvc.add_argument("--rmvpe-path", default=None,
+                     help="Path to rmvpe.pt (optional; backend downloads it if omitted).")
     rvc.add_argument("--backend", default="infer_rvc_python",
                      help="RVC backend identifier (default: infer_rvc_python).")
     rvc.add_argument("--f0-method", default="rmvpe")
@@ -241,6 +245,8 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
         pitch_shift=args.pitch_shift,
         sample_rate=config.sample_rate,
         force_cpu=args.force_cpu,
+        hubert_path=args.hubert_path,
+        rmvpe_path=args.rmvpe_path,
     )
 
     engine = RvcEngine(rvc_config)
