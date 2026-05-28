@@ -148,11 +148,16 @@ def _build_parser() -> argparse.ArgumentParser:
                           "engine sees [previous_input_tail, chunk]; the "
                           "model's output for the context region is "
                           "trimmed away proportionally so the chunk's "
-                          "EMITTED duration stays exactly chunk_ms (no "
-                          "timeline drift). Eliminates per-chunk cold-"
-                          "start in HuBERT / F0 / index without any "
-                          "output-side blending. Set 0 to disable. "
-                          "Engineering knob, not a voice tuning knob.")
+                          "EMITTED duration stays close to chunk_ms (no "
+                          "accumulating timeline drift). Eliminates per-"
+                          "chunk cold-start in HuBERT / F0 / index "
+                          "without any output-side blending. Set 0 to "
+                          "disable. ENGINEERING knob (continuity / "
+                          "boundary quality), NOT a voice-tuning knob. "
+                          "Tuning of this value is a deferred Stage 4+ "
+                          "optimization point; current default is what "
+                          "Stage 3 validated against the offline "
+                          "reference.")
 
     return parser
 

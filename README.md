@@ -112,6 +112,17 @@ audio reaching `CABLE Input` it does only what is required:
   of silence or a crash. The `rvc_fallback_count` metric tells you if
   it fires.
 
+## Note: `--rvc-context-ms` is a deferred engineering optimization point
+
+`--rvc-context-ms` is a continuity / boundary-quality knob, **not** a
+voice-tuning control. The current default of 200 ms is what Stage 3
+shipped with; further refinement (lower / higher values, adaptive
+sizing, true bilateral overlap, etc.) is **deferred** until the full
+chain has been validated end-to-end with the trained kiki model on
+the realtime route. Do not sweep this value to "tune the voice" — it
+does not change voice identity, and the project's model-faithful
+posture remains intact regardless of the value chosen.
+
 ## Stage 3 — input-side left-context (the continuity strategy)
 
 Per-chunk inference inherits no past audio across chunk boundaries.
@@ -228,6 +239,35 @@ amplitude metrics for regression tracking.
 
 The profile supplies the voice. The CLI supplies only file I/O and
 device. No tuning knobs appear in this command.
+
+## Stage 4-A — full-chain validation
+
+Stage 4-A's purpose is to confirm the **complete fixed-model
+realtime chain** works end-to-end against the trained kiki model
+without changing voice identity. Run the validation command (next
+section) and inspect the final summary against the following gates:
+
+| Counter | Pass gate | Meaning if non-zero |
+| --- | --- | --- |
+| `input_queue_drops` | 0 | input arriving faster than the worker can pull — chunk size or queue too small |
+| `output_queue_drops` | 0 | worker producing faster than the output callback drains — queue too small |
+| `rvc_output_blocks_dropped` | 0 | same as above, accounted on the RVC path |
+| `rvc_fallback_count` | 0 | backend raised — investigate the exception, do NOT mask it |
+| `nan_inf_scrub_count` | 0 | model produced non-finite samples — investigate the input chunk |
+| `rvc_stale_chunk_drops` | 0, or explained | inference fell behind the mic; usually 0 in steady state |
+| `steady_state_output_underruns` | "low enough for local use" | small numbers acceptable; explain spikes |
+| `input_status_flag_count` / `output_status_flag_count` | 0, or explained | PortAudio host-API warnings |
+
+`startup_output_underruns` may be > 0 during the first ~1-2 chunks
+(before the warmup+prebuffer fully populate the queue) and is not a
+failure. Listening quality is the operator's judgment — the chain
+should reproduce a continuous kiki voice on `CABLE Output` for a
+downstream app or recorder configured to listen there.
+
+If a counter fails the gate, classify the issue as one of
+{runtime continuity, chunk/context artifact, model/backend
+limitation, training/model quality, audio device / CABLE monitoring
+issue} — but do NOT tune voice identity parameters.
 
 ## Stage 3 — realtime RVC (recommended invocation)
 
