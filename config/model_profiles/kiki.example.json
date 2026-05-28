@@ -1,0 +1,15 @@
+{
+  "name": "kiki",
+  "model_path": "models/kiki/kikiV1.pth",
+  "index_path": "models/kiki/kikiV1.index",
+  "hubert_path": "models/kiki/hubert_base.pt",
+  "rmvpe_path": "models/kiki/rmvpe.pt",
+  "f0_method": "rmvpe",
+  "index_rate": 0.5,
+  "protect": 0.33,
+  "filter_radius": 3,
+  "rms_mix_rate": 0.25,
+  "pitch_shift": 0,
+  "resample_sr": 0,
+  "notes": "Example profile for the 'kiki' trained model. These values are the model's intended inference settings, not sound-design knobs. Do not change them to 'tune the voice'; train a different model instead. Paths are relative to the project root (the directory you run python -m from)."
+}

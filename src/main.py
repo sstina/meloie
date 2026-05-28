@@ -57,22 +57,44 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-virtual-cable-input", action="store_true",
                         help="Diagnostic only: allow VB-CABLE capture endpoint as input.")
 
-    # RVC-mode flags
-    rvc = parser.add_argument_group("RVC mode (--mode rvc)")
-    rvc.add_argument("--model-path", help="Path to RVC .pth model.")
-    rvc.add_argument("--index-path", default=None, help="Path to .index file (optional).")
+    # RVC voice identity comes from a model profile JSON. The runtime CLI
+    # only takes engineering knobs; the voice-identity flags below are
+    # developer/debug overrides and emit a warning when set.
+    rvc = parser.add_argument_group(
+        "RVC mode (--mode rvc)",
+        description="Use --model-profile to load a trained model's intended "
+                    "inference settings. The remaining voice-identity flags "
+                    "(model/index/hubert/rmvpe paths, f0_method, index_rate, "
+                    "protect, filter_radius, rms_mix_rate, pitch_shift) are "
+                    "DEVELOPER OVERRIDES — not normal user controls.",
+    )
+    rvc.add_argument("--model-profile", default=None,
+                     help="Path to a model profile JSON (see "
+                          "config/model_profiles/kiki.example.json). "
+                          "Supplies the voice identity. Recommended.")
+    rvc.add_argument("--model-path", default=None,
+                     help="DEVELOPER OVERRIDE: path to RVC .pth model. "
+                          "Overrides the profile.")
+    rvc.add_argument("--index-path", default=None,
+                     help="DEVELOPER OVERRIDE: path to .index file.")
     rvc.add_argument("--hubert-path", default=None,
-                     help="Path to hubert_base.pt (optional; backend downloads it if omitted).")
+                     help="DEVELOPER OVERRIDE: path to hubert_base.pt.")
     rvc.add_argument("--rmvpe-path", default=None,
-                     help="Path to rmvpe.pt (optional; backend downloads it if omitted).")
+                     help="DEVELOPER OVERRIDE: path to rmvpe.pt.")
     rvc.add_argument("--backend", default="infer_rvc_python",
                      help="RVC backend identifier (default: infer_rvc_python).")
-    rvc.add_argument("--f0-method", default="rmvpe")
-    rvc.add_argument("--index-rate", type=float, default=0.5)
-    rvc.add_argument("--protect", type=float, default=0.33)
-    rvc.add_argument("--filter-radius", type=int, default=3)
-    rvc.add_argument("--rms-mix-rate", type=float, default=0.25)
-    rvc.add_argument("--pitch-shift", type=int, default=0)
+    rvc.add_argument("--f0-method", default=None,
+                     help="DEVELOPER OVERRIDE: F0 estimator. Profile default if omitted.")
+    rvc.add_argument("--index-rate", type=float, default=None,
+                     help="DEVELOPER OVERRIDE: retrieval index influence.")
+    rvc.add_argument("--protect", type=float, default=None,
+                     help="DEVELOPER OVERRIDE: consonant/breath protection.")
+    rvc.add_argument("--filter-radius", type=int, default=None,
+                     help="DEVELOPER OVERRIDE: F0 median-filter radius.")
+    rvc.add_argument("--rms-mix-rate", type=float, default=None,
+                     help="DEVELOPER OVERRIDE: source envelope mix rate.")
+    rvc.add_argument("--pitch-shift", type=int, default=None,
+                     help="DEVELOPER OVERRIDE: pitch shift in semitones.")
     rvc.add_argument("--chunk-ms", type=float, default=180.0,
                      help="RVC chunk size in milliseconds (default 180).")
     rvc.add_argument("--crossfade-ms", type=float, default=20.0,
@@ -238,16 +260,80 @@ def _cmd_mode_identity(args: argparse.Namespace) -> int:
     return 0
 
 
+_VOICE_IDENTITY_FIELDS = (
+    # (cli_arg_name, profile_attr_name, default_when_neither)
+    ("model_path",  "model_path",  None),
+    ("index_path",  "index_path",  None),
+    ("hubert_path", "hubert_path", None),
+    ("rmvpe_path",  "rmvpe_path",  None),
+    ("f0_method",   "f0_method",   "rmvpe"),
+    ("index_rate",  "index_rate",  0.5),
+    ("protect",     "protect",     0.33),
+    ("filter_radius", "filter_radius", 3),
+    ("rms_mix_rate",  "rms_mix_rate",  0.25),
+    ("pitch_shift",   "pitch_shift",   0),
+)
+
+
+def _resolve_voice_identity(args: argparse.Namespace, profile) -> dict:
+    """Resolve voice-identity params from (profile, CLI override) pairs.
+
+    CLI override wins when set; a divergence from the profile prints a
+    "developer override" warning to stderr. The point of the warning is
+    to make tuning-by-flag visibly non-default in dev logs.
+    """
+    resolved: dict = {}
+    for cli_name, prof_name, default in _VOICE_IDENTITY_FIELDS:
+        cli_val = getattr(args, cli_name)
+        prof_val = getattr(profile, prof_name) if profile is not None else None
+        if cli_val is not None:
+            if (
+                profile is not None
+                and prof_val is not None
+                and cli_val != prof_val
+            ):
+                print(
+                    f"WARNING: developer override: profile "
+                    f"{prof_name}={prof_val!r} replaced by CLI "
+                    f"--{cli_name.replace('_', '-')} = {cli_val!r}. "
+                    "Model-faithful behaviour is to omit this flag.",
+                    file=sys.stderr,
+                )
+            resolved[prof_name] = cli_val
+        elif prof_val is not None:
+            resolved[prof_name] = prof_val
+        else:
+            resolved[prof_name] = default
+    return resolved
+
+
 def _cmd_mode_rvc(args: argparse.Namespace) -> int:
     config = _require_config(args)
     if config is None:
         return 2
     config = _apply_device_overrides(config, args)
 
-    if not args.model_path:
+    from .engine.model_profile import ModelProfileError, load_model_profile
+
+    profile = None
+    if args.model_profile:
+        try:
+            profile = load_model_profile(args.model_profile)
+        except ModelProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 7
         print(
-            "error: --mode rvc requires --model-path /path/to/model.pth\n"
-            "Place local model files under models/local/ (gitignored).",
+            f"loaded model profile: name={profile.name!r} "
+            f"model_path={profile.model_path!r}"
+        )
+
+    voice = _resolve_voice_identity(args, profile)
+
+    if not voice["model_path"]:
+        print(
+            "error: --mode rvc requires --model-profile PATH or "
+            "--model-path /path/to/model.pth. Place local model files "
+            "under models/ (gitignored).",
             file=sys.stderr,
         )
         return 2
@@ -269,24 +355,29 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
     # showed that asking infer_rvc_python to resample internally added
     # ~230 ms/chunk on kiki @ chunk_ms=1000, pushing rt > 1. Worker-side
     # linear resample costs ~1 ms.
-    resample_sr = args.resample_sr if args.resample_sr is not None else 0
+    if args.resample_sr is not None:
+        resample_sr = args.resample_sr
+    elif profile is not None:
+        resample_sr = profile.resample_sr
+    else:
+        resample_sr = 0
 
     rvc_config = RvcEngineConfig(
-        model_path=args.model_path,
-        index_path=args.index_path,
+        model_path=voice["model_path"],
+        index_path=voice["index_path"],
         backend=args.backend,
-        f0_method=args.f0_method,
-        index_rate=args.index_rate,
-        protect=args.protect,
-        filter_radius=args.filter_radius,
-        rms_mix_rate=args.rms_mix_rate,
-        pitch_shift=args.pitch_shift,
+        f0_method=voice["f0_method"],
+        index_rate=voice["index_rate"],
+        protect=voice["protect"],
+        filter_radius=voice["filter_radius"],
+        rms_mix_rate=voice["rms_mix_rate"],
+        pitch_shift=voice["pitch_shift"],
         sample_rate=config.sample_rate,
         resample_sr=resample_sr,
         device=args.device,
         force_cpu=args.force_cpu,
-        hubert_path=args.hubert_path,
-        rmvpe_path=args.rmvpe_path,
+        hubert_path=voice["hubert_path"],
+        rmvpe_path=voice["rmvpe_path"],
     )
 
     engine = RvcEngine(rvc_config)

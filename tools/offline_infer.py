@@ -37,37 +37,93 @@ from typing import List, Optional
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tvoice-offline-infer",
-        description="Run RVC inference on a WAV file (offline sanity check).",
+        description="Run RVC inference on a WAV file (offline sanity check). "
+                    "Use --model-profile for the recommended invocation; the "
+                    "voice-identity flags below are developer overrides.",
     )
     p.add_argument("--input-wav", required=True)
     p.add_argument("--output-wav", required=True)
-    p.add_argument("--model-path", required=True,
-                   help="Path to RVC .pth (place local models under models/local/).")
+    p.add_argument("--model-profile", default=None,
+                   help="Path to a model profile JSON (see "
+                        "config/model_profiles/kiki.example.json). "
+                        "Supplies the voice identity. Recommended.")
+    p.add_argument("--model-path", default=None,
+                   help="DEVELOPER OVERRIDE: path to RVC .pth model.")
     p.add_argument("--index-path", default=None,
-                   help="Path to .index (optional).")
+                   help="DEVELOPER OVERRIDE: path to .index file.")
     p.add_argument("--hubert-path", default=None,
-                   help="Path to hubert_base.pt (optional; backend "
-                        "downloads it if omitted).")
+                   help="DEVELOPER OVERRIDE: path to hubert_base.pt.")
     p.add_argument("--rmvpe-path", default=None,
-                   help="Path to rmvpe.pt (optional; backend "
-                        "downloads it if omitted).")
+                   help="DEVELOPER OVERRIDE: path to rmvpe.pt.")
     p.add_argument("--backend", default="infer_rvc_python")
-    p.add_argument("--f0-method", default="rmvpe")
-    p.add_argument("--index-rate", type=float, default=0.5)
-    p.add_argument("--protect", type=float, default=0.33)
-    p.add_argument("--filter-radius", type=int, default=3)
-    p.add_argument("--rms-mix-rate", type=float, default=0.25)
-    p.add_argument("--pitch-shift", type=int, default=0)
+    p.add_argument("--f0-method", default=None,
+                   help="DEVELOPER OVERRIDE.")
+    p.add_argument("--index-rate", type=float, default=None,
+                   help="DEVELOPER OVERRIDE.")
+    p.add_argument("--protect", type=float, default=None,
+                   help="DEVELOPER OVERRIDE.")
+    p.add_argument("--filter-radius", type=int, default=None,
+                   help="DEVELOPER OVERRIDE.")
+    p.add_argument("--rms-mix-rate", type=float, default=None,
+                   help="DEVELOPER OVERRIDE.")
+    p.add_argument("--pitch-shift", type=int, default=None,
+                   help="DEVELOPER OVERRIDE.")
     p.add_argument("--device", default="auto",
                    choices=["auto", "cpu", "cuda", "directml_experimental"],
                    help="Inference device. 'auto' picks cuda if available, "
                         "otherwise cpu.")
     p.add_argument("--force-cpu", action="store_true",
                    help="DEPRECATED: equivalent to --device cpu.")
-    p.add_argument("--resample-sr", type=int, default=0,
+    p.add_argument("--resample-sr", type=int, default=None,
                    help="Ask the RVC backend to resample its output to this "
-                        "sample rate. 0 = keep model's natural rate (offline).")
+                        "sample rate. Default: profile's resample_sr or 0 "
+                        "(keep model's natural rate).")
     return p
+
+
+_OFFLINE_VOICE_FIELDS = (
+    ("model_path",  "model_path",  None),
+    ("index_path",  "index_path",  None),
+    ("hubert_path", "hubert_path", None),
+    ("rmvpe_path",  "rmvpe_path",  None),
+    ("f0_method",   "f0_method",   "rmvpe"),
+    ("index_rate",  "index_rate",  0.5),
+    ("protect",     "protect",     0.33),
+    ("filter_radius", "filter_radius", 3),
+    ("rms_mix_rate",  "rms_mix_rate",  0.25),
+    ("pitch_shift",   "pitch_shift",   0),
+)
+
+
+def _resolve_offline_voice(args, profile) -> dict:
+    """Resolve voice-identity params for offline inference.
+
+    Same semantics as the realtime CLI: CLI override wins and a
+    divergence prints a clear developer-override warning.
+    """
+    resolved: dict = {}
+    for cli_name, prof_name, default in _OFFLINE_VOICE_FIELDS:
+        cli_val = getattr(args, cli_name)
+        prof_val = getattr(profile, prof_name) if profile is not None else None
+        if cli_val is not None:
+            if (
+                profile is not None
+                and prof_val is not None
+                and cli_val != prof_val
+            ):
+                print(
+                    f"WARNING: developer override: profile "
+                    f"{prof_name}={prof_val!r} replaced by CLI "
+                    f"--{cli_name.replace('_', '-')} = {cli_val!r}. "
+                    "Model-faithful behaviour is to omit this flag.",
+                    file=sys.stderr,
+                )
+            resolved[prof_name] = cli_val
+        elif prof_val is not None:
+            resolved[prof_name] = prof_val
+        else:
+            resolved[prof_name] = default
+    return resolved
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -75,25 +131,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     in_path = Path(args.input_wav)
     out_path = Path(args.output_wav)
-    model_path = Path(args.model_path)
 
     if not in_path.exists():
         print(f"error: input WAV not found: {in_path}", file=sys.stderr)
         return 2
-    if not model_path.exists():
-        print(
-            f"error: model not found: {model_path}\n"
-            "Tip: place local model files under models/local/ "
-            "(gitignored) and pass the full path.",
-            file=sys.stderr,
-        )
-        return 3
-    if args.index_path and not Path(args.index_path).exists():
-        print(f"error: index file not found: {args.index_path}", file=sys.stderr)
-        return 3
 
     # Lazy imports — RVC stack only touched here.
     from src.audio.wav_io import read_wav_mono_float32, write_wav_float32
+    from src.engine.model_profile import ModelProfileError, load_model_profile
     from src.engine.rvc_engine import (
         DependencyMissingError,
         ModelLoadError,
@@ -103,6 +148,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     from src.safety.guard import dbfs_peak, dbfs_rms, scrub_nan_inf
 
+    profile = None
+    if args.model_profile:
+        try:
+            profile = load_model_profile(args.model_profile)
+        except ModelProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 7
+        print(
+            f"loaded model profile: name={profile.name!r} "
+            f"model_path={profile.model_path!r}"
+        )
+
+    voice = _resolve_offline_voice(args, profile)
+
+    if not voice["model_path"]:
+        print(
+            "error: requires --model-profile PATH or --model-path "
+            "/path/to/model.pth.",
+            file=sys.stderr,
+        )
+        return 2
+
+    model_path = Path(voice["model_path"])
+    if not model_path.exists():
+        print(
+            f"error: model not found: {model_path}\n"
+            "Tip: place local model files under models/ (gitignored) "
+            "and pass the full path.",
+            file=sys.stderr,
+        )
+        return 3
+    if voice["index_path"] and not Path(voice["index_path"]).exists():
+        print(f"error: index file not found: {voice['index_path']}", file=sys.stderr)
+        return 3
+
     print(f"reading {in_path} ...")
     audio, in_sr = read_wav_mono_float32(str(in_path))
     duration = audio.size / float(in_sr)
@@ -111,21 +191,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"peak={dbfs_peak(audio):.2f} dBFS  rms={dbfs_rms(audio):.2f} dBFS"
     )
 
+    if args.resample_sr is not None:
+        resample_sr = args.resample_sr
+    elif profile is not None:
+        resample_sr = profile.resample_sr
+    else:
+        resample_sr = 0
+
     cfg = RvcEngineConfig(
         model_path=str(model_path),
-        index_path=args.index_path,
+        index_path=voice["index_path"],
         backend=args.backend,
-        f0_method=args.f0_method,
-        index_rate=args.index_rate,
-        protect=args.protect,
-        filter_radius=args.filter_radius,
-        rms_mix_rate=args.rms_mix_rate,
-        pitch_shift=args.pitch_shift,
-        resample_sr=args.resample_sr,
+        f0_method=voice["f0_method"],
+        index_rate=voice["index_rate"],
+        protect=voice["protect"],
+        filter_radius=voice["filter_radius"],
+        rms_mix_rate=voice["rms_mix_rate"],
+        pitch_shift=voice["pitch_shift"],
+        resample_sr=resample_sr,
         device=args.device,
         force_cpu=args.force_cpu,
-        hubert_path=args.hubert_path,
-        rmvpe_path=args.rmvpe_path,
+        hubert_path=voice["hubert_path"],
+        rmvpe_path=voice["rmvpe_path"],
     )
     engine = RvcEngine(cfg)
 
