@@ -38,6 +38,18 @@ def test_config_defaults_validate():
     assert cfg.filter_radius == 3
     assert cfg.rms_mix_rate == pytest.approx(0.25)
     assert cfg.pitch_shift == 0
+    assert cfg.device == "auto"
+    assert cfg.resample_sr == 0
+
+
+def test_config_rejects_unknown_device():
+    with pytest.raises(ValueError):
+        RvcEngineConfig(device="rocm").validate()
+
+
+def test_config_rejects_negative_resample_sr():
+    with pytest.raises(ValueError):
+        RvcEngineConfig(resample_sr=-1).validate()
 
 
 def test_config_rejects_out_of_range_index_rate():
@@ -88,6 +100,33 @@ def test_engine_unknown_backend_raises_dependency_missing():
     with pytest.raises(DependencyMissingError) as excinfo:
         engine.load()
     assert "nonexistent_xyz" in str(excinfo.value)
+
+
+def test_engine_directml_experimental_not_implemented():
+    """Reserved future backend must fail loudly rather than silently fall
+    back to CPU."""
+    from src.engine.rvc_engine import _InferRvcPythonBackend
+    backend = _InferRvcPythonBackend()
+    cfg = RvcEngineConfig(model_path="/fake.pth", device="directml_experimental")
+    with pytest.raises(NotImplementedError):
+        backend._resolve_only_cpu(cfg)
+
+
+def test_engine_device_cpu_forces_cpu_without_touching_torch():
+    """device='cpu' must not require torch — useful for headless CI."""
+    from src.engine.rvc_engine import _InferRvcPythonBackend
+    backend = _InferRvcPythonBackend()
+    cfg = RvcEngineConfig(model_path="/fake.pth", device="cpu")
+    assert backend._resolve_only_cpu(cfg) is True
+    assert backend.resolved_device == "cpu"
+
+
+def test_engine_force_cpu_back_compat_forces_cpu():
+    from src.engine.rvc_engine import _InferRvcPythonBackend
+    backend = _InferRvcPythonBackend()
+    cfg = RvcEngineConfig(model_path="/fake.pth", device="auto", force_cpu=True)
+    assert backend._resolve_only_cpu(cfg) is True
+    assert backend.resolved_device == "cpu"
 
 
 # ---------------------------------------------------------------------------

@@ -58,7 +58,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--filter-radius", type=int, default=3)
     p.add_argument("--rms-mix-rate", type=float, default=0.25)
     p.add_argument("--pitch-shift", type=int, default=0)
-    p.add_argument("--force-cpu", action="store_true")
+    p.add_argument("--device", default="auto",
+                   choices=["auto", "cpu", "cuda", "directml_experimental"],
+                   help="Inference device. 'auto' picks cuda if available, "
+                        "otherwise cpu.")
+    p.add_argument("--force-cpu", action="store_true",
+                   help="DEPRECATED: equivalent to --device cpu.")
+    p.add_argument("--resample-sr", type=int, default=0,
+                   help="Ask the RVC backend to resample its output to this "
+                        "sample rate. 0 = keep model's natural rate (offline).")
     return p
 
 
@@ -113,13 +121,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         filter_radius=args.filter_radius,
         rms_mix_rate=args.rms_mix_rate,
         pitch_shift=args.pitch_shift,
+        resample_sr=args.resample_sr,
+        device=args.device,
         force_cpu=args.force_cpu,
         hubert_path=args.hubert_path,
         rmvpe_path=args.rmvpe_path,
     )
     engine = RvcEngine(cfg)
 
-    print(f"loading RVC backend={args.backend} ...")
+    print(f"loading RVC backend={args.backend} device={args.device} ...")
     try:
         engine.load()
     except DependencyMissingError as exc:
@@ -128,6 +138,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ModelLoadError as exc:
         print(f"error: model load failed: {exc}", file=sys.stderr)
         return 11
+    print(
+        f"engine loaded. resolved_device={engine.resolved_device} "
+        f"cuda_device={engine.cuda_device_name or '(n/a)'}"
+    )
 
     print(f"running RVC inference on {audio.size} samples ...")
     try:

@@ -79,8 +79,18 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="Crossfade length at chunk boundaries (default 20; "
                           "set 0 to disable, then expect occasional clicks "
                           "until Stage 3 refines this).")
+    rvc.add_argument("--device", default="auto",
+                     choices=["auto", "cpu", "cuda", "directml_experimental"],
+                     help="Inference device. 'auto' picks cuda if available, "
+                          "otherwise cpu. 'cuda' fails if CUDA is unavailable. "
+                          "directml_experimental is reserved for a future milestone.")
     rvc.add_argument("--force-cpu", action="store_true",
-                     help="Force backend to CPU (skip CUDA).")
+                     help="DEPRECATED: equivalent to --device cpu.")
+    rvc.add_argument("--resample-sr", type=int, default=None,
+                     help="Ask the RVC backend to resample its output to this "
+                          "sample rate. Default for realtime is the stream's "
+                          "sample_rate (e.g. 48000) so the OutputStream sees "
+                          "matching audio.")
 
     return parser
 
@@ -233,6 +243,11 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
     from .audio.devices import FeedbackLoopRisk
     from .audio.streams import run_rvc_stream
 
+    # For realtime, default --resample-sr to the stream's sample rate so the
+    # OutputStream sees matching audio (the kiki model natively returns 40 kHz;
+    # without this, a 40 kHz buffer would be played as if it were 48 kHz).
+    resample_sr = args.resample_sr if args.resample_sr is not None else config.sample_rate
+
     rvc_config = RvcEngineConfig(
         model_path=args.model_path,
         index_path=args.index_path,
@@ -244,13 +259,15 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
         rms_mix_rate=args.rms_mix_rate,
         pitch_shift=args.pitch_shift,
         sample_rate=config.sample_rate,
+        resample_sr=resample_sr,
+        device=args.device,
         force_cpu=args.force_cpu,
         hubert_path=args.hubert_path,
         rmvpe_path=args.rmvpe_path,
     )
 
     engine = RvcEngine(rvc_config)
-    print(f"loading RVC backend={rvc_config.backend} ...")
+    print(f"loading RVC backend={rvc_config.backend} device={args.device} ...")
     try:
         engine.load()
     except DependencyMissingError as exc:
@@ -259,7 +276,11 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
     except ModelLoadError as exc:
         print(f"error: model load failed: {exc}", file=sys.stderr)
         return 11
-    print("RVC engine loaded.")
+    print(
+        f"RVC engine loaded. resolved_device={engine.resolved_device} "
+        f"cuda_device={engine.cuda_device_name or '(n/a)'} "
+        f"resample_sr={resample_sr}"
+    )
 
     try:
         run_rvc_stream(

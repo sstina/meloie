@@ -243,3 +243,82 @@ def test_record_inference_ms_updates_mean_and_max():
     assert metrics.rvc_inference_last_ms == pytest.approx(30.0)
     assert metrics.rvc_inference_max_ms == pytest.approx(30.0)
     assert metrics.rvc_inference_mean_ms == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2C: sample-rate mismatch safety
+# ---------------------------------------------------------------------------
+
+class _WrongSrEngine:
+    """Returns audio at a sample rate different from what the worker asked for.
+
+    This simulates a backend that ignores ``resample_sr`` or returns its
+    own native rate (e.g. the 40 kHz kiki model into a 48 kHz stream).
+    """
+
+    def __init__(self, returned_sr: int) -> None:
+        self.returned_sr = int(returned_sr)
+        self.call_count = 0
+
+    def infer_array(self, audio, sample_rate):
+        self.call_count += 1
+        return audio.astype(np.float32, copy=True), self.returned_sr
+
+
+def test_rvc_worker_falls_back_when_returned_sr_mismatches_stream_sr():
+    """If the backend returns audio at a different SR than the stream is
+    using, the worker must refuse to enqueue it (would otherwise corrupt
+    pitch and chunk-block alignment) and use identity instead."""
+    chunk_size = 1920
+    block_size = 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _WrongSrEngine(returned_sr=40000)  # stream is 48000
+
+    expected = np.full(chunk_size, 0.3, dtype=np.float32)
+    for i in range(chunk_size // block_size):
+        in_q.put(expected[i * block_size:(i + 1) * block_size])
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+    )
+
+    assert engine.call_count == 1
+    assert metrics.rvc_fallback_count == 1
+    # output should be the identity (input) audio
+    out_blocks = _drain(out_q)
+    concat = np.concatenate(out_blocks)
+    np.testing.assert_allclose(concat, expected, atol=1e-6)
+
+
+def test_rvc_worker_accepts_matching_sr():
+    """If the backend returns the same SR the worker asked for, the
+    safety net must NOT fire."""
+    in_q: "queue.Queue" = queue.Queue(maxsize=8)
+    out_q: "queue.Queue" = queue.Queue(maxsize=8)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _WrongSrEngine(returned_sr=48000)
+
+    in_q.put(np.full(480, 0.2, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=480,
+        output_block_size=480,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+    )
+
+    assert metrics.rvc_fallback_count == 0
+    assert metrics.rvc_chunks_processed == 1

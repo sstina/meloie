@@ -412,7 +412,12 @@ def run_rvc_stream(
         f"crossfade_ms={crossfade_ms:.1f} ({crossfade_size} samples)",
         f"model={model_basename or '(none)'}  "
         f"index={index_basename or '(none)'}  "
-        f"backend={engine.backend_name}",
+        f"backend={engine.backend_name}  "
+        f"device={engine.resolved_device or '(unknown)'}"
+        + (f" / {engine.cuda_device_name}" if engine.cuda_device_name else ""),
+        f"resample_sr={engine.config.resample_sr}  "
+        f"stream_sr={config.sample_rate}  "
+        f"(must match for safe enqueue; mismatch -> rvc_fallback_count)",
         f"f0_method={engine.config.f0_method}  "
         f"index_rate={engine.config.index_rate}  "
         f"protect={engine.config.protect}  "

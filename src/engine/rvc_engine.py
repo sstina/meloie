@@ -90,9 +90,17 @@ class RvcEngineConfig:
     rms_mix_rate: float = 0.25
     pitch_shift: int = 0
     sample_rate: Optional[int] = None      # informational; backend decides
-    resample_sr: int = 0                   # 0 = let backend pick
-    force_cpu: bool = False
+    resample_sr: int = 0                   # 0 = backend's natural SR; non-zero = ask backend to resample
     backend_tag: str = "tvoice_default"    # opaque label for backend cache
+
+    # Stage 2C device selection.
+    #   "auto" -> cuda if torch.cuda.is_available() else cpu
+    #   "cpu"  -> force CPU
+    #   "cuda" -> require CUDA; fail clearly if unavailable
+    #   "directml_experimental" -> reserved, not implemented this milestone
+    device: str = "auto"
+    # Deprecated back-compat: if True, force CPU regardless of ``device``.
+    force_cpu: bool = False
 
     # Optional explicit paths to the shared assets infer_rvc_python
     # otherwise downloads. Set these when the model bundle already
@@ -109,6 +117,13 @@ class RvcEngineConfig:
             raise ValueError("filter_radius must be >= 0")
         if not (0.0 <= self.rms_mix_rate <= 1.0):
             raise ValueError(f"rms_mix_rate must be in [0, 1]; got {self.rms_mix_rate}")
+        if self.resample_sr < 0:
+            raise ValueError(f"resample_sr must be >= 0; got {self.resample_sr}")
+        if self.device not in ("auto", "cpu", "cuda", "directml_experimental"):
+            raise ValueError(
+                f"device must be 'auto', 'cpu', 'cuda', or "
+                f"'directml_experimental'; got {self.device!r}"
+            )
         if self.f0_method not in ("rmvpe", "rmvpe+", "fcpe", "crepe", "harvest", "pm"):
             # Unknown methods may still work with the backend, but flag
             # the common-typo case loudly.
@@ -141,6 +156,74 @@ class _InferRvcPythonBackend(RvcBackend):
     def __init__(self) -> None:
         self._converter = None
         self._tag = None
+        # Resolved after load(): "cpu" or "cuda". Visible via
+        # RvcEngine.resolved_device for metrics/logging.
+        self._resolved_device: Optional[str] = None
+        self._cuda_device_name: Optional[str] = None
+
+    @property
+    def resolved_device(self) -> Optional[str]:
+        return self._resolved_device
+
+    @property
+    def cuda_device_name(self) -> Optional[str]:
+        return self._cuda_device_name
+
+    def _resolve_only_cpu(self, config: RvcEngineConfig) -> bool:
+        """Map config.device + back-compat force_cpu to ``only_cpu`` bool.
+
+        Side effects: sets ``self._resolved_device`` and
+        ``self._cuda_device_name`` (if CUDA is selected and torch is
+        importable).
+        """
+        device = (config.device or "auto").lower()
+
+        # Deprecated back-compat.
+        if config.force_cpu:
+            device = "cpu"
+
+        if device == "directml_experimental":
+            raise NotImplementedError(
+                "directml_experimental backend is reserved for a future "
+                "milestone; not implemented yet. Use --device auto, cpu, "
+                "or cuda."
+            )
+
+        if device == "cpu":
+            self._resolved_device = "cpu"
+            return True
+
+        # cuda / auto -> probe torch.
+        try:
+            import torch  # noqa: WPS433 - deliberately lazy
+        except ImportError as exc:
+            if device == "cuda":
+                raise DependencyMissingError(
+                    "device='cuda' requested but torch is not installed. "
+                    "Install a CUDA-enabled torch build for your platform."
+                ) from exc
+            # auto + no torch -> CPU fallback.
+            self._resolved_device = "cpu"
+            return True
+
+        if torch.cuda.is_available():
+            self._resolved_device = "cuda"
+            try:
+                self._cuda_device_name = str(torch.cuda.get_device_name(0))
+            except Exception:
+                self._cuda_device_name = None
+            return False
+
+        if device == "cuda":
+            raise ModelLoadError(
+                "device='cuda' requested but torch.cuda.is_available() "
+                "returned False. Either install a CUDA-enabled torch build "
+                "or use --device auto / --device cpu."
+            )
+
+        # auto + no CUDA -> CPU.
+        self._resolved_device = "cpu"
+        return True
 
     def load(self, config: RvcEngineConfig) -> None:
         try:
@@ -172,9 +255,11 @@ class _InferRvcPythonBackend(RvcBackend):
                 f"rmvpe_path not found: {config.rmvpe_path!r}"
             )
 
+        only_cpu = self._resolve_only_cpu(config)
+
         try:
             self._converter = BaseLoader(
-                only_cpu=bool(config.force_cpu),
+                only_cpu=only_cpu,
                 hubert_path=config.hubert_path,
                 rmvpe_path=config.rmvpe_path,
             )
@@ -280,6 +365,20 @@ class RvcEngine:
         if self._backend is not None:
             return getattr(self._backend, "name", "custom")
         return self._config.backend
+
+    @property
+    def resolved_device(self) -> Optional[str]:
+        """Device the backend is actually using after load() ("cpu" / "cuda")."""
+        if self._backend is None:
+            return None
+        return getattr(self._backend, "resolved_device", None)
+
+    @property
+    def cuda_device_name(self) -> Optional[str]:
+        """Human-readable CUDA device name if running on GPU."""
+        if self._backend is None:
+            return None
+        return getattr(self._backend, "cuda_device_name", None)
 
     def load(self) -> None:
         if self._loaded:

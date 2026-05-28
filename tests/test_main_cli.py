@@ -27,6 +27,34 @@ def test_parser_accepts_rvc_mode_with_required_flags():
     assert args.f0_method == "rmvpe"
     assert args.index_rate == 0.5
     assert args.protect == 0.33
+    # Stage 2C defaults
+    assert args.device == "auto"
+    assert args.resample_sr is None  # _cmd_mode_rvc defaults to stream SR
+
+
+def test_parser_accepts_cuda_device_and_explicit_resample_sr():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+        "--device", "cuda",
+        "--resample-sr", "48000",
+    ])
+    assert args.device == "cuda"
+    assert args.resample_sr == 48000
+
+
+def test_parser_rejects_unknown_device():
+    parser = _build_parser()
+    import pytest
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--mode", "rvc",
+            "--config", "x",
+            "--model-path", "y",
+            "--device", "rocm",
+        ])
 
 
 def test_parser_accepts_identity_mode():

@@ -208,16 +208,28 @@ def rvc_worker_loop(
 
         for chunk in chunks:
             t0 = time.perf_counter()
+            sr_mismatch = False
             try:
-                processed, _result_sr = engine.infer_array(chunk, int(sample_rate))
-                # Defensive: shape match for downstream splitter.
+                processed, result_sr = engine.infer_array(chunk, int(sample_rate))
                 processed = np.asarray(processed, dtype=np.float32).reshape(-1)
+                if int(result_sr) != int(sample_rate):
+                    sr_mismatch = True
             except Exception:
                 if not fallback_to_identity_on_error:
                     raise
                 processed = chunk.astype(np.float32, copy=True)
                 metrics.rvc_fallback_count += 1
             metrics.record_inference_ms((time.perf_counter() - t0) * 1000.0)
+
+            # Safety: if the backend returned audio at a different sample
+            # rate than the stream expects, we cannot safely enqueue it
+            # (downstream OutputStream is fixed at ``sample_rate``;
+            # mismatched audio would play back at the wrong pitch/length
+            # and desynchronise the chunk -> block splitter). Fall back
+            # to identity for this chunk so the audio link stays alive.
+            if sr_mismatch:
+                processed = chunk.astype(np.float32, copy=True)
+                metrics.rvc_fallback_count += 1
 
             # NaN/Inf scrub — RVC can produce these on edge cases.
             scrub = scrub_nan_inf(processed)
