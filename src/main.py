@@ -142,6 +142,17 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="If inference falls behind, drop older queued "
                           "chunks and keep only the latest. Reduces "
                           "perceived latency drift. Default: on for RVC.")
+    rvc.add_argument("--rvc-context-ms", type=float, default=200.0,
+                     help="Stage 3 input-side LEFT context fed to the "
+                          "model before each chunk. Default 200 ms. The "
+                          "engine sees [previous_input_tail, chunk]; the "
+                          "model's output for the context region is "
+                          "trimmed away proportionally so the chunk's "
+                          "EMITTED duration stays exactly chunk_ms (no "
+                          "timeline drift). Eliminates per-chunk cold-"
+                          "start in HuBERT / F0 / index without any "
+                          "output-side blending. Set 0 to disable. "
+                          "Engineering knob, not a voice tuning knob.")
 
     return parser
 
@@ -430,6 +441,7 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
             rvc_queue_ms=args.rvc_queue_ms,
             rvc_prebuffer_ms=args.rvc_prebuffer_ms,
             drop_stale_input=args.drop_stale_input,
+            context_ms=args.rvc_context_ms,
         )
     except FeedbackLoopRisk as exc:
         print(f"error: {exc}", file=sys.stderr)

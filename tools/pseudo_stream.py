@@ -91,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Stitched crossfade at chunk boundaries in ms. "
                         "Default 0 (model-faithful). Set >0 to reproduce "
                         "the legacy stitched-blend behaviour.")
+    p.add_argument("--context-ms", type=float, default=200.0,
+                   help="Stage 3 left-context prepended to each chunk "
+                        "before inference. Output trimmed proportionally "
+                        "to preserve chunk duration exactly. Default 200; "
+                        "set 0 to disable for A/B against Stage 2G.")
     p.add_argument("--resampler", default="polyphase",
                    choices=["polyphase", "linear", "torchaudio"],
                    help="Resampler used between engine native SR and "
@@ -282,9 +287,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     chunk_size = max(1, int(round(args.chunk_ms / 1000.0 * stream_sr)))
     crossfade_size = max(0, int(round(args.crossfade_ms / 1000.0 * stream_sr)))
+    context_size = max(0, int(round(args.context_ms / 1000.0 * stream_sr)))
     print(
         f"chunk_size={chunk_size} samples ({args.chunk_ms:.1f} ms @ {stream_sr} Hz)  "
-        f"crossfade_size={crossfade_size} samples  resampler={args.resampler}"
+        f"crossfade_size={crossfade_size} samples  "
+        f"context_size={context_size} samples ({args.context_ms:.1f} ms)  "
+        f"resampler={args.resampler}"
     )
 
     if args.warmup_count > 0:
@@ -314,10 +322,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     per_chunk_ms: List[float] = []
     per_chunk_peak: List[float] = []
     native_sr_seen: Optional[int] = None
+    # Stage 3 left-context buffer (matches src.engine.worker.rvc_worker_loop).
+    context_buffer = (
+        np.zeros(context_size, dtype=np.float32) if context_size > 0 else None
+    )
 
     for i, chunk in enumerate(chunks):
+        if context_buffer is not None and context_size > 0:
+            input_to_model = np.concatenate([context_buffer, chunk])
+        else:
+            input_to_model = chunk
         t0 = time.perf_counter()
-        processed, result_sr = engine.infer_array(chunk, stream_sr)
+        processed, result_sr = engine.infer_array(input_to_model, stream_sr)
         dur_ms = (time.perf_counter() - t0) * 1000.0
         per_chunk_ms.append(dur_ms)
         result_sr = int(result_sr)
@@ -335,8 +351,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"(size={processed.size} sr={result_sr})", file=sys.stderr)
             continue
 
+        # Trim the leading context-warmup region BEFORE resampling so the
+        # downstream length math is in input-time terms.
+        if context_size > 0 and input_to_model.size > 0 and processed.size > 0:
+            trim = int(round(context_size * processed.size / input_to_model.size))
+            trim = max(0, min(trim, processed.size - 1))
+            processed = processed[trim:]
+
         if result_sr != stream_sr:
             processed = _RESAMPLERS[args.resampler](processed, result_sr, stream_sr)
+
+        # Refresh context for the NEXT inference using the chunk's own tail.
+        if context_buffer is not None and context_size > 0:
+            if chunk.size >= context_size:
+                context_buffer = chunk[-context_size:].astype(np.float32, copy=True)
+            else:
+                new_ctx = np.zeros(context_size, dtype=np.float32)
+                new_ctx[-chunk.size:] = chunk
+                context_buffer = new_ctx
 
         per_chunk_peak.append(float(np.max(np.abs(processed))) if processed.size else 0.0)
 
@@ -390,6 +422,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "engine_native_sr": native_sr_seen,
             "chunk_ms": float(args.chunk_ms),
             "crossfade_ms": float(args.crossfade_ms),
+            "context_ms": float(args.context_ms),
             "resampler": args.resampler,
             "resample_sr": int(args.resample_sr or 0),
             "n_chunks": len(per_chunk_ms),

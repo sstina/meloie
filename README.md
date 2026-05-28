@@ -66,6 +66,7 @@ These shape stability, latency, and correctness — not voice character:
 | --- | --- | --- |
 | `--device` | `auto` | Inference device (`auto` / `cuda` / `cpu`) |
 | `--chunk-ms` | 180 | RVC chunk size — accumulation latency. Recommended realtime value is 1000 (longer = more model context per call). |
+| `--rvc-context-ms` | **200** | Stage 3 input-side LEFT context. Engine sees `[prev_input_tail, chunk]`; output is trimmed proportionally so emit duration ≈ chunk_ms. Set 0 to A/B. See "Stage 3 — input-side left-context" below. |
 | `--crossfade-ms` | **0** | Stitched output-only crossfade. OFF by default — see "What the realtime path does NOT do" below. |
 | `--rvc-queue-ms` | 6000 | Per-direction queue capacity |
 | `--rvc-prebuffer-ms` | `2 × chunk_ms` | Startup silence inserted before first real audio |
@@ -93,8 +94,7 @@ audio reaching `CABLE Input` it does only what is required:
   temporally-disjoint regions, since the input chunks themselves do
   not overlap. The audit measured no faithfulness improvement vs
   no-crossfade. Re-enable with `--crossfade-ms N` for legacy
-  comparison only; a proper input-overlap crossfade is a deferred
-  Stage 3 task.
+  comparison only.
 - **Resampling between model-native SR and stream SR uses
   `scipy.signal.resample_poly`** (sinc-windowed polyphase) when scipy
   is importable, falling back to `np.interp` otherwise. The polyphase
@@ -104,21 +104,74 @@ audio reaching `CABLE Input` it does only what is required:
 - **`drop_stale_input` is ON** as a fail-safe: if inference falls
   behind faster than the mic feeds, the worker discards older queued
   chunks and processes the freshest one. In normal steady-state (mean
-  inference ~370 ms at chunk_ms=1000 on RTX 4080 Laptop) this never
-  fires; the `rvc_stale_chunk_drops` metric tells you if it does.
+  inference ~160 ms at chunk_ms=1000 with default context on RTX 4080
+  Laptop) this never fires; the `rvc_stale_chunk_drops` metric tells
+  you if it does.
 - **Identity fallback** runs only when the backend raises or returns
   garbage. The user hears their own voice for that one chunk instead
   of silence or a crash. The `rvc_fallback_count` metric tells you if
   it fires.
 
-The structural quality ceiling is **per-chunk inference vs offline
-whole-file inference**. The model has no context across chunk
-boundaries (HuBERT / RMVPE re-initialise each call), so chunked
-output is fundamentally less smooth than the offline reference —
-even with a perfect post-model chain. A future revision can address
-this with input-overlap crossfade (chunk N includes the last K ms of
-chunk N−1's input; the model's output overlap region is faded
-across); this is deferred.
+## Stage 3 — input-side left-context (the continuity strategy)
+
+Per-chunk inference inherits no past audio across chunk boundaries.
+HuBERT, RMVPE (F0), and the index retrieval re-initialise on every
+call, so the first ~tens of ms of every chunk's output exhibits cold-
+start instability: boundary clicks, F0 wobble, sustained-vowel
+"flutter". The previous output-side crossfade did not fix this — it
+blended two temporally-disjoint regions, which is geometrically wrong.
+
+The model-faithful fix is to give the model real previous audio as
+*input* warmup, then discard the output region that corresponds to
+that warmup input. This is exactly what `--rvc-context-ms` does
+(default 200 ms):
+
+1. For each chunk N the engine receives `[chunk N−1's tail of
+   context_size samples, chunk N]` as one input.
+2. The model produces an output of length ~`(context_size +
+   chunk_size) * (out_per_in_ratio)`.
+3. The worker discards the first `round(context_size * out_len /
+   in_len)` samples of model output, then emits the remainder.
+4. The context buffer is refreshed to `chunk N[-context_size:]` for
+   the next call.
+
+Audit results (`tools/pseudo_stream.py --context-ms 0` vs `200`):
+
+| metric | ctx=0 | ctx=200 (default) |
+|---|---|---|
+| RMS error vs offline 40k→polyphase 48k | 0.0395 | 0.0366 (−7 %) |
+| SNR vs offline reference | +0.94 dB | **+1.60 dB** (+0.66 dB) |
+| Cross-corr alignment shift vs offline | −983 samples | **−547 samples** (−44 %) |
+| Pairwise SNR ctx=200 vs ctx=0 | — | **+5.31 dB** (materially different) |
+| Per-chunk time deficit | 1.96 % | 1.67 % (smaller is better) |
+| Steady-state inference time / chunk | 140 ms | 161 ms (+21 ms) |
+
+**Timeline preservation**: emit duration per chunk stays ≈ chunk_ms.
+Strictly, it grows slightly (47040 → 47200 samples per 1 s input at
+48 kHz) because a longer model input loses proportionally less audio
+to edge framing — but this *reduces* the running per-chunk time
+deficit, it does not introduce drift. There is NO accumulating
+timeline error of the sort the legacy output-side crossfade
+introduced (that one shifted by exactly one crossfade length per
+chunk and grew unboundedly with session length).
+
+**Latency cost**: zero added to the audio chain. Audio still arrives
+at the input callback at the same cadence and is emitted at the same
+cadence. Only the worker's per-chunk inference time grows by ~21 ms
+(measured), which is still far below `chunk_ms`, so the worker
+continues to keep up with the mic.
+
+**Diminishing returns past 200 ms**: `--rvc-context-ms 400` gives
+only +0.07 dB SNR over 200 ms in the audit, so 200 is the default.
+Set 0 to A/B against Stage 2G.
+
+The remaining structural ceiling is the per-chunk-vs-whole-file
+inference gap that left-context alone cannot fully close (chunk N's
+output for time T differs slightly from chunk N+1's output for the
+same T due to internal model state). A future revision could attempt
+true bilateral overlap with same-input-time crossfade; this is
+deferred until measured listening evidence justifies the added
+complexity.
 
 ## VB-CABLE routing rules
 
@@ -176,7 +229,7 @@ amplitude metrics for regression tracking.
 The profile supplies the voice. The CLI supplies only file I/O and
 device. No tuning knobs appear in this command.
 
-## Stage 2 — realtime RVC (recommended invocation)
+## Stage 3 — realtime RVC (recommended invocation)
 
 ```
 .\.venv310\Scripts\python.exe -m src.main --mode rvc `
@@ -186,13 +239,20 @@ device. No tuning knobs appear in this command.
     --output-device-substring "CABLE Input" `
     --device cuda `
     --chunk-ms 1000 `
+    --rvc-context-ms 200 `
     --rvc-queue-ms 6000 `
     --rvc-prebuffer-ms 3000 `
     --warmup-rvc-count 2 `
     --duration-seconds 60
 ```
 
-`--crossfade-ms` is omitted — the model-faithful default is 0.
+`--rvc-context-ms 200` (the default — shown explicitly here) gives
+the model 200 ms of real previous input audio as warmup left-context
+before each chunk, and the worker trims the corresponding region of
+model output proportionally so emit duration stays ≈ chunk_ms (no
+timeline drift). See "Stage 3 — input-side left-context" below for
+the audit measurements. `--crossfade-ms` is omitted; the model-
+faithful default is 0.
 
 Discord / OBS / your recorder mic must be `CABLE Output (VB-Audio
 Virtual Cable)`.

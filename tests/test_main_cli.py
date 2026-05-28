@@ -46,6 +46,34 @@ def test_parser_accepts_cuda_device_and_explicit_resample_sr():
     assert args.resample_sr == 48000
 
 
+def test_parser_context_default_is_200ms():
+    """Stage 3: input-side left-context is ON by default at 200 ms.
+
+    It is an *engineering* knob (continuity behaviour), not a voice
+    tuning knob — the model's identity parameters are still profile-
+    owned. The audit (tools/pseudo_stream) confirms this default
+    preserves chunk duration exactly while reducing per-chunk cold-
+    start in HuBERT / F0 / index."""
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+    ])
+    assert args.rvc_context_ms == 200.0
+
+
+def test_parser_context_can_be_disabled():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+        "--rvc-context-ms", "0",
+    ])
+    assert args.rvc_context_ms == 0.0
+
+
 def test_parser_crossfade_default_is_zero():
     """Model-faithful default: stitched OUTPUT-side crossfade is OFF.
 

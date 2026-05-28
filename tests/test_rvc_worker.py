@@ -481,3 +481,238 @@ def test_rvc_worker_records_resample_timing_on_sr_mismatch():
     assert metrics.rvc_resample_count == 1
     assert metrics.rvc_resample_total_ms >= 0.0
     assert metrics.rvc_resample_mean_ms >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: input-side left-context with proportional output trim
+# ---------------------------------------------------------------------------
+
+class _RecordingEngine:
+    """Engine that records every input shape it was called with and
+    returns its input unchanged (identity gain, same SR).
+
+    This makes it trivial to assert what the worker actually sent to
+    ``infer_array`` — specifically that the left-context was prepended.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list = []   # list of (np.ndarray copy, sr)
+
+    def infer_array(self, audio, sample_rate):
+        self.calls.append((audio.astype(np.float32, copy=True), int(sample_rate)))
+        return audio.astype(np.float32, copy=False), int(sample_rate)
+
+
+def test_rvc_worker_prepends_left_context_to_engine_input():
+    """With context_size > 0 the engine sees chunk_size + context_size
+    samples per call; the first call's context is zeros (true start-of-
+    signal); subsequent calls' context is the previous chunk's tail."""
+    chunk_size = 2400
+    block_size = 480
+    context_size = 480     # 10 ms @ 48 kHz; convenient block multiple
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _RecordingEngine()
+
+    chunk_1 = np.linspace(0.1, 0.5, chunk_size, dtype=np.float32)
+    chunk_2 = np.linspace(0.5, 0.9, chunk_size, dtype=np.float32)
+    for i in range(chunk_size // block_size):
+        in_q.put(chunk_1[i * block_size:(i + 1) * block_size].copy())
+    for i in range(chunk_size // block_size):
+        in_q.put(chunk_2[i * block_size:(i + 1) * block_size].copy())
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        context_size=context_size,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=False,
+    )
+
+    assert len(engine.calls) == 2
+    a0, _ = engine.calls[0]
+    a1, _ = engine.calls[1]
+    # Each engine input is context_size + chunk_size long.
+    assert a0.size == context_size + chunk_size
+    assert a1.size == context_size + chunk_size
+    # First call's context is zeros.
+    np.testing.assert_array_equal(a0[:context_size], np.zeros(context_size, dtype=np.float32))
+    # First call's new region matches chunk_1 exactly.
+    np.testing.assert_allclose(a0[context_size:], chunk_1, atol=1e-6)
+    # Second call's context is chunk_1's tail.
+    np.testing.assert_allclose(a1[:context_size], chunk_1[-context_size:], atol=1e-6)
+    np.testing.assert_allclose(a1[context_size:], chunk_2, atol=1e-6)
+
+
+def test_rvc_worker_trims_output_proportionally_to_preserve_chunk_duration():
+    """With an identity-gain engine, the EMITTED output per chunk must
+    equal the chunk_size in input samples — no timeline drift."""
+    chunk_size = 2400
+    block_size = 480
+    context_size = 480
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _RecordingEngine()
+
+    for _ in range(3 * (chunk_size // block_size)):
+        in_q.put(np.full(block_size, 0.25, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        context_size=context_size,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=False,
+    )
+
+    assert len(engine.calls) == 3
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    # 3 chunks * 2400 samples each = exactly 7200 emitted samples.
+    # (Identity engine -> 1:1 input/output ratio -> trim removes exactly
+    # context_size samples per chunk.)
+    assert total == 3 * chunk_size
+
+
+def test_rvc_worker_zero_context_is_identical_to_legacy_behaviour():
+    """context_size=0 must reproduce the no-context legacy path: the
+    engine sees the chunk only, and no trim is applied."""
+    chunk_size = 1920
+    block_size = 480
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _RecordingEngine()
+
+    payload = np.linspace(-0.5, 0.5, chunk_size, dtype=np.float32)
+    for i in range(chunk_size // block_size):
+        in_q.put(payload[i * block_size:(i + 1) * block_size].copy())
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        context_size=0,
+        poll_timeout_seconds=0.05,
+    )
+
+    assert len(engine.calls) == 1
+    a0, _ = engine.calls[0]
+    assert a0.size == chunk_size
+    np.testing.assert_allclose(a0, payload, atol=1e-6)
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    assert total == chunk_size
+
+
+def test_rvc_worker_fallback_path_does_not_apply_trim():
+    """When the engine raises, the worker emits the chunk's own audio
+    via identity fallback. The trim path (which assumes the model ran
+    on chunk+context) must NOT engage in that case, otherwise the
+    listener loses the first ``context_size`` samples of fallback
+    audio."""
+    chunk_size = 2400
+    block_size = 480
+    context_size = 480
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _FakeEngine(raise_on_call=True)
+
+    payload = np.full(chunk_size, 0.42, dtype=np.float32)
+    for i in range(chunk_size // block_size):
+        in_q.put(payload[i * block_size:(i + 1) * block_size].copy())
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        context_size=context_size,
+        poll_timeout_seconds=0.05,
+    )
+
+    assert metrics.rvc_fallback_count == 1
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    assert total == chunk_size
+    concat = np.concatenate(out_blocks)
+    np.testing.assert_allclose(concat, payload, atol=1e-6)
+
+
+def test_rvc_worker_rejects_negative_context_size():
+    in_q: "queue.Queue" = queue.Queue()
+    out_q: "queue.Queue" = queue.Queue()
+    with pytest.raises(ValueError):
+        rvc_worker_loop(
+            _FakeEngine(), in_q, out_q, RuntimeMetrics(), threading.Event(), SENTINEL,
+            sample_rate=48000, chunk_size=480, output_block_size=480,
+            context_size=-1,
+            poll_timeout_seconds=0.01,
+        )
+
+
+def test_rvc_worker_context_preserved_across_stale_drop():
+    """When drop_stale_input drops intermediate chunks, the context
+    buffer must carry forward from the LAST processed chunk (we never
+    saw the dropped ones individually). This is documented behaviour."""
+    chunk_size = 480
+    block_size = 480
+    context_size = 240
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _RecordingEngine()
+
+    # 3 chunks of distinct content. The worker should pull all 3 in one
+    # drain cycle and process only the latest under drop_stale_input.
+    c1 = np.full(chunk_size, 0.1, dtype=np.float32)
+    c2 = np.full(chunk_size, 0.2, dtype=np.float32)
+    c3 = np.full(chunk_size, 0.3, dtype=np.float32)
+    for blk in (c1, c2, c3):
+        in_q.put(blk.copy())
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        context_size=context_size,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=True,
+    )
+
+    assert metrics.rvc_stale_chunk_drops == 2
+    assert len(engine.calls) == 1
+    a0, _ = engine.calls[0]
+    # The single engine call's context is zeros (no prior chunk had been
+    # processed yet); its new region is c3.
+    np.testing.assert_array_equal(a0[:context_size], np.zeros(context_size, dtype=np.float32))
+    np.testing.assert_allclose(a0[context_size:], c3, atol=1e-6)

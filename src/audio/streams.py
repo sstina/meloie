@@ -458,6 +458,7 @@ def run_rvc_stream(
     rvc_queue_ms: float = 6000.0,
     rvc_prebuffer_ms: Optional[float] = None,
     drop_stale_input: bool = True,
+    context_ms: float = 0.0,
 ) -> RuntimeMetrics:
     """Open the realtime RVC chunk loop and run it.
 
@@ -476,9 +477,12 @@ def run_rvc_stream(
         raise ValueError("chunk_ms must be > 0")
     if crossfade_ms < 0:
         raise ValueError("crossfade_ms must be >= 0")
+    if context_ms < 0:
+        raise ValueError("context_ms must be >= 0")
 
     chunk_size = max(1, int(round(chunk_ms / 1000.0 * config.sample_rate)))
     crossfade_size = max(0, int(round(crossfade_ms / 1000.0 * config.sample_rate)))
+    context_size = max(0, int(round(context_ms / 1000.0 * config.sample_rate)))
     output_block_size = int(config.block_size)
 
     # RVC mode needs much larger queues than identity. The identity-era
@@ -521,6 +525,9 @@ def run_rvc_stream(
         f"rvc_queue_blocks={rvc_queue_blocks}  "
         f"rvc_prebuffer_blocks={prebuffer_blocks}  "
         f"drop_stale_input={drop_stale_input}",
+        f"context_ms={context_ms:.1f} ({context_size} samples) "
+        f"-- input-left-context fed to model; output trimmed proportionally "
+        f"so emit duration == chunk_ms (no timeline drift)",
         f"f0_method={engine.config.f0_method}  "
         f"index_rate={engine.config.index_rate}  "
         f"protect={engine.config.protect}  "
@@ -563,6 +570,7 @@ def run_rvc_stream(
                 "output_block_size": int(output_block_size),
                 "crossfade_size": int(crossfade_size),
                 "drop_stale_input": bool(drop_stale_input),
+                "context_size": int(context_size),
             },
             name="rvc-worker",
             daemon=True,

@@ -149,6 +149,7 @@ def rvc_worker_loop(
     fallback_to_identity_on_error: bool = True,
     poll_timeout_seconds: float = 0.1,
     drop_stale_input: bool = True,
+    context_size: int = 0,
 ) -> None:
     """Chunked RVC worker.
 
@@ -157,18 +158,52 @@ def rvc_worker_loop(
         block = in_queue.get(timeout=...)
         append to input_acc (BlockAccumulator at chunk_size)
         for each full chunk:
+            if context_size > 0:
+                input_to_model = concat(context_buffer, chunk)
+            else:
+                input_to_model = chunk
             t0 = perf_counter()
             try:
-                processed, _sr = engine.infer_array(chunk, sample_rate)
+                processed, _sr = engine.infer_array(input_to_model, sample_rate)
             except Exception:
                 processed = identity(chunk)   # fallback, link stays alive
                 metrics.rvc_fallback_count += 1
+            if context_size > 0:
+                # Trim leading region proportionally — preserves the chunk's
+                # output duration exactly while letting the model see real
+                # previous audio as warmup context.
+                trim = round(context_size * processed.size / input_to_model.size)
+                processed = processed[trim:]
+                context_buffer = chunk[-context_size:]
             scrub NaN/Inf
             crossfade with previous chunk's tail (if crossfade_size > 0)
             feed processed into output_acc (BlockAccumulator at block_size)
             push each emitted block to out_queue (put_nowait; full -> drop++)
 
-    On shutdown, flush any pending tail and partial blocks.
+    Stage 3 — input-left-context (``context_size > 0``):
+
+    Per-chunk inference inherits no past audio across chunk boundaries,
+    so HuBERT / F0 / index re-initialise on every call. The first
+    ~tens of ms of every chunk's output exhibits cold-start instability
+    (boundary clicks, F0 wobble, sustained-vowel flutter). The
+    model-faithful fix is to feed the model some real previous input
+    audio as left-context, then discard the proportional output region.
+
+    * Each inference receives ``[context_buffer, chunk]`` (``context_size
+      + chunk_size`` samples). On the very first chunk the buffer is
+      zeros, which mirrors a true start-of-signal.
+    * The output is trimmed by ``round(context_size * out_len / in_len)``
+      samples from the front. This preserves the chunk's nominal
+      output duration exactly (no timeline drift).
+    * ``context_buffer`` is then refreshed to ``chunk[-context_size:]``
+      so the next call sees the correct preceding audio.
+    * On ``drop_stale_input`` engagement, intermediate chunks' tails
+      are not propagated; the buffer carries the LAST processed
+      chunk's tail. This is a known small discontinuity that only
+      fires when inference falls behind; identity fallback semantics
+      are unchanged.
+
+    On shutdown, flush any pending crossfade tail and partial block.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
@@ -176,6 +211,8 @@ def rvc_worker_loop(
         raise ValueError("output_block_size must be > 0")
     if crossfade_size < 0:
         raise ValueError("crossfade_size must be >= 0")
+    if context_size < 0:
+        raise ValueError("context_size must be >= 0")
     if engine is None:
         raise ValueError("engine must not be None")
 
@@ -183,6 +220,11 @@ def rvc_worker_loop(
     output_acc = BlockAccumulator(ChunkerConfig(chunk_size=int(output_block_size)))
     pending_tail: Optional[np.ndarray] = None
     saw_shutdown = False
+    # Stage 3 input-left-context buffer. Zero-initialised so the very
+    # first chunk sees a silent past (matches true start-of-signal).
+    context_buffer: Optional[np.ndarray] = (
+        np.zeros(int(context_size), dtype=np.float32) if context_size > 0 else None
+    )
 
     def _emit(buf: np.ndarray) -> None:
         if buf.size == 0:
@@ -249,10 +291,21 @@ def rvc_worker_loop(
             chunks = chunks[-1:]
 
         for chunk in chunks:
+            # Stage 3: prepend left-context before sending to the model.
+            # ``input_to_model`` is what the engine sees; ``chunk`` is the
+            # caller's "new audio" that should map to chunk_size samples
+            # of OUTPUT after trimming.
+            if context_buffer is not None and context_size > 0:
+                input_to_model = np.concatenate([context_buffer, chunk])
+            else:
+                input_to_model = chunk
             t0 = time.perf_counter()
             result_sr = int(sample_rate)
+            used_fallback = False
             try:
-                processed, result_sr_raw = engine.infer_array(chunk, int(sample_rate))
+                processed, result_sr_raw = engine.infer_array(
+                    input_to_model, int(sample_rate)
+                )
                 processed = np.asarray(processed, dtype=np.float32).reshape(-1)
                 result_sr = int(result_sr_raw)
             except Exception:
@@ -260,7 +313,45 @@ def rvc_worker_loop(
                     raise
                 processed = chunk.astype(np.float32, copy=True)
                 metrics.rvc_fallback_count += 1
+                used_fallback = True
             metrics.record_inference_ms((time.perf_counter() - t0) * 1000.0)
+
+            # Trim the leading region that corresponds to the context
+            # input. Skipped when context is off, when the model failed
+            # (the fallback is already the chunk's own audio), or when
+            # the backend returned a degenerate output (the SR-handling
+            # block below will treat that as fallback anyway).
+            if (
+                context_size > 0
+                and not used_fallback
+                and processed.size > 0
+                and input_to_model.size > 0
+            ):
+                trim = int(round(
+                    int(context_size) * processed.size / input_to_model.size
+                ))
+                if trim < 0:
+                    trim = 0
+                if trim >= processed.size:
+                    # Defensive: would leave nothing; treat as fallback so the
+                    # chain stays alive. Should never happen in practice.
+                    processed = chunk.astype(np.float32, copy=True)
+                    metrics.rvc_fallback_count += 1
+                else:
+                    processed = processed[trim:]
+
+            # Refresh context buffer for the next inference. We refresh
+            # from the chunk's actual input regardless of whether the
+            # model succeeded — the next chunk's correct left-context is
+            # always "this chunk's tail" in input time.
+            if context_buffer is not None and context_size > 0:
+                if chunk.size >= context_size:
+                    context_buffer = chunk[-context_size:].astype(np.float32, copy=True)
+                else:
+                    # Partial chunk (shorter than context). Pad-shift.
+                    new_ctx = np.zeros(context_size, dtype=np.float32)
+                    new_ctx[-chunk.size:] = chunk
+                    context_buffer = new_ctx
 
             # SR handling. The kiki model returns 40 kHz natively while the
             # stream is 48 kHz; asking infer_rvc_python to resample
