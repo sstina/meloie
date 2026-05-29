@@ -5,11 +5,11 @@
   "hubert_path": "models/kiki/hubert_base.pt",
   "rmvpe_path": "models/kiki/rmvpe.pt",
   "f0_method": "rmvpe",
-  "index_rate": 0.5,
+  "index_rate": 0.0,
   "protect": 0.33,
   "filter_radius": 3,
   "rms_mix_rate": 1.0,
-  "pitch_shift": 0,
+  "pitch_shift": 12,
   "resample_sr": 0,
-  "notes": "Example profile for the 'kiki' trained model. These values are the model's intended inference settings, not sound-design knobs. Do not change them to 'tune the voice'; train a different model instead. rms_mix_rate is kept at 1.0 (model's own loudness); lowering it imposes the source mic's loudness envelope on the output (change_rms), which is runtime gain shaping and breaks the faithful-carrier contract. Paths are relative to the project root (the directory you run python -m from)."
+  "notes": "Profile for the 'kiki' trained model. These are the model creator's INTENDED inference settings, recovered from the original RVC tool kiki shipped with (mod/configs/config.json): pitch=+12 (kiki is a female model meant to be driven with the input transposed up an octave -- this is THE fix for the 'weird/电音' quality at pitch 0), index_rate=0.0, f0=fcpe (we use rmvpe; infer_rvc_python's fcpe path is broken). The creator used rms_mix_rate=0.5 (imposes source loudness for live dynamics); we keep 1.0 (faithful, model's own loudness) -- set 0.5 if you prefer the creator's exact live feel. pitch is voice-dependent: override per-run with --pitch. Paths are relative to the project root."
 }

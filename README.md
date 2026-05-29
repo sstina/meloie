@@ -88,13 +88,25 @@ Voice identity is a JSON file under `config/model_profiles/`
   "index_path":  "models/kiki/kikiV1.index",
   "hubert_path": "models/kiki/hubert_base.pt",
   "rmvpe_path":  "models/kiki/rmvpe.pt",
-  "f0_method": "rmvpe", "index_rate": 0.5, "protect": 0.33,
-  "filter_radius": 3, "rms_mix_rate": 1.0, "pitch_shift": 0, "resample_sr": 0
+  "f0_method": "rmvpe", "index_rate": 0.0, "protect": 0.33,
+  "filter_radius": 3, "rms_mix_rate": 1.0, "pitch_shift": 12, "resample_sr": 0
 }
 ```
 
 Paths are relative to the directory you run `python -m` from (the project
 root). Place model assets under `models/` (gitignored).
+
+### `pitch_shift` is the transpose (变调) — it matters a lot
+
+`pitch_shift` (semitones) transposes the **input F0** before conversion. It is
+the single most important knob for getting a usable voice: a **female model
+driven by a male voice needs roughly +12** (one octave). At `0`, a female
+model produces a female timbre stuck at a too-low pitch — the uncanny
+"电音"/robotic quality. kiki's intended value (from the tool it shipped with)
+is **+12**, with `index_rate=0.0`. Pitch is voice-dependent, so override it
+per run with **`--pitch SEMITONES`** (e.g. `--pitch 12`, `--pitch 7`) to find
+what suits your voice. `--pitch` conditions the model's input pitch — it is
+**not** an output pitch-shift, so it stays within the faithful-carrier design.
 
 ## Engineering knobs (the only user-facing controls — none change the voice)
 

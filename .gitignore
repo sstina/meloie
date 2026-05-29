@@ -1,8 +1,10 @@
 __pycache__/
 .pytest_cache/
 .venv/
+.venv*/
 .venv310/
 .venv311/
+.venv_applio310/
 venv/
 
 # redirected caches / temp (setup_env.ps1) — never commit

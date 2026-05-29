@@ -55,6 +55,7 @@ def test_parser_engineering_defaults():
     assert args.input_device is None     # follow system default
     assert args.output_device is None
     assert args.allow_virtual_cable_input is False
+    assert args.pitch is None            # transpose: default to the profile's value
 
 
 def test_parser_can_disable_stale_drop():
@@ -85,12 +86,22 @@ def test_parser_input_device_override_and_legacy_alias():
     assert b.input_device == "WO Mic"
 
 
-def test_parser_has_no_voice_shaping_flags():
-    """The runtime is a faithful carrier — there must be no --mode,
-    --crossfade-ms, --frame-restore-method, --pitch-shift, etc."""
+def test_parser_accepts_pitch():
+    """--pitch (变调/transpose) is THE creative knob: it conditions the model's
+    input F0 (a female model needs ~+12 for a male voice). Allowed."""
+    args = _build_parser().parse_args(["--config", CONFIG, "--pitch", "12"])
+    assert args.pitch == 12
+    args = _build_parser().parse_args(["--config", CONFIG, "--pitch", "-5"])
+    assert args.pitch == -5
+
+
+def test_parser_has_no_output_shaping_flags():
+    """Still a faithful carrier on the OUTPUT — no --mode, --crossfade-ms,
+    --frame-restore-method, --index-rate, --f0-method. (--pitch is allowed: it
+    is input-F0 conditioning, the essential transpose, not output shaping.)"""
     parser = _build_parser()
     for bad in ("--mode", "--crossfade-ms", "--frame-restore-method",
-                "--pitch-shift", "--index-rate", "--f0-method"):
+                "--index-rate", "--f0-method", "--rms-mix-rate"):
         with pytest.raises(SystemExit):
             parser.parse_args([bad, "x"])
 

@@ -87,6 +87,14 @@ def _build_parser() -> argparse.ArgumentParser:
     voice.add_argument("--index-path", default=None, help="Path to .index file.")
     voice.add_argument("--hubert-path", default=None, help="Path to hubert_base.pt.")
     voice.add_argument("--rmvpe-path", default=None, help="Path to rmvpe.pt.")
+    voice.add_argument("--pitch", type=int, default=None, metavar="SEMITONES",
+                       help="Transpose (变调) in semitones applied to the input "
+                            "F0 before conversion -- THE main creative knob. A "
+                            "female model typically needs about +12 for a male "
+                            "voice (e.g. kiki's intended setting is +12). This "
+                            "conditions the model's input pitch (not an output "
+                            "pitch-shift). Overrides the profile's pitch_shift; "
+                            "default: the profile's value.")
 
     eng = parser.add_argument_group("Engineering knobs (stability / latency)")
     eng.add_argument("--backend", default="infer_rvc_python",
@@ -274,7 +282,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         protect=pick("protect", 0.33),
         filter_radius=pick("filter_radius", 3),
         rms_mix_rate=pick("rms_mix_rate", 1.0),
-        pitch_shift=pick("pitch_shift", 0),
+        pitch_shift=(args.pitch if args.pitch is not None else pick("pitch_shift", 0)),
         sample_rate=config.sample_rate,
         resample_sr=resample_sr,
         device=args.device,
@@ -282,6 +290,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         rmvpe_path=args.rmvpe_path or pick("rmvpe_path", None),
     )
 
+    print(f"voice params: pitch={rvc_config.pitch_shift:+d} semitones  "
+          f"index_rate={rvc_config.index_rate}  f0={rvc_config.f0_method}  "
+          f"protect={rvc_config.protect}  rms_mix={rvc_config.rms_mix_rate}")
     engine = RvcEngine(rvc_config)
     print(f"loading RVC backend={rvc_config.backend} device={args.device} ...")
     try:
