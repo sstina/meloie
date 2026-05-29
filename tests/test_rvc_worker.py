@@ -523,3 +523,92 @@ def test_sola_disabled_when_context_too_small():
     assert metrics.rvc_sola_applied_count == 0
     total = sum(b.size for b in _drain(out_q))
     assert total == metrics.rvc_chunks_processed * chunk_size
+
+
+# ---------------------------------------------------------------------------
+# SilenceFront (w-okada borrow): RMS-gated silence skip, faithful + hangover.
+# ---------------------------------------------------------------------------
+
+def test_silence_skips_below_threshold_emitting_zeros():
+    chunk_size = 2400  # 5 * 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    engine = _FakeEngine(gain=0.5)
+
+    for _ in range(5):
+        in_q.put(np.zeros(480, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size,
+         silence_rms_threshold=0.01, silence_hangover_chunks=0)
+
+    assert engine.call_count == 0                 # inference skipped entirely
+    assert metrics.rvc_silence_skipped_count == 1
+    assert metrics.rvc_chunks_processed == 0
+    concat = np.concatenate(_drain(out_q))
+    assert concat.shape == (chunk_size,)          # still emits chunk_size...
+    np.testing.assert_array_equal(concat, np.zeros(chunk_size, np.float32))  # ...of zeros
+
+
+def test_silence_processes_above_threshold():
+    chunk_size = 2400
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    engine = _FakeEngine(gain=0.5)
+
+    for _ in range(5):
+        in_q.put(np.full(480, 0.4, dtype=np.float32))   # RMS 0.4 >> 0.01
+    in_q.put(SENTINEL)
+
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size,
+         silence_rms_threshold=0.01, silence_hangover_chunks=0)
+
+    assert engine.call_count == 1
+    assert metrics.rvc_silence_skipped_count == 0
+    assert metrics.rvc_chunks_processed == 1
+
+
+def test_silence_disabled_by_default_processes_silent_chunk():
+    """The safe default (threshold 0.0) must NEVER skip — a silent chunk is
+    still run through inference, so soft speech can never be gated out."""
+    chunk_size = 2400
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    engine = _FakeEngine(gain=0.5)
+
+    for _ in range(5):
+        in_q.put(np.zeros(480, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size)  # no silence args
+
+    assert engine.call_count == 1
+    assert metrics.rvc_silence_skipped_count == 0
+    assert metrics.rvc_chunks_processed == 1
+
+
+def test_silence_hangover_keeps_quiet_chunk_then_skips():
+    """One loud chunk then quiet: with hangover=1, the first quiet chunk is
+    still processed (tail protection); the next quiet chunk is skipped."""
+    chunk_size = 2400
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    engine = _FakeEngine(gain=0.5)
+
+    for _ in range(5):                              # chunk 1: loud
+        in_q.put(np.full(480, 0.4, dtype=np.float32))
+    for _ in range(10):                             # chunks 2 & 3: quiet
+        in_q.put(np.zeros(480, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size,
+         silence_rms_threshold=0.01, silence_hangover_chunks=1,
+         drop_stale_input=False)                    # process all 3 chunks in order
+
+    assert engine.call_count == 2                   # loud + 1 hangover chunk
+    assert metrics.rvc_chunks_processed == 2
+    assert metrics.rvc_silence_skipped_count == 1   # the 3rd (post-hangover)

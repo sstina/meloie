@@ -60,6 +60,9 @@ class RuntimeMetrics:
     rvc_output_blocks_enqueued: int = 0
     rvc_output_blocks_dropped: int = 0
     frame_restoration_shortfall_count: int = 0
+    # SilenceFront (w-okada borrow): chunks whose input RMS fell below the
+    # silence threshold and were emitted as zeros without running inference.
+    rvc_silence_skipped_count: int = 0
 
     # SOLA seam alignment (faithful: chooses the cut offset, no sample edit).
     rvc_sola_applied_count: int = 0

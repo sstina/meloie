@@ -180,6 +180,7 @@ def _print_metrics_line(metrics, in_q, out_q) -> None:
         f"max={metrics.rvc_inference_max_ms:4.0f})ms "
         f"fb={metrics.rvc_fallback_count} "
         f"stale={metrics.rvc_stale_chunk_drops} "
+        f"sil={metrics.rvc_silence_skipped_count} "
         f"odrop={metrics.rvc_output_blocks_dropped} "
         f"sola={metrics.rvc_sola_offset_last:+d}",
         flush=True,
@@ -209,6 +210,7 @@ def _print_summary(
     print(f"rvc_chunk_ms_budget      = {metrics.rvc_chunk_ms_budget:.1f}")
     print(f"rvc_fallback_count       = {metrics.rvc_fallback_count}")
     print(f"rvc_stale_chunk_drops    = {metrics.rvc_stale_chunk_drops}")
+    print(f"rvc_silence_skipped_count= {metrics.rvc_silence_skipped_count}")
     print(f"rvc_output_blocks_enqueued = {metrics.rvc_output_blocks_enqueued}")
     print(f"rvc_output_blocks_dropped  = {metrics.rvc_output_blocks_dropped}")
     print(f"frame_restoration_shortfall_count = {metrics.frame_restoration_shortfall_count}")
@@ -255,6 +257,8 @@ def run_rvc_stream(
     context_ms: float = 500.0,
     tail_pad_ms: float = 30.0,
     sola_search_ms: float = 10.0,
+    silence_threshold_dbfs: Optional[float] = None,
+    silence_hangover_ms: float = 500.0,
 ) -> RuntimeMetrics:
     """Open ``system default mic -> RVC worker -> CABLE Input`` and run it.
 
@@ -314,6 +318,23 @@ def run_rvc_stream(
     sola_search_size = max(0, int(round(sola_search_ms / 1000.0 * config.sample_rate)))
     sola_link_size = 2 * sola_search_size
 
+    # SilenceFront (w-okada borrow): a dBFS threshold on each chunk's input RMS,
+    # below which inference is skipped and the chunk is emitted as silence.
+    # None => disabled (linear 0.0; RMS >= 0 always, so nothing is ever skipped).
+    # Default OFF: an over-high threshold would silence soft speech, so this is
+    # opt-in only. Converted dBFS -> linear amplitude here.
+    if silence_threshold_dbfs is None:
+        silence_rms_threshold = 0.0
+    else:
+        silence_rms_threshold = float(10.0 ** (float(silence_threshold_dbfs) / 20.0))
+    # Hangover in whole chunks: keep processing this long after the last voiced
+    # chunk so soft / trailing syllables are not clipped.
+    silence_hangover_chunks = (
+        int(np.ceil(float(silence_hangover_ms) / float(chunk_ms)))
+        if silence_hangover_ms > 0
+        else 0
+    )
+
     rvc_queue_blocks = queue_blocks_from_ms(
         float(rvc_queue_ms), config.block_size, config.sample_rate,
         minimum=config.queue_blocks,
@@ -357,7 +378,13 @@ def run_rvc_stream(
         + f"\nqueue={rvc_queue_blocks} blocks (~{rvc_queue_ms:.0f} ms)  "
         f"prebuffer={prebuffer_blocks} blocks (~{prebuffer_ms:.0f} ms)  "
         f"drop_stale_input={drop_stale_input}\n"
-        "faithful-carrier: model defines the voice; runtime only resamples "
+        + (
+            f"silence-skip: OFF\n"
+            if silence_rms_threshold <= 0.0
+            else f"silence-skip: < {silence_threshold_dbfs:.0f} dBFS, "
+                 f"hangover {silence_hangover_chunks} chunk(s) (~{silence_hangover_ms:.0f} ms)\n"
+        )
+        + "faithful-carrier: model defines the voice; runtime only resamples "
         "to the stream SR, slices exactly, and scrubs NaN. No pitch/stretch/"
         "crossfade/EQ. Identity fallback only on backend error."
     )
@@ -439,6 +466,8 @@ def run_rvc_stream(
             "sola_search_size": int(sola_search_size),
             "sola_link_size": int(sola_link_size),
             "drop_stale_input": bool(drop_stale_input),
+            "silence_rms_threshold": float(silence_rms_threshold),
+            "silence_hangover_chunks": int(silence_hangover_chunks),
         },
         name="rvc-worker",
         daemon=True,

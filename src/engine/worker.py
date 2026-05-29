@@ -69,9 +69,19 @@ def rvc_worker_loop(
     sola_link_size: int = 0,
     drop_stale_input: bool = True,
     fallback_to_identity_on_error: bool = True,
+    silence_rms_threshold: float = 0.0,
+    silence_hangover_chunks: int = 0,
     poll_timeout_seconds: float = 0.1,
 ) -> None:
-    """Run the realtime RVC worker until shutdown. See module docstring."""
+    """Run the realtime RVC worker until shutdown. See module docstring.
+
+    SilenceFront (borrowed from w-okada): when ``silence_rms_threshold > 0`` and
+    a chunk's linear RMS falls below it, the inference pipeline is skipped and
+    that chunk is emitted as ``chunk_size`` zeros — silence in, silence out, a
+    faithful no-op (no voiced sample is reshaped). ``silence_hangover_chunks``
+    keeps processing for that many chunks after the last voiced chunk so soft /
+    trailing syllables are never clipped. Default (threshold 0.0) = disabled.
+    """
     if engine is None:
         raise ValueError("engine must not be None")
     if chunk_size <= 0:
@@ -84,7 +94,13 @@ def rvc_worker_loop(
         raise ValueError("tail_pad_size must be >= 0")
     if sola_search_size < 0 or sola_link_size < 0:
         raise ValueError("sola_search_size and sola_link_size must be >= 0")
+    if silence_rms_threshold < 0:
+        raise ValueError("silence_rms_threshold must be >= 0 (0 disables)")
+    if silence_hangover_chunks < 0:
+        raise ValueError("silence_hangover_chunks must be >= 0")
 
+    silence_rms_threshold = float(silence_rms_threshold)
+    silence_hangover_chunks = int(silence_hangover_chunks)
     chunk_size = int(chunk_size)
     context_size = int(context_size)
     tail_pad_size = int(tail_pad_size)
@@ -113,6 +129,9 @@ def rvc_worker_loop(
     sola_link: Optional[np.ndarray] = None
     stream_buf = np.zeros(0, dtype=np.float32)
     saw_shutdown = False
+    # SilenceFront hangover: chunks still to process after the last voiced one.
+    voiced_hangover = 0
+    silence_enabled = silence_rms_threshold > 0.0
 
     chunk_ms_budget = float(chunk_size) * 1000.0 / float(sample_rate)
     metrics.rvc_chunk_ms_budget = chunk_ms_budget
@@ -160,6 +179,19 @@ def rvc_worker_loop(
         metrics.rvc_fallback_count += 1
         metrics.rvc_chunks_processed += 1
         _emit(_scrub(chunk.astype(np.float32, copy=True)))
+
+    def _silence_skip(chunk: np.ndarray) -> None:
+        # SilenceFront: input below the silence floor -> emit chunk_size zeros
+        # (silence in, silence out: faithful, no voiced sample touched), skip
+        # the whole inference pipeline. Refresh context from this real (silent)
+        # chunk so the next voiced chunk warms up on its true left neighbour
+        # (fixes w-okada's stale-context-on-resume weakness), and reset the SOLA
+        # link since emitted zeros are not a model render.
+        nonlocal sola_link
+        sola_link = None
+        metrics.rvc_silence_skipped_count += 1
+        _refresh_context(chunk)
+        _emit(np.zeros(chunk_size, dtype=np.float32))
 
     def _seam_aligned_start(processed: np.ndarray) -> int:
         """Pick the slice start that phase-aligns this render's seam with the
@@ -285,6 +317,20 @@ def rvc_worker_loop(
                 np.float32, copy=True
             )
             stream_buf = stream_buf[chunk_size:]
+
+            # SilenceFront gate: skip inference on sub-threshold chunks, but a
+            # hangover keeps processing for a short tail after voiced audio so
+            # soft / trailing syllables are never clipped.
+            if silence_enabled:
+                rms = float(np.sqrt(np.mean(np.square(chunk)))) if chunk.size else 0.0
+                if rms >= silence_rms_threshold:
+                    voiced_hangover = silence_hangover_chunks
+                elif voiced_hangover > 0:
+                    voiced_hangover -= 1
+                else:
+                    _silence_skip(chunk)
+                    continue
+
             _handle_chunk(chunk, tail)
             _refresh_context(chunk)
 

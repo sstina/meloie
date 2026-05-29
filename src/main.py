@@ -141,6 +141,18 @@ def _build_parser() -> argparse.ArgumentParser:
                      action=argparse.BooleanOptionalAction, default=True,
                      help="If inference falls behind, drop oldest chunks to "
                           "keep latency bounded. Default: on.")
+    eng.add_argument("--silence-threshold-dbfs", type=float, default=None,
+                     help="SilenceFront (w-okada borrow): skip RVC inference on "
+                          "chunks whose input RMS is below this level (dBFS) and "
+                          "emit silence -- saves GPU on silence, no voice change. "
+                          "Default: OFF (an over-high value would silence soft "
+                          "speech). Opt in with e.g. -60; watch the live in_rms "
+                          "vs your soft-speech level and keep it well below.")
+    eng.add_argument("--silence-hangover-ms", type=float, default=500.0,
+                     help="Keep processing this long after the last voiced chunk "
+                          "so soft/trailing syllables are never clipped by the "
+                          "silence skip. Only used when --silence-threshold-dbfs "
+                          "is set. Default 500.")
     eng.add_argument("--resample-sr", type=int, default=None,
                      help="Ask the backend to resample its output to this SR. "
                           "Default: profile's value or 0 (model-native; the "
@@ -340,6 +352,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             context_ms=args.rvc_context_ms,
             tail_pad_ms=args.tail_pad_ms,
             sola_search_ms=args.sola_search_ms,
+            silence_threshold_dbfs=args.silence_threshold_dbfs,
+            silence_hangover_ms=args.silence_hangover_ms,
         )
     except FeedbackLoopRisk as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -121,6 +121,8 @@ what suits your voice. `--pitch` conditions the model's input pitch — it is
 | `--rvc-prebuffer-ms` | 800 | Output silence before first real audio = the standing output latency. Absolute cushion (decoupled from chunk) sized to cover one inference spike + one output burst. Lower = less latency, more underruns |
 | `--warmup-rvc-count` | 2 | Dummy inferences before opening the stream (hides the ~30 s cold start) |
 | `--drop-stale-input` / `--no-drop-stale-input` | on | If inference falls behind, drop oldest chunks so latency stays bounded |
+| `--silence-threshold-dbfs` | off | SilenceFront: skip inference on chunks below this input RMS (dBFS) and emit silence — saves GPU, no voice change. Opt-in (off by default so it can never gate out soft speech) |
+| `--silence-hangover-ms` | 500 | Keep processing this long after the last voiced chunk so soft/trailing syllables aren't clipped (only used when the threshold is set) |
 | `--input-device` / `--output-device` | system default / `CABLE Input` | Device name fragments |
 | `--duration-seconds` | run until Ctrl+C | Stop after N seconds |
 

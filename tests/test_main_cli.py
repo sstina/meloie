@@ -51,6 +51,8 @@ def test_parser_engineering_defaults():
     assert args.rvc_prebuffer_ms is None
     assert args.warmup_rvc_count == 2
     assert args.drop_stale_input is True
+    assert args.silence_threshold_dbfs is None    # SilenceFront off by default
+    assert args.silence_hangover_ms == 500.0
     assert args.resample_sr is None
     assert args.input_device is None     # follow system default
     assert args.output_device is None
