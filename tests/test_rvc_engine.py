@@ -39,6 +39,7 @@ def test_config_defaults_validate():
     assert cfg.rms_mix_rate == pytest.approx(1.0)
     assert cfg.pitch_shift == 0
     assert cfg.device == "auto"
+    assert cfg.precision == "auto"
     assert cfg.resample_sr == 0
 
 
@@ -65,6 +66,16 @@ def test_config_rejects_negative_filter_radius():
 def test_config_rejects_out_of_range_protect():
     with pytest.raises(ValueError):
         RvcEngineConfig(protect=0.9).validate()
+
+
+def test_config_accepts_known_precisions():
+    for p in ("auto", "fp16", "fp32"):
+        RvcEngineConfig(precision=p).validate()
+
+
+def test_config_rejects_unknown_precision():
+    with pytest.raises(ValueError):
+        RvcEngineConfig(precision="bf16").validate()
 
 
 # ---------------------------------------------------------------------------

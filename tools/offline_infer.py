@@ -72,6 +72,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    choices=["auto", "cpu", "cuda", "directml_experimental"],
                    help="Inference device. 'auto' picks cuda if available, "
                         "otherwise cpu.")
+    p.add_argument("--precision", default="auto",
+                   choices=["auto", "fp32", "fp16"],
+                   help="Numeric precision. 'fp32' forces single precision "
+                        "(x_pad=1 on this backend); 'auto' = backend default.")
     p.add_argument("--force-cpu", action="store_true",
                    help="DEPRECATED: equivalent to --device cpu.")
     p.add_argument("--resample-sr", type=int, default=None,
@@ -215,6 +219,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         pitch_shift=voice["pitch_shift"],
         resample_sr=resample_sr,
         device=args.device,
+        precision=args.precision,
         force_cpu=args.force_cpu,
         hubert_path=voice["hubert_path"],
         rmvpe_path=voice["rmvpe_path"],
@@ -232,7 +237,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 11
     print(
         f"engine loaded. resolved_device={engine.resolved_device} "
-        f"cuda_device={engine.cuda_device_name or '(n/a)'}"
+        f"cuda_device={engine.cuda_device_name or '(n/a)'} "
+        f"precision={engine.resolved_precision or '(unknown)'}"
     )
 
     print(f"running RVC inference on {audio.size} samples ...")

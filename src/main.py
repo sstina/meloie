@@ -102,6 +102,13 @@ def _build_parser() -> argparse.ArgumentParser:
     eng.add_argument("--device", default="auto",
                      choices=["auto", "cpu", "cuda"],
                      help="Inference device. 'auto' = cuda if available else cpu.")
+    eng.add_argument("--precision", default="auto",
+                     choices=["auto", "fp32", "fp16"],
+                     help="Inference numeric precision. 'auto' = backend default "
+                          "(FP16 on most NVIDIA GPUs). 'fp32' = more stable and, "
+                          "on this backend, uses a 1 s reflect-pad instead of 3 s "
+                          "(less audio per inference); costs ~200 MB VRAM. Pure "
+                          "precision -- does not reshape the voice.")
     eng.add_argument("--chunk-ms", type=float, default=500.0,
                      help="RVC chunk size in ms (accumulation latency). "
                           "Default 500 — the conservative low-latency setting "
@@ -306,6 +313,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         sample_rate=config.sample_rate,
         resample_sr=resample_sr,
         device=args.device,
+        precision=args.precision,
         hubert_path=args.hubert_path or pick("hubert_path", None),
         rmvpe_path=args.rmvpe_path or pick("rmvpe_path", None),
     )
@@ -325,6 +333,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 11
     print(f"RVC engine loaded. resolved_device={engine.resolved_device} "
           f"cuda_device={engine.cuda_device_name or '(n/a)'} "
+          f"precision={engine.resolved_precision or '(unknown)'} "
           f"resample_sr={resample_sr}")
 
     if args.warmup_rvc_count > 0:

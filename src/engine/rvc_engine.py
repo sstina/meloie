@@ -107,6 +107,15 @@ class RvcEngineConfig:
     # Deprecated back-compat: if True, force CPU regardless of ``device``.
     force_cpu: bool = False
 
+    # Inference numeric precision (borrowed control from the Deiteris fork).
+    #   "auto" -> let the backend decide (FP16 on most modern NVIDIA GPUs).
+    #   "fp16" -> force half precision (backend default on an RTX 4080; x_pad=3).
+    #   "fp32" -> force single precision: more numerically stable, and on this
+    #             backend it also selects x_pad=1 (1 s reflect-pad vs 3 s),
+    #             i.e. far less audio processed per inference. ~200 MB more VRAM.
+    # This is pure numeric precision (same model/math) -> faithful, not a reshape.
+    precision: str = "auto"
+
     # Optional explicit paths to the shared assets infer_rvc_python
     # otherwise downloads. Set these when the model bundle already
     # ships hubert_base.pt / rmvpe.pt next to the .pth.
@@ -128,6 +137,11 @@ class RvcEngineConfig:
             raise ValueError(
                 f"device must be 'auto', 'cpu', 'cuda', or "
                 f"'directml_experimental'; got {self.device!r}"
+            )
+        if self.precision not in ("auto", "fp16", "fp32"):
+            raise ValueError(
+                f"precision must be 'auto', 'fp16', or 'fp32'; "
+                f"got {self.precision!r}"
             )
         if self.f0_method not in ("rmvpe", "rmvpe+", "fcpe", "crepe", "harvest", "pm"):
             # Unknown methods may still work with the backend, but flag
@@ -165,6 +179,8 @@ class _InferRvcPythonBackend(RvcBackend):
         # RvcEngine.resolved_device for metrics/logging.
         self._resolved_device: Optional[str] = None
         self._cuda_device_name: Optional[str] = None
+        # e.g. "fp16 (x_pad=3)" / "fp32 (x_pad=1)"; set during load().
+        self._resolved_precision: Optional[str] = None
 
     @property
     def resolved_device(self) -> Optional[str]:
@@ -173,6 +189,10 @@ class _InferRvcPythonBackend(RvcBackend):
     @property
     def cuda_device_name(self) -> Optional[str]:
         return self._cuda_device_name
+
+    @property
+    def resolved_precision(self) -> Optional[str]:
+        return self._resolved_precision
 
     def _resolve_only_cpu(self, config: RvcEngineConfig) -> bool:
         """Map config.device + back-compat force_cpu to ``only_cpu`` bool.
@@ -281,6 +301,28 @@ class _InferRvcPythonBackend(RvcBackend):
                 consonant_breath_protection=float(config.protect),
             )
             self._tag = config.backend_tag
+            # Precision control (borrowed from the Deiteris fork), applied AFTER
+            # apply_conf so the backend has initialised its lazy attributes
+            # (hu_bert_model / model_pitch_estimator). The model itself is loaded
+            # on the first generate_from_cache, reading config.is_half then, so
+            # overriding the Config here takes effect. device_config re-reads
+            # is_half to give the matching pad tuple (fp32 -> x_pad=1, fp16 -> 3).
+            # "auto" leaves the backend's own device-based choice untouched.
+            cfg = getattr(self._converter, "config", None)
+            if cfg is not None and config.precision in ("fp16", "fp32"):
+                cfg.is_half = config.precision == "fp16"
+                (
+                    cfg.x_pad,
+                    cfg.x_query,
+                    cfg.x_center,
+                    cfg.x_max,
+                ) = cfg.device_config(only_cpu)
+            # Record the precision actually in effect (forced or "auto").
+            if cfg is not None:
+                self._resolved_precision = (
+                    f"{'fp16' if getattr(cfg, 'is_half', False) else 'fp32'} "
+                    f"(x_pad={getattr(cfg, 'x_pad', '?')})"
+                )
         except Exception as exc:  # backend raised during config/load
             raise ModelLoadError(
                 f"infer_rvc_python failed to load model: {exc}"
@@ -384,6 +426,13 @@ class RvcEngine:
         if self._backend is None:
             return None
         return getattr(self._backend, "cuda_device_name", None)
+
+    @property
+    def resolved_precision(self) -> Optional[str]:
+        """Numeric precision the backend settled on, e.g. 'fp32 (x_pad=1)'."""
+        if self._backend is None:
+            return None
+        return getattr(self._backend, "resolved_precision", None)
 
     def load(self) -> None:
         if self._loaded:
