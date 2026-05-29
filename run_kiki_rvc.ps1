@@ -42,10 +42,12 @@ Write-Host "Press Ctrl+C in this window to stop the runtime." -ForegroundColor Y
 Read-Host "Press Enter to start"
 
 # Use the venv python by absolute path (do not rely on PATH).
+# Extra args are forwarded, so you can tune the transpose live, e.g.:
+#   run_kiki_rvc.bat --pitch 12   (kiki's intended; raise/lower for your voice)
 & $py -m src.main `
     --config config/runtime.example.json `
     --model-profile config/model_profiles/kiki.example.json `
-    --device cuda
+    --device cuda @args
 $code = $LASTEXITCODE
 
 Write-Host ""
