@@ -113,7 +113,8 @@ what suits your voice. `--pitch` conditions the model's input pitch — it is
 | Flag | Default | What it controls |
 | --- | --- | --- |
 | `--device` | `auto` | Inference device (`auto` / `cuda` / `cpu`) |
-| `--chunk-ms` | 500 | RVC chunk size (accumulation latency); larger = more model context. Floor ~400: worst-case inference is a fixed ~350 ms regardless of chunk |
+| `--precision` | `fp32` | Inference precision. FP32 uses a 1 s reflect-pad vs FP16's 3 s → ~25% faster (lower inference floor) and measured spectrally identical to FP16; `auto`/`fp16` available. Pure precision, no voice change |
+| `--chunk-ms` | 500 | RVC chunk size (accumulation latency); larger = more model context. Floor ~300 (FP32): worst-case inference (~260 ms) is roughly fixed regardless of chunk |
 | `--rvc-context-ms` | 500 | Input-side left-context warm-up fed to the model, then sliced away. Continuity only; clears the decoder's ~240 ms internal lead-in margin (see [docs/realtime_study_notes.md](docs/realtime_study_notes.md)). |
 | `--tail-pad-ms` | 30 | Look-ahead tail pad that absorbs the model's deterministic ~20 ms tail-frame loss, then sliced away. No stretch, no pitch. |
 | `--sola-search-ms` | 10 | SOLA seam-alignment search window. Phase-matches each chunk's seam to the previous chunk's tail by **choosing the cut offset** (no crossfade, no blend, no sample edit) — kills chunk-boundary comb-filter "电音". 0 disables. Must be ≤ `--tail-pad-ms`. |
@@ -127,12 +128,13 @@ what suits your voice. `--pitch` conditions the model's input pitch — it is
 | `--duration-seconds` | run until Ctrl+C | Stop after N seconds |
 
 **Latency budget** ≈ `chunk_ms` (accumulation) + `prebuffer_ms` (standing output) +
-~150 ms inference + ~40 ms device ≈ **~1.5 s** at the defaults. The standing output
-prebuffer used to dominate (it defaulted to 3 × chunk = 3 s); decoupling it to an
-absolute 800 ms and dropping the chunk to 500 ms is what brought the link down from
-~2 s. Going lower means a smaller chunk, but the ~350 ms inference floor caps that at
-~400 ms; sub-second would require pacing the output burst (a deferred code change),
-not just smaller buffers. None of these touch the voice — see the design stance above.
+~105 ms inference (FP32) + ~40 ms device ≈ **~1.5 s** at the defaults. The standing
+output prebuffer used to dominate (it defaulted to 3 × chunk = 3 s); decoupling it to
+an absolute 800 ms and dropping the chunk to 500 ms brought the link down from ~2 s,
+and FP32 cut inference (mean ~105 ms, max ~260 ms) below the old FP16 floor. Going
+lower means a smaller chunk — FP32's ~260 ms worst case now allows ~300 ms; true
+sub-second would require pacing the output burst (a deferred code change), not just
+smaller buffers. None of these touch the voice — see the design stance above.
 
 ## Continuity & stability (why the chunked pipeline stays drift-free)
 

@@ -43,7 +43,7 @@ def test_parser_accepts_model_and_index_path():
 def test_parser_engineering_defaults():
     args = _build_parser().parse_args(["--config", CONFIG, "--model-path", "x.pth"])
     assert args.device == "auto"
-    assert args.precision == "auto"
+    assert args.precision == "fp32"    # FP32 is the validated default (faster, same timbre)
     assert args.chunk_ms == 500.0
     assert args.rvc_context_ms == 500.0
     assert args.tail_pad_ms == 30.0

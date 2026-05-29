@@ -72,10 +72,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    choices=["auto", "cpu", "cuda", "directml_experimental"],
                    help="Inference device. 'auto' picks cuda if available, "
                         "otherwise cpu.")
-    p.add_argument("--precision", default="auto",
+    p.add_argument("--precision", default="fp32",
                    choices=["auto", "fp32", "fp16"],
-                   help="Numeric precision. 'fp32' forces single precision "
-                        "(x_pad=1 on this backend); 'auto' = backend default.")
+                   help="Numeric precision. Default 'fp32' to mirror the runtime "
+                        "(x_pad=1 on this backend; faster + spectrally identical). "
+                        "'auto' = backend default (FP16); 'fp16' forces half.")
     p.add_argument("--force-cpu", action="store_true",
                    help="DEPRECATED: equivalent to --device cpu.")
     p.add_argument("--resample-sr", type=int, default=None,

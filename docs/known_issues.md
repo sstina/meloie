@@ -44,5 +44,15 @@ not the voice it *emits*, so it is contract-compatible. Risk: it would also rais
 noise floor during near-silence, so it needs a gate/threshold. Defer until the
 re-test confirms the cause and mic-level tuning proves insufficient.
 
-**Status:** OPEN. Latency config (chunk 500 / prebuffer 800) is locked in as
-**provisional** pending step 1 above. If step 2 implicates chunk, revert chunk.
+**Update 2026-05-30 — FP32 helped (partial).** Switching inference to FP32
+(`--precision fp32`, now the default) made soft speech **noticeably better**: still
+a bit rough/coarse, but now **intelligible** ("能听清说什么了"). Consistent with the
+weak-signal-F0 theory — FP32 RMVPE is more precise on low-level input. FP32 is now the
+default (faster too: live inference max dropped ~390 ms → ~257 ms). The issue is
+improved, **not closed**.
+
+**Status:** OPEN (improved by FP32). Latency config (chunk 500 / prebuffer 800,
+FP32) is locked in as **provisional**. Next: re-test with the **new microphone**
+(arriving ~2026-05-31). If a clean mic + FP32 still leaves soft speech rough, revisit
+(mic input level/boost, or a faithful input-normalization gate). The chunk-1000-vs-500
+A/B (step 1) only matters if soft speech is still bad after the mic swap.
