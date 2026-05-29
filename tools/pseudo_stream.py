@@ -96,6 +96,14 @@ def _build_parser() -> argparse.ArgumentParser:
                         "before inference. Output trimmed proportionally "
                         "to preserve chunk duration exactly. Default 200; "
                         "set 0 to disable for A/B against Stage 2G.")
+    p.add_argument("--reconcile-timeline-method", default="polyphase",
+                   choices=["polyphase", "linear", "pad_zero", "off"],
+                   help="Stage 4-E timeline reconciliation. polyphase "
+                        "(default) stretches each chunk's output to the "
+                        "exact chunk-input-duration sample count so the "
+                        "live runtime does not slowly drain its output "
+                        "queue. 'off' reproduces the Stage 4-D legacy "
+                        "behavior for A/B fidelity testing.")
     p.add_argument("--resampler", default="polyphase",
                    choices=["polyphase", "linear", "torchaudio"],
                    help="Resampler used between engine native SR and "
@@ -285,6 +293,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"cuda={engine.cuda_device_name or '(n/a)'}  resample_sr={cfg.resample_sr}"
     )
 
+    from src.audio.chunker import reconcile_to_length
     chunk_size = max(1, int(round(args.chunk_ms / 1000.0 * stream_sr)))
     crossfade_size = max(0, int(round(args.crossfade_ms / 1000.0 * stream_sr)))
     context_size = max(0, int(round(args.context_ms / 1000.0 * stream_sr)))
@@ -361,6 +370,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         if result_sr != stream_sr:
             processed = _RESAMPLERS[args.resampler](processed, result_sr, stream_sr)
 
+        # Stage 4-E timeline reconciliation: stretch each chunk's
+        # output to exactly chunk_size samples so the realtime
+        # equivalent does not drain its output queue. Matches the
+        # worker's behavior.
+        if (
+            args.reconcile_timeline_method != "off"
+            and processed.size > 0
+            and chunk_size > 0
+            and processed.size != chunk_size
+        ):
+            processed = reconcile_to_length(
+                processed, chunk_size, method=args.reconcile_timeline_method
+            )
+
         # Refresh context for the NEXT inference using the chunk's own tail.
         if context_buffer is not None and context_size > 0:
             if chunk.size >= context_size:
@@ -423,6 +446,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "chunk_ms": float(args.chunk_ms),
             "crossfade_ms": float(args.crossfade_ms),
             "context_ms": float(args.context_ms),
+            "reconcile_timeline_method": str(args.reconcile_timeline_method),
             "resampler": args.resampler,
             "resample_sr": int(args.resample_sr or 0),
             "n_chunks": len(per_chunk_ms),

@@ -240,6 +240,22 @@ def _print_summary(
               f"{metrics.output_queue_near_empty_threshold_blocks}")
         print(f"output_queue_near_empty_events = {metrics.output_queue_near_empty_events}")
         print(f"cumulative_frame_delta   = {metrics.cumulative_frame_delta}")
+        # Stage 4-E: timeline reconciliation summary.
+        print(f"timeline_reconcile_enabled = {metrics.timeline_reconcile_enabled}")
+        print(f"timeline_reconcile_method  = {metrics.timeline_reconcile_method!r}")
+        print(f"timeline_reconcile_count   = {metrics.timeline_reconcile_count}")
+        print(f"timeline_expected_output_frames_total   = "
+              f"{metrics.timeline_expected_output_frames_total}")
+        print(f"timeline_actual_output_frames_total     = "
+              f"{metrics.timeline_actual_output_frames_total}")
+        print(f"timeline_reconciled_output_frames_total = "
+              f"{metrics.timeline_reconciled_output_frames_total}")
+        print(f"timeline_reconciliation_total_frame_error = "
+              f"{metrics.timeline_reconciliation_total_frame_error}")
+        print(f"timeline_max_reconciliation_frames_per_chunk = "
+              f"{metrics.timeline_max_reconciliation_frames_per_chunk}")
+        print(f"timeline_reconciliation_mean_ratio = "
+              f"{metrics.timeline_reconciliation_mean_ratio:.6f}")
         print(f"startup_output_underruns = {metrics.startup_output_underruns}")
         print(f"steady_state_output_underruns = {metrics.steady_state_output_underruns}")
         print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")
@@ -500,6 +516,7 @@ def run_rvc_stream(
     rvc_prebuffer_ms: Optional[float] = None,
     drop_stale_input: bool = True,
     context_ms: float = 0.0,
+    reconcile_timeline_method: str = "polyphase",
 ) -> RuntimeMetrics:
     """Open the realtime RVC chunk loop and run it.
 
@@ -520,6 +537,12 @@ def run_rvc_stream(
         raise ValueError("crossfade_ms must be >= 0")
     if context_ms < 0:
         raise ValueError("context_ms must be >= 0")
+    if reconcile_timeline_method not in ("polyphase", "linear", "pad_zero", "off"):
+        raise ValueError(
+            f"reconcile_timeline_method must be one of "
+            f"'polyphase', 'linear', 'pad_zero', 'off'; "
+            f"got {reconcile_timeline_method!r}"
+        )
 
     chunk_size = max(1, int(round(chunk_ms / 1000.0 * config.sample_rate)))
     crossfade_size = max(0, int(round(crossfade_ms / 1000.0 * config.sample_rate)))
@@ -573,6 +596,11 @@ def run_rvc_stream(
         f"context_ms={context_ms:.1f} ({context_size} samples) "
         f"-- input-left-context fed to model; output trimmed proportionally "
         f"so emit duration == chunk_ms (no timeline drift)",
+        f"reconcile_timeline_method={reconcile_timeline_method} -- Stage 4-E: "
+        f"each chunk's output is stretched to exactly chunk_size samples so "
+        f"the per-chunk ~20 ms model framing deficit does not drain the output "
+        f"queue over time. polyphase = ~34 cents flat (sub-perceptible); "
+        f"'off' restores the Stage 4-D drain-prone behavior.",
         f"f0_method={engine.config.f0_method}  "
         f"index_rate={engine.config.index_rate}  "
         f"protect={engine.config.protect}  "
@@ -616,6 +644,7 @@ def run_rvc_stream(
                 "crossfade_size": int(crossfade_size),
                 "drop_stale_input": bool(drop_stale_input),
                 "context_size": int(context_size),
+                "reconcile_timeline_method": str(reconcile_timeline_method),
             },
             name="rvc-worker",
             daemon=True,

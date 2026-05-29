@@ -142,6 +142,23 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="If inference falls behind, drop older queued "
                           "chunks and keep only the latest. Reduces "
                           "perceived latency drift. Default: on for RVC.")
+    rvc.add_argument("--reconcile-timeline-method", default="polyphase",
+                     choices=["polyphase", "linear", "pad_zero", "off"],
+                     help="Stage 4-E timeline reconciliation method. "
+                          "The chunked RVC pipeline emits ~20 ms less "
+                          "audio per call than the input chunk demands "
+                          "(structural framing loss in HuBERT / RMVPE / "
+                          "vocoder). Without reconciliation the output "
+                          "queue drains at ~17 ms / s and eventually "
+                          "underruns. polyphase (default, recommended): "
+                          "scipy.signal.resample_poly stretches each "
+                          "chunk's output to exactly chunk_size samples "
+                          "via a rational up/down ratio (~50:49 for "
+                          "kiki at 48 kHz / 1 s chunks; introduces "
+                          "~34 cents pitch flat - sub-perceptible on "
+                          "speech material). linear: np.interp stretch. "
+                          "pad_zero: silence-pad / truncate. off: "
+                          "Stage 4-D legacy, drain-prone.")
     rvc.add_argument("--rvc-context-ms", type=float, default=200.0,
                      help="Stage 3 input-side LEFT context fed to the "
                           "model before each chunk. Default 200 ms. The "
@@ -447,6 +464,7 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
             rvc_prebuffer_ms=args.rvc_prebuffer_ms,
             drop_stale_input=args.drop_stale_input,
             context_ms=args.rvc_context_ms,
+            reconcile_timeline_method=args.reconcile_timeline_method,
         )
     except FeedbackLoopRisk as exc:
         print(f"error: {exc}", file=sys.stderr)

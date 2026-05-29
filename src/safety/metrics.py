@@ -134,6 +134,27 @@ class RuntimeMetrics:
     # the counter on every poll.
     output_queue_above_near_empty_last: bool = True
 
+    # Stage 4-E: timeline reconciliation.
+    # The chunked RVC pipeline emits ~20 ms less audio per call than the
+    # input chunk contained (structural framing loss in HuBERT / RMVPE /
+    # vocoder, confirmed via direct engine.infer_array probe at multiple
+    # input lengths). Without reconciliation this drains the output queue
+    # at ~17 ms / s. The reconciliation step stretches the model output
+    # to exactly ``chunk_size`` samples so per-chunk emit duration equals
+    # input duration.
+    timeline_reconcile_enabled: bool = False
+    timeline_reconcile_method: str = ""
+    timeline_reconcile_count: int = 0
+    timeline_expected_output_frames_total: int = 0
+    timeline_actual_output_frames_total: int = 0
+    timeline_reconciled_output_frames_total: int = 0
+    timeline_max_reconciliation_frames_per_chunk: int = 0
+    # Signed sum of (actual - expected). Negative = model emitted less
+    # than asked for (the normal case); reconciliation adds that many
+    # frames back. Positive = model emitted more (rare; reconciliation
+    # truncates).
+    timeline_reconciliation_total_frame_error: int = 0
+
     # Startup vs steady-state output underruns. Bin is decided in the
     # output callback based on whether the worker has emitted any real
     # audio yet (``first_real_output_seen``).
@@ -245,8 +266,54 @@ class RuntimeMetrics:
         documented in the README). If it grows monotonically over a
         long run, the prebuffer is being eaten faster than steady-state
         production can replenish -- expect eventual underruns.
+
+        Stage 4-E: with timeline reconciliation ON (default), the
+        per-chunk framing loss is added back via polyphase stretch
+        before the audio reaches the output queue, so this delta now
+        stays bounded near zero (modulo per-chunk emit-rounding) in
+        steady state.
         """
         return int(self.input_frames) - int(self.output_frames)
+
+    def record_timeline_reconcile(
+        self,
+        expected_frames: int,
+        actual_frames: int,
+        reconciled_frames: int,
+    ) -> None:
+        """Stage 4-E: count one chunk's reconciliation outcome.
+
+        ``expected_frames`` = chunk_size (= what the input chunk demands
+        in output samples at the stream SR). ``actual_frames`` = what
+        the model + post-model chain returned BEFORE reconciliation.
+        ``reconciled_frames`` = what was emitted to the output queue
+        AFTER reconciliation; should equal ``expected_frames`` for the
+        polyphase/linear/pad_zero methods.
+        """
+        self.timeline_reconcile_count += 1
+        self.timeline_expected_output_frames_total += int(expected_frames)
+        self.timeline_actual_output_frames_total += int(actual_frames)
+        self.timeline_reconciled_output_frames_total += int(reconciled_frames)
+        err = int(actual_frames) - int(expected_frames)
+        if abs(err) > self.timeline_max_reconciliation_frames_per_chunk:
+            self.timeline_max_reconciliation_frames_per_chunk = abs(err)
+        self.timeline_reconciliation_total_frame_error += err
+
+    @property
+    def timeline_reconciliation_mean_ratio(self) -> float:
+        """Mean ``actual / expected`` ratio across reconciled chunks.
+
+        Stage 4-E sanity gauge: for the kiki model this should sit
+        ~0.98 (the 2 % framing deficit measured in the engine probe).
+        A ratio far from that hints at an unexpected backend change
+        or a runtime accounting bug.
+        """
+        if self.timeline_expected_output_frames_total == 0:
+            return 0.0
+        return (
+            float(self.timeline_actual_output_frames_total)
+            / float(self.timeline_expected_output_frames_total)
+        )
 
     def record_resample_ms(self, ms: float) -> None:
         """Update worker-side resample timing counters."""

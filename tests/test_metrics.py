@@ -303,6 +303,63 @@ def test_cumulative_frame_delta_negative_when_output_ahead_of_input():
     assert m.cumulative_frame_delta == -200
 
 
+# ---------------------------------------------------------------------------
+# Stage 4-E: timeline reconciliation recording
+# ---------------------------------------------------------------------------
+
+def test_record_timeline_reconcile_accumulates_totals():
+    m = RuntimeMetrics()
+    m.record_timeline_reconcile(expected_frames=48000, actual_frames=47040, reconciled_frames=48000)
+    m.record_timeline_reconcile(expected_frames=48000, actual_frames=47100, reconciled_frames=48000)
+    m.record_timeline_reconcile(expected_frames=48000, actual_frames=47200, reconciled_frames=48000)
+    assert m.timeline_reconcile_count == 3
+    assert m.timeline_expected_output_frames_total == 144000
+    assert m.timeline_actual_output_frames_total == 47040 + 47100 + 47200
+    assert m.timeline_reconciled_output_frames_total == 144000
+    # Signed cumulative error (negative = model under-emitted).
+    assert m.timeline_reconciliation_total_frame_error == (
+        (47040 - 48000) + (47100 - 48000) + (47200 - 48000)
+    )
+    # Max abs per chunk = 960 (= 48000 - 47040).
+    assert m.timeline_max_reconciliation_frames_per_chunk == 960
+    # Mean ratio for kiki sits near 0.98.
+    assert 0.97 < m.timeline_reconciliation_mean_ratio < 0.99
+
+
+def test_timeline_reconciliation_mean_ratio_zero_when_no_data():
+    m = RuntimeMetrics()
+    assert m.timeline_reconciliation_mean_ratio == 0.0
+
+
+def test_record_timeline_reconcile_handles_excess_actual():
+    """Model occasionally emits MORE than expected (positive error)."""
+    m = RuntimeMetrics()
+    m.record_timeline_reconcile(expected_frames=48000, actual_frames=49000, reconciled_frames=48000)
+    assert m.timeline_reconciliation_total_frame_error == 1000
+    assert m.timeline_max_reconciliation_frames_per_chunk == 1000
+
+
+def test_runtime_metrics_dict_includes_new_stage4e_timeline_fields():
+    """Sidecar JSON consumers depend on the dataclass shape."""
+    m = RuntimeMetrics()
+    m.record_timeline_reconcile(expected_frames=48000, actual_frames=47040, reconciled_frames=48000)
+    d = m.to_dict()
+    for k in (
+        "timeline_reconcile_enabled",
+        "timeline_reconcile_method",
+        "timeline_reconcile_count",
+        "timeline_expected_output_frames_total",
+        "timeline_actual_output_frames_total",
+        "timeline_reconciled_output_frames_total",
+        "timeline_max_reconciliation_frames_per_chunk",
+        "timeline_reconciliation_total_frame_error",
+    ):
+        assert k in d, f"missing {k}"
+    encoded = json.dumps(d)
+    decoded = json.loads(encoded)
+    assert decoded["timeline_reconcile_count"] == 1
+
+
 def test_runtime_metrics_dict_includes_new_stage4c_fields_and_is_json_safe():
     """Sidecar JSON consumers depend on the dataclass shape; make sure
     the new Stage 4-C fields are present, JSON-encodable (None ->

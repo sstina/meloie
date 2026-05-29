@@ -34,7 +34,12 @@ from typing import Optional
 
 import numpy as np
 
-from ..audio.chunker import BlockAccumulator, ChunkerConfig, resample_audio
+from ..audio.chunker import (
+    BlockAccumulator,
+    ChunkerConfig,
+    reconcile_to_length,
+    resample_audio,
+)
 from ..audio.devices import iter_device_infos  # noqa: F401  (re-export friendliness)
 from ..engine.crossfade import linear_crossfade
 from ..safety.guard import scrub_nan_inf
@@ -150,6 +155,7 @@ def rvc_worker_loop(
     poll_timeout_seconds: float = 0.1,
     drop_stale_input: bool = True,
     context_size: int = 0,
+    reconcile_timeline_method: str = "polyphase",
 ) -> None:
     """Chunked RVC worker.
 
@@ -233,6 +239,14 @@ def rvc_worker_loop(
     # over-budget debt in ms.
     chunk_ms_budget: float = float(chunk_size) * 1000.0 / float(sample_rate)
     metrics.rvc_chunk_ms_budget = chunk_ms_budget
+
+    # Stage 4-E: timeline reconciliation target. Each emitted chunk's
+    # output sample count must match this so the output queue does not
+    # drain over a sustained session. ``method='off'`` leaves the legacy
+    # Stage 4-D behavior (model output verbatim, drain-prone).
+    reconcile_target_samples: int = int(chunk_size)
+    metrics.timeline_reconcile_enabled = (reconcile_timeline_method != "off")
+    metrics.timeline_reconcile_method = str(reconcile_timeline_method)
 
     def _emit(buf: np.ndarray) -> None:
         if buf.size == 0:
@@ -387,6 +401,30 @@ def rvc_worker_loop(
             if scrub.replaced_count:
                 metrics.nan_inf_scrub_count += int(scrub.replaced_count)
                 processed = scrub.audio
+
+            # Stage 4-E: timeline reconciliation. The kiki backend
+            # consistently emits ~20 ms less audio per call than the
+            # input chunk demands. Without this step the output queue
+            # drains at ~17 ms / s (the Stage 4-D 300 s spoken failure).
+            # The reconciliation is applied to non-fallback paths only;
+            # identity fallback already emits exactly chunk_size samples.
+            if (
+                reconcile_timeline_method != "off"
+                and not used_fallback
+                and processed.size > 0
+                and reconcile_target_samples > 0
+            ):
+                actual = int(processed.size)
+                target = reconcile_target_samples
+                if actual != target:
+                    processed = reconcile_to_length(
+                        processed, target, method=reconcile_timeline_method
+                    )
+                metrics.record_timeline_reconcile(
+                    expected_frames=target,
+                    actual_frames=actual,
+                    reconciled_frames=int(processed.size),
+                )
 
             metrics.rvc_chunks_processed += 1
 

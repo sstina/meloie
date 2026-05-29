@@ -270,7 +270,13 @@ def test_rvc_worker_resamples_when_returned_sr_mismatches_stream_sr():
     """Stage 2D: if the backend returns valid audio at a different SR
     than the stream uses, the worker now resamples to match (cheap
     linear interp) instead of falling back to identity. This unlocks
-    the kiki@native_sr=40k path which is the only realtime-fits config."""
+    the kiki@native_sr=40k path which is the only realtime-fits config.
+
+    Stage 4-E note: this test asserts the *post-SR-resample* emit size
+    (5760 samples). The new timeline-reconciliation step would otherwise
+    stretch that to chunk_size (4800). We pin reconcile to ``off`` here
+    so the test continues to exercise only the SR-mismatch path.
+    """
     chunk_size = 4800        # 100 ms @ 48 kHz
     block_size = 480
     in_q: "queue.Queue" = queue.Queue(maxsize=64)
@@ -291,6 +297,7 @@ def test_rvc_worker_resamples_when_returned_sr_mismatches_stream_sr():
         output_block_size=block_size,
         crossfade_size=0,
         poll_timeout_seconds=0.05,
+        reconcile_timeline_method="off",
     )
 
     assert engine.call_count == 1
@@ -725,6 +732,146 @@ def test_rvc_worker_passes_chunk_ms_budget_into_record_inference_ms():
     # but with timing slop, just check it's positive and < the
     # actual measured last-inference time.
     assert 30.0 < metrics.rvc_inference_over_budget_total_ms <= metrics.rvc_inference_last_ms
+
+
+class _DeficitEngine:
+    """Engine that drops a fixed tail of N samples from the output.
+
+    Simulates the kiki backend's structural 20 ms framing loss
+    (`infer_rvc_python` returns ~960 fewer samples per call than the
+    input chunk demands, regardless of input length). Useful for end-
+    to-end Stage 4-E reconciliation testing without loading a model.
+    """
+
+    def __init__(self, deficit_samples: int = 960) -> None:
+        self.deficit_samples = int(deficit_samples)
+        self.call_count = 0
+
+    def infer_array(self, audio, sample_rate):
+        self.call_count += 1
+        n = max(0, audio.size - self.deficit_samples)
+        return audio[:n].astype(np.float32, copy=True), int(sample_rate)
+
+
+def test_rvc_worker_reconciles_each_chunk_to_chunk_size_by_default():
+    """Stage 4-E default (polyphase): every chunk's emit must equal
+    chunk_size in samples, regardless of the model's structural deficit."""
+    chunk_size = 4800     # 100 ms @ 48 kHz
+    block_size = 480
+    deficit = 96          # 2 ms loss @ 48 kHz, ~analogous to kiki's 20 ms
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _DeficitEngine(deficit_samples=deficit)
+
+    # 3 full chunks of input.
+    for _ in range(3 * (chunk_size // block_size)):
+        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=False,
+        # reconcile_timeline_method defaults to "polyphase"
+    )
+
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    # 3 chunks * chunk_size samples each = no drain, no per-chunk deficit.
+    assert total == 3 * chunk_size
+    assert metrics.timeline_reconcile_enabled is True
+    assert metrics.timeline_reconcile_method == "polyphase"
+    assert metrics.timeline_reconcile_count == 3
+    assert metrics.timeline_expected_output_frames_total == 3 * chunk_size
+    # actual = chunk_size - deficit, three chunks
+    assert metrics.timeline_actual_output_frames_total == 3 * (chunk_size - deficit)
+    assert metrics.timeline_reconciled_output_frames_total == 3 * chunk_size
+    # signed cumulative error = -3 * deficit
+    assert metrics.timeline_reconciliation_total_frame_error == -3 * deficit
+    assert metrics.timeline_max_reconciliation_frames_per_chunk == deficit
+
+
+def test_rvc_worker_off_mode_preserves_legacy_drain_behavior():
+    """``--reconcile-timeline-method off`` must reproduce the Stage 4-D
+    drain: emit size matches what the model returned, NOT chunk_size."""
+    chunk_size = 4800
+    block_size = 480
+    deficit = 96
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _DeficitEngine(deficit_samples=deficit)
+
+    for _ in range(3 * (chunk_size // block_size)):
+        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=False,
+        reconcile_timeline_method="off",
+    )
+
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    # Without reconciliation, the worker emits chunk_size - deficit per
+    # chunk; over 3 chunks that's 3 * (chunk_size - deficit). The final
+    # block_size leftover bookkeeping rounds the count, so verify the
+    # drain is at least ``3 * deficit`` samples short of full timeline.
+    assert total <= 3 * chunk_size - (3 * deficit) + block_size
+    assert total >= 3 * (chunk_size - deficit) - block_size
+    assert metrics.timeline_reconcile_enabled is False
+    assert metrics.timeline_reconcile_count == 0
+
+
+def test_rvc_worker_reconciliation_skipped_on_identity_fallback():
+    """Identity fallback path emits the chunk's own audio (already at
+    chunk_size). The reconciliation must NOT count that, otherwise the
+    error totals would falsely include fallback frames."""
+    chunk_size = 2400
+    block_size = 480
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _FakeEngine(raise_on_call=True)
+
+    for _ in range(chunk_size // block_size):
+        in_q.put(np.full(block_size, 0.25, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+    )
+
+    assert metrics.rvc_fallback_count == 1
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    # Fallback emits chunk_size samples directly; reconciliation does NOT
+    # apply (the chain already matches the timeline by virtue of being
+    # the original chunk).
+    assert total == chunk_size
+    assert metrics.timeline_reconcile_count == 0
 
 
 def test_rvc_worker_context_preserved_across_stale_drop():

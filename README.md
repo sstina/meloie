@@ -112,6 +112,54 @@ audio reaching `CABLE Input` it does only what is required:
   of silence or a crash. The `rvc_fallback_count` metric tells you if
   it fires.
 
+## Stage 4-E — timeline reconciliation (sustained-session continuity)
+
+The Stage 4-D 300 s spoken run revealed a structural drain: the
+chunked RVC pipeline emits **~20 ms less audio per inference call
+than the input chunk contained** — and this deficit is **independent
+of chunk length** (confirmed by direct `engine.infer_array` probes
+at chunk sizes 24000, 47900, 48000, 52800, 57600, 96000 samples — all
+returned exactly 20 ms short). It's the `infer_rvc_python` backend's
+internal framing loss (HuBERT / RMVPE / vocoder edge frames). At
+chunk_ms=1000 that's a ~17 ms / s steady drain on the output queue,
+no matter how large the prebuffer.
+
+The fix is **per-chunk timeline reconciliation**: each chunk's model
+output is stretched to exactly `chunk_size` samples (== the input
+chunk's sample count at the stream SR) before reaching the output
+queue. With the default `--reconcile-timeline-method polyphase` this
+is a ~50:49 `scipy.signal.resample_poly` stretch — a ~34-cent flat
+pitch shift, sub-perceptible on speech material, no clicks, no gaps,
+no output-side crossfade. This is "timeline preservation, not voice
+shaping".
+
+Method choices (`--reconcile-timeline-method`):
+
+| Method | Behaviour | Use case |
+| --- | --- | --- |
+| `polyphase` (default) | scipy polyphase stretch, ~34-cent pitch flat | Quality-first default |
+| `linear` | `np.interp` stretch, same pitch effect, mild aliasing | Fallback when scipy is unavailable |
+| `pad_zero` | Silence-pad if short, truncate if long | Diagnostic — produces audible ~1 Hz tremolo at chunk_ms=1000 |
+| `off` | No reconciliation — Stage 4-D legacy | Diagnostic / A/B; the queue WILL drain |
+
+Reconciliation metrics (visible in the final summary):
+
+| Metric | Meaning |
+| --- | --- |
+| `timeline_reconcile_enabled` | True when method is not `off` |
+| `timeline_reconcile_method` | The active method |
+| `timeline_reconcile_count` | Number of chunks reconciled |
+| `timeline_expected_output_frames_total` | Σ chunk_size across chunks |
+| `timeline_actual_output_frames_total` | Σ samples returned by the model + post-model chain before reconciliation |
+| `timeline_reconciled_output_frames_total` | Σ samples enqueued after reconciliation (≈ expected_total) |
+| `timeline_reconciliation_total_frame_error` | Σ (actual − expected); negative = model under-emitted, reconciliation added back |
+| `timeline_max_reconciliation_frames_per_chunk` | Largest abs(actual − expected) seen on any chunk |
+| `timeline_reconciliation_mean_ratio` | actual / expected; for kiki this sits at ~0.98 |
+
+After reconciliation, `cumulative_frame_delta` stays bounded near
+zero in steady state instead of growing at ~17 ms / s, so a
+sustained session no longer monotonically drains its prebuffer.
+
 ## Stage 4-C — headless quality-first runtime
 
 `src.main --mode rvc` is the complete non-GUI realtime RVC runtime.
@@ -362,6 +410,7 @@ issue} — but do NOT tune voice identity parameters.
     --device cuda `
     --chunk-ms 1000 `
     --rvc-context-ms 200 `
+    --reconcile-timeline-method polyphase `
     --rvc-queue-ms 6000 `
     --warmup-rvc-count 2 `
     --duration-seconds 60

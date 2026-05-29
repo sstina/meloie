@@ -24,6 +24,7 @@ from src.audio.chunker import (
     BlockAccumulator,
     ChunkerConfig,
     linear_resample,
+    reconcile_to_length,
     resample_audio,
 )
 from src.engine.crossfade import linear_crossfade
@@ -298,6 +299,113 @@ def test_resample_audio_rejects_zero_or_negative_sr():
 def test_resample_audio_rejects_stereo():
     with pytest.raises(ValueError):
         resample_audio(np.zeros((100, 2), dtype=np.float32), 44100, 48000)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4-E: reconcile_to_length (timeline reconciliation)
+# ---------------------------------------------------------------------------
+
+def test_reconcile_to_length_noop_when_size_matches():
+    audio = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    out = reconcile_to_length(audio, 3, method="polyphase")
+    np.testing.assert_array_equal(out, audio)
+    # Must be a copy.
+    out[0] = 99.0
+    assert audio[0] == pytest.approx(0.1)
+
+
+def test_reconcile_to_length_off_returns_input_unchanged_size():
+    audio = np.ones(1234, dtype=np.float32)
+    out = reconcile_to_length(audio, 9999, method="off")
+    assert out.size == 1234  # unchanged
+    assert out is audio  # exact passthrough is allowed for "off"
+
+
+def test_reconcile_to_length_polyphase_stretches_to_target():
+    # Simulate the kiki case: 47040 samples -> 48000 samples (50:49)
+    audio = np.sin(
+        2.0 * np.pi * 440.0 * np.arange(47040) / 48000.0
+    ).astype(np.float32)
+    out = reconcile_to_length(audio, 48000, method="polyphase")
+    assert out.size == 48000
+    assert out.dtype == np.float32
+    assert np.all(np.isfinite(out))
+    # Peak preserved within sinc-window overshoot tolerance.
+    assert 0.85 <= float(np.max(np.abs(out))) <= 1.15
+
+
+def test_reconcile_to_length_polyphase_compresses_to_target():
+    # Excess case: 48800 samples -> 48000 samples.
+    audio = np.full(48800, 0.5, dtype=np.float32)
+    out = reconcile_to_length(audio, 48000, method="polyphase")
+    assert out.size == 48000
+    # Interior is stable.
+    interior = out[200:-200]
+    np.testing.assert_allclose(interior, np.full_like(interior, 0.5), atol=5e-3)
+
+
+def test_reconcile_to_length_pad_zero_pads_short():
+    audio = np.full(100, 0.5, dtype=np.float32)
+    out = reconcile_to_length(audio, 200, method="pad_zero")
+    assert out.size == 200
+    np.testing.assert_array_equal(out[:100], audio)
+    np.testing.assert_array_equal(out[100:], np.zeros(100, dtype=np.float32))
+
+
+def test_reconcile_to_length_pad_zero_truncates_long():
+    audio = np.full(200, 0.5, dtype=np.float32)
+    out = reconcile_to_length(audio, 100, method="pad_zero")
+    assert out.size == 100
+    np.testing.assert_array_equal(out, np.full(100, 0.5, dtype=np.float32))
+
+
+def test_reconcile_to_length_linear_stretches_to_target():
+    audio = np.full(40000, 0.5, dtype=np.float32)
+    out = reconcile_to_length(audio, 48000, method="linear")
+    assert out.size == 48000
+    np.testing.assert_allclose(out, np.full(48000, 0.5, dtype=np.float32), atol=1e-6)
+
+
+def test_reconcile_to_length_rejects_stereo():
+    with pytest.raises(ValueError):
+        reconcile_to_length(np.zeros((100, 2), dtype=np.float32), 200)
+
+
+def test_reconcile_to_length_rejects_negative_target():
+    with pytest.raises(ValueError):
+        reconcile_to_length(np.zeros(100, dtype=np.float32), -1)
+
+
+def test_reconcile_to_length_rejects_unknown_method():
+    with pytest.raises(ValueError):
+        reconcile_to_length(np.zeros(100, dtype=np.float32), 200, method="bogus")
+
+
+def test_reconcile_to_length_zero_target_returns_empty():
+    out = reconcile_to_length(np.ones(100, dtype=np.float32), 0, method="polyphase")
+    assert out.size == 0
+
+
+def test_reconcile_to_length_empty_input_returns_zeros_at_target():
+    out = reconcile_to_length(np.zeros(0, dtype=np.float32), 100, method="polyphase")
+    assert out.size == 100
+    np.testing.assert_array_equal(out, np.zeros(100, dtype=np.float32))
+
+
+def test_reconcile_to_length_polyphase_falls_back_when_scipy_missing(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "scipy.signal" or name.startswith("scipy.signal."):
+            raise ImportError("simulated missing scipy.signal")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    audio = np.full(40000, 0.5, dtype=np.float32)
+    out = reconcile_to_length(audio, 48000, method="polyphase")
+    assert out.size == 48000
+    np.testing.assert_allclose(out, np.full(48000, 0.5, dtype=np.float32), atol=1e-6)
 
 
 def test_resample_audio_falls_back_when_scipy_missing(monkeypatch):
