@@ -82,6 +82,11 @@ def _write_wav(path: Path, audio_f32: np.ndarray, sample_rate: int) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    for _s in (sys.stdout, sys.stderr):  # tolerate non-GBK device names
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
     args = _build_parser().parse_args(argv)
 
     try:

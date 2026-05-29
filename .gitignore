@@ -4,6 +4,10 @@ __pycache__/
 .venv310/
 .venv311/
 venv/
+
+# redirected caches / temp (setup_env.ps1) — never commit
+.cache/
+.tmp/
 *.pyc
 *.pyo
 *.pyd

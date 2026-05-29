@@ -94,6 +94,46 @@ class FeedbackLoopRisk(ValueError):
     same virtual cable it is rendering to — i.e. a feedback loop."""
 
 
+def select_default_input_device(
+    devices: Iterable[Mapping],
+    default_index: Optional[int],
+) -> AudioDeviceInfo:
+    """Return the system default input device (the user's "系统默认 mic").
+
+    ``default_index`` is the index PortAudio reports as the default input
+    device (``sounddevice.default.device[0]``). This honours the Windows
+    "default recording device" the user has chosen, so the runtime follows
+    the system mic instead of guessing by name.
+
+    Refuses ``CABLE Output`` (the virtual cable's capture side): if that
+    were ever the system default, capturing it while we render to
+    ``CABLE Input`` would form a feedback loop.
+    """
+    infos = list(iter_device_infos(devices))
+    if default_index is None or default_index < 0 or default_index >= len(infos):
+        raise LookupError(
+            f"no valid system default input device "
+            f"(sounddevice.default.device[0]={default_index!r}). "
+            "Set a default recording device in Windows sound settings, or "
+            "pass --input-device to choose one explicitly."
+        )
+    info = infos[int(default_index)]
+    if not info.is_input_capable:
+        raise LookupError(
+            f"system default input device [{info.index}] {info.name!r} "
+            "reports no input channels; pass --input-device to choose a "
+            "physical microphone explicitly."
+        )
+    if is_probable_cable_output(info.name):
+        raise FeedbackLoopRisk(
+            f"the system default input is {info.name!r} (the VB-CABLE capture "
+            "side). Using it as the app's mic while rendering to 'CABLE Input' "
+            "creates a feedback loop. Choose a physical microphone as the "
+            "Windows default, or pass --input-device."
+        )
+    return info
+
+
 def select_device_by_substring(
     devices: Iterable[Mapping],
     substring: str,

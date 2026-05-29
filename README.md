@@ -1,38 +1,81 @@
-# Tvoice / RVC — Python Realtime Voice Changer
+# Tvoice / RVC — Realtime Voice Changer
 
-Python rebuild of a realtime RVC (Retrieval-based Voice Conversion) voice
-changer. Target route:
+Turn the voice you speak into a trained target voice (RVC) in real time and
+send it to Discord / OBS / a recorder. There is exactly one route:
 
 ```
-physical microphone
-  -> Python audio pipeline
-  -> RVC chunked inference (the model defines the voice)
-  -> CABLE Input  (the app renders here)
-  -> CABLE Output (Discord / OBS / Zoom select this as "microphone")
+系统默认麦克风 (Windows default recording device)
+  -> Python pipeline (chunk -> RVC inference -> resample to stream SR)
+  -> CABLE Input   (the app renders here)
+  -> CABLE Output  (Discord / OBS / recorder select this as their "microphone")
 ```
 
-## Design stance: model-faithful runtime
+## Design stance: a faithful carrier, not a sound-design tool
 
-**The trained model is the voice.** A model bundle is a `.pth` + its
-`.index` + the supporting `hubert_base.pt` + `rmvpe.pt`, plus the
-inference parameters those files were trained against. The runtime's
-job is to load that bundle and play it through the realtime audio chain
-**faithfully, stably, and safely**.
+**The trained model is the voice.** A model bundle is a `.pth` + its `.index`
++ the supporting `hubert_base.pt` + `rmvpe.pt`, plus the inference parameters
+they were trained against (in the model profile). The runtime's whole job is
+to play that bundle through the realtime audio chain **faithfully, stably, and
+safely**.
 
-The runtime does **not** position itself as a sound-design tool:
+Between `engine.infer_array(...)` returning a chunk and the audio reaching
+`CABLE Input`, the runtime does **only** what is structurally required:
 
-- `pitch_shift`, `index_rate`, `protect`, `filter_radius`, `rms_mix_rate`,
-  `f0_method` are **model profile parameters** — properties of the
-  trained model, not user-facing tuning knobs. They live inside the
-  model profile JSON.
-- The CLI flags that override them exist for developer / debug purposes
-  only and print a "developer override" warning when used.
-- To get a different voice, train (or load) a different model.
+- resample the model's native sample rate to the stream rate (sinc-polyphase),
+- a sample-accurate slice that drops the input-side warm-up context and the
+  look-ahead tail pad,
+- a NaN/Inf scrub (safety, not shaping).
+
+There is **no pitch shift, no time-stretch, no crossfade, no EQ, no limiter,
+no gain shaping** anywhere in the runtime. To get a different voice, train or
+load a different model. Voice-identity parameters (`f0_method`, `index_rate`,
+`protect`, `filter_radius`, `rms_mix_rate`, `pitch_shift`) live in the model
+profile — they are properties of the trained model, not user knobs, and the
+CLI has no flags to override them.
+
+## Quick start (PowerShell)
+
+```powershell
+# 1. dot-source the env script (caches/temp -> RVC\, UTF-8 console, venv on)
+. .\setup_env.ps1
+
+# 2. see your devices — the system default mic is marked "I", outputs "O"
+python -m src.main --list-devices
+
+# 3. (optional) confirm the cable carries audio: tone -> CABLE Input -> CABLE Output
+python -m tools.verify_cable_route --duration-seconds 2
+
+# 4. run: system default mic -> kiki model -> CABLE Input
+python -m src.main `
+    --config config/runtime.example.json `
+    --model-profile config/model_profiles/kiki.example.json `
+    --device cuda
+```
+
+In Discord / OBS / your recorder, select **`CABLE Output (VB-Audio Virtual
+Cable)`** as the microphone. Speak — you are heard as the model's voice.
+
+`Ctrl+C` stops the run; a final metrics summary is printed.
+
+## The microphone: system default, with an override
+
+By default the runtime captures the **Windows default recording device**
+(your "系统默认 mic") — change it in Windows sound settings and the runtime
+follows. To pin a specific mic instead, set `input_device_substring` in the
+config or pass `--input-device "Realtek"` (a name fragment). The runtime
+refuses `CABLE Output` as input (that would feed the cable back into itself).
+
+## VB-CABLE routing rules (do not invert)
+
+- The app **renders to `CABLE Input`** (the virtual cable's render side).
+- Downstream apps **select `CABLE Output`** as their microphone.
+- The app's input is a **physical microphone** — `CABLE Output` is refused as
+  input unless the diagnostic `--allow-virtual-cable-input` flag is set.
 
 ## Model profile
 
-Voice identity is bundled in a JSON file under `config/model_profiles/`.
-The shipped example is [`config/model_profiles/kiki.example.json`](config/model_profiles/kiki.example.json):
+Voice identity is a JSON file under `config/model_profiles/`
+([`kiki.example.json`](config/model_profiles/kiki.example.json)):
 
 ```json
 {
@@ -41,496 +84,105 @@ The shipped example is [`config/model_profiles/kiki.example.json`](config/model_
   "index_path":  "models/kiki/kikiV1.index",
   "hubert_path": "models/kiki/hubert_base.pt",
   "rmvpe_path":  "models/kiki/rmvpe.pt",
-  "f0_method":   "rmvpe",
-  "index_rate":  0.5,
-  "protect":     0.33,
-  "filter_radius": 3,
-  "rms_mix_rate":  0.25,
-  "pitch_shift":   0,
-  "resample_sr":   0,
-  "notes":         "Example profile for the kiki model. These values are the model's intended inference settings, not sound-design knobs."
+  "f0_method": "rmvpe", "index_rate": 0.5, "protect": 0.33,
+  "filter_radius": 3, "rms_mix_rate": 0.25, "pitch_shift": 0, "resample_sr": 0
 }
 ```
 
-Paths inside the profile are interpreted relative to the working
-directory you run the command from (normally the project root).
+Paths are relative to the directory you run `python -m` from (the project
+root). Place model assets under `models/` (gitignored).
 
-Place the actual model assets under `models/` (gitignored end-to-end;
-`*.pth`, `*.index`, `*.pt` files are never committed).
-
-## Runtime engineering knobs (the *only* normal-user knobs)
-
-These shape stability, latency, and correctness — not voice character:
+## Engineering knobs (the only user-facing controls — none change the voice)
 
 | Flag | Default | What it controls |
 | --- | --- | --- |
 | `--device` | `auto` | Inference device (`auto` / `cuda` / `cpu`) |
-| `--chunk-ms` | 180 | RVC chunk size — accumulation latency. Recommended realtime value is 1000 (longer = more model context per call). |
-| `--rvc-context-ms` | **200** | Stage 3 input-side LEFT context. Engine sees `[prev_input_tail, chunk]`; output is trimmed proportionally so emit duration ≈ chunk_ms. Set 0 to A/B. See "Stage 3 — input-side left-context" below. |
-| `--crossfade-ms` | **0** | Stitched output-only crossfade. OFF by default — see "What the realtime path does NOT do" below. |
+| `--chunk-ms` | 1000 | RVC chunk size (accumulation latency); larger = more model context |
+| `--rvc-context-ms` | 500 | Input-side left-context warm-up fed to the model, then sliced away. Continuity only; clears the decoder's ~240 ms internal lead-in margin (see [docs/realtime_study_notes.md](docs/realtime_study_notes.md)). |
+| `--tail-pad-ms` | 30 | Look-ahead tail pad that absorbs the model's deterministic ~20 ms tail-frame loss, then sliced away. No stretch, no pitch. |
+| `--sola-search-ms` | 10 | SOLA seam-alignment search window. Phase-matches each chunk's seam to the previous chunk's tail by **choosing the cut offset** (no crossfade, no blend, no sample edit) — kills chunk-boundary comb-filter "电音". 0 disables. Must be ≤ `--tail-pad-ms`. |
 | `--rvc-queue-ms` | 6000 | Per-direction queue capacity |
-| `--rvc-prebuffer-ms` | `2 × chunk_ms` | Startup silence inserted before first real audio |
-| `--warmup-rvc-count` | 2 | Dummy inferences run before opening audio stream |
-| `--drop-stale-input` / `--no-drop-stale-input` | on | If inference falls behind, drop older chunks instead of growing latency |
-| `--duration-seconds` | (none — run until Ctrl+C) | Stop after N seconds |
-| `--input-device-substring` | from config | Mic device name fragment |
-| `--output-device-substring` | from config | Output device name fragment (must be `CABLE Input`) |
-
-## What the realtime path does NOT do
-
-The realtime worker is intentionally a thin carrier for the trained
-model. Between `engine.infer_array(...)` returning a chunk and the
-audio reaching `CABLE Input` it does only what is required:
-
-- **No EQ, no limiter, no normalizer, no compressor.** The chunk goes
-  out at the amplitude the model returned (one defensive int16-scale
-  rescale lives in the engine adapter to match `infer_rvc_python`'s
-  documented contract; that one is required).
-- **No "smoothing" or "warming" of the model output.**
-- **Stitched output-side crossfade is OFF by default.** An audit (run
-  via `tools/pseudo_stream.py`) showed the previous 20 ms default
-  shifted the output timeline by one crossfade length per chunk and
-  blended chunk N's tail with chunk N+1's head — two
-  temporally-disjoint regions, since the input chunks themselves do
-  not overlap. The audit measured no faithfulness improvement vs
-  no-crossfade. Re-enable with `--crossfade-ms N` for legacy
-  comparison only.
-- **Resampling between model-native SR and stream SR uses
-  `scipy.signal.resample_poly`** (sinc-windowed polyphase) when scipy
-  is importable, falling back to `np.interp` otherwise. The polyphase
-  path measured ~+11 dB output SNR vs the linear fallback on
-  kiki 40→48 kHz. Both run in well under a millisecond per chunk on
-  this hardware.
-- **`drop_stale_input` is ON** as a fail-safe: if inference falls
-  behind faster than the mic feeds, the worker discards older queued
-  chunks and processes the freshest one. In normal steady-state (mean
-  inference ~160 ms at chunk_ms=1000 with default context on RTX 4080
-  Laptop) this never fires; the `rvc_stale_chunk_drops` metric tells
-  you if it does.
-- **Identity fallback** runs only when the backend raises or returns
-  garbage. The user hears their own voice for that one chunk instead
-  of silence or a crash. The `rvc_fallback_count` metric tells you if
-  it fires.
-
-## Stage 4-E2 — input-side frame restoration (model-faithful continuity)
-
-The chunked RVC pipeline emits **exactly one ~20 ms HuBERT frame less
-audio per chunk than the input demands**, and the loss is **entirely
-at the tail**. This is deterministic: `tools/probe_frame_deficit.py`
-measured exactly 800 samples @ 40 kHz native (= 20 ms = 960 @ 48 kHz)
-for every input length (24000 / 48000 / 52800 / 57600 / 96000) and
-every content type (sine / noise / speech) with **zero variance** —
-20 ms is exactly one 50 Hz HuBERT feature frame, which the backend
-floors. Cross-correlation confirms the model renders input time
-`[0, L − 20 ms]`: the front maps cleanly (prepending context shifts
-the render by exactly the context duration, no start deficit). Left
-uncorrected, at chunk_ms=1000 that's a ~17 ms/s steady output-queue
-drain regardless of prebuffer (the Stage 4-D 300 s failure).
-
-**The fix is input-side, not output-side.** Feed the backend
-`[left_context][chunk][tail_pad]` so the dropped tail frame lands
-inside the tail pad, resample the whole render to the stream SR, then
-emit the **sample-accurate slice** `[context_size : context_size +
-chunk_size]`. The emit is exactly `chunk_size` samples, generated by
-the model, **not time-stretched and not pitch-shifted** — unlike the
-earlier Stage 4-E output-side polyphase stretch (kept as a diagnostic
-below), this does not alter the model's samples or their time
-relationship. This is "timeline preservation, not voice shaping".
-
-Method choices (`--frame-restore-method`, default `lookahead`;
-tail pad size via `--tail-pad-ms`, default 30 ms ≈ 1.5× the
-deterministic 20 ms loss):
-
-| Method | Behaviour | Pitch | Latency | Use case |
-| --- | --- | --- | --- | --- |
-| `lookahead` (default) | Tail pad = next chunk's real audio; exact slice | unchanged | +tail_pad_ms | Production: seamless boundaries, most faithful |
-| `silence` | Tail pad = zeros; exact slice | unchanged | none | Production: zero added latency, slight boundary coloring |
-| `stretch` | Stage 4-E output-side polyphase stretch to chunk_size | ~34¢ flat | none | Diagnostic / fallback |
-| `off` | No restoration — Stage 4-D legacy | unchanged | none | Diagnostic / A/B; the queue WILL drain |
-
-`lookahead` is the default because the chunk's final frame is then
-rendered with **real** continuation, so every emitted sample is
-produced with full real neighbor context (closest to the offline
-whole-file pass) and chunk boundaries stay seamless. The look-ahead
-costs `tail_pad_ms` of latency — trivial against the 5000 ms
-prebuffer, and this project explicitly does not chase low latency.
-
-Frame-restoration metrics (final summary):
-
-| Metric | Meaning |
-| --- | --- |
-| `frame_restore_method` / `frame_restore_enabled` | Active method; True for `lookahead`/`silence` |
-| `input_tail_pad_ms` / `input_tail_pad_frames` | Effective tail pad (0 for `stretch`/`off`) |
-| `frame_restoration_count` | Chunks restored input-side |
-| `frame_restoration_shortfall_count` | Chunks where the render was shorter than the slice (tail pad too small) — should be 0 |
-| `frame_restoration_expected_frames_total` | Σ chunk_size (the emit target) |
-| `frame_restoration_actual_frames_total` | Σ whole-render length before the slice |
-| `frame_restoration_emitted_frames_total` | Σ emitted (= Σ chunk_size; the drift gauge) |
-| `frame_restoration_trim_start/end_frames_total` | Σ context region dropped / trailing surplus dropped |
-| `output_stretch_used_count` | Honesty gauge: chunks where the output stretch ran (0 for input-side methods) |
-
-With input-side restoration, `cumulative_frame_delta` stays bounded
-in steady state instead of growing at ~17 ms/s, so a sustained
-session no longer drains its prebuffer — and no pitch shift is
-introduced. The `stretch` diagnostic still populates the Stage 4-E
-`timeline_*` counters.
-
-## Stage 4-C — headless quality-first runtime
-
-`src.main --mode rvc` is the complete non-GUI realtime RVC runtime.
-"Quality-first" means defaults trade latency for continuity: the
-runtime would rather start ~5 seconds later and stay glitch-free than
-start fast and hiccup mid-conversation. There is no other mode — the
-runtime IS the quality-first runtime.
-
-**Defaults that shape continuity (Stage 4-C)**:
-
-- `--rvc-prebuffer-ms` defaults to **5 × chunk_ms** (= 5000 ms at the
-  recommended `chunk_ms=1000`). This is the silence inserted into the
-  output queue before the first real RVC chunk lands. It survives
-  (a) the per-chunk framing deficit that slowly drains the queue and
-  (b) a single inference outlier up to ~2 × chunk_ms. Empirical
-  justification: a Stage 4-B spoken run with `--rvc-prebuffer-ms 3000`
-  hit a 1713 ms inference spike at t=47 s and produced 167 underruns
-  (~1.67 s of silence on `CABLE Output`). 5000 ms would have left
-  ~2 s of margin under the same spike. Override with
-  `--rvc-prebuffer-ms` only when you're consciously trading stability
-  for latency.
-
-- `--rvc-queue-ms` (default 6000 ms) is the per-direction queue
-  capacity. It must be ≥ `--rvc-prebuffer-ms`.
-
-- `--rvc-context-ms` (default 200 ms) is unchanged — Stage 3 left-context
-  is still the chunk-boundary continuity strategy. Tuning is deferred.
-
-- `--crossfade-ms` (default 0) — output-side crossfade stays off. Do
-  not re-enable it for "smoothing"; the Stage 3 audit showed it
-  blends temporally-disjoint regions and introduces timeline drift
-  for no faithfulness gain.
-
-**Spike-protection metrics (new in Stage 4-C)**:
-
-| Metric | Meaning |
-| --- | --- |
-| `rvc_chunk_ms_budget` | Per-chunk audio budget (= chunk_size / sample_rate × 1000). Any single inference taking longer than this is "over budget". |
-| `rvc_inference_over_budget_count` | How many inferences exceeded the budget. |
-| `rvc_inference_over_budget_max_consecutive` | Longest streak of consecutive over-budget calls. Streaks ≥ 2 are the highest-risk pattern for underruns. |
-| `rvc_inference_over_budget_total_ms` | Sum of wall-clock debt vs the audio stream (ms). |
-| `min_output_queue_depth_after_steady` | Lowest output-queue depth ever seen after the prebuffer drained. Useful drain-trend indicator. |
-| `output_queue_near_empty_threshold_blocks` | Threshold for the next counter (= 50 ms worth of blocks at the configured sample rate / block size). |
-| `output_queue_near_empty_events` | Edge-triggered count of times the output queue transitioned into "near-empty" territory. |
-| `cumulative_frame_delta` | Net `input_frames - output_frames` at session end. Positive = output behind input (= queue is being drained over time). |
-
-The per-second metrics line now shows `ob=N` (over-budget count),
-`ne=N` (near-empty events), `minq=N` (current minimum-after-steady),
-and `delta=±Nf` (cumulative frame delta) so drains are visible in
-real time, not just at shutdown.
-
-**Failure-class taxonomy** (when a counter fails a gate, classify
-into one of these — never tune voice identity):
-
-1. **Runtime continuity** — inference spike(s), queue drain, near-
-   empty events, underruns. Mitigate via larger prebuffer or
-   identifying the source of the spike (GPU contention, etc.).
-2. **Chunk / context artifact** — visible in pseudo-stream A/B with
-   different `context_ms` values. Out of scope for Stage 4-C.
-3. **Model / backend limitation** — same artifact in offline whole-
-   file inference, not specific to realtime.
-4. **Training / model quality** — voice doesn't sound right even
-   offline. Re-train; do not tune identity params.
-5. **Audio device / CABLE monitoring** — input is silent or
-   downstream app isn't reading `CABLE Output`. Re-check routing.
-
-**PASS / FAIL / BLOCKED definition for a spoken validation run**:
-
-- **PASS**: real speech was present (input peak dBFS regularly above
-  −60 dBFS) AND all engineering gates clean: `input_queue_drops = 0`,
-  `output_queue_drops = 0`, `rvc_output_blocks_dropped = 0`,
-  `rvc_fallback_count = 0`, `nan_inf_scrub_count = 0`,
-  `steady_state_output_underruns = 0` (or extremely low and clearly
-  explained), `rvc_inference_over_budget_max_consecutive ≤ 1`,
-  `output_queue_near_empty_events = 0`, `cumulative_frame_delta`
-  growing only at the documented per-chunk framing rate.
-- **FAIL**: speech present but one or more engineering gates dirty
-  (e.g. an inference spike caused underruns). Classify per the
-  taxonomy above.
-- **BLOCKED**: no real speech detected, audio device unavailable, or
-  `CABLE Output` could not be monitored.
-
-## Note: `--rvc-context-ms` is a deferred engineering optimization point
-
-`--rvc-context-ms` is a continuity / boundary-quality knob, **not** a
-voice-tuning control. The current default of 200 ms is what Stage 3
-shipped with; further refinement (lower / higher values, adaptive
-sizing, true bilateral overlap, etc.) is **deferred** until the full
-chain has been validated end-to-end with the trained kiki model on
-the realtime route. Do not sweep this value to "tune the voice" — it
-does not change voice identity, and the project's model-faithful
-posture remains intact regardless of the value chosen.
-
-## Stage 3 — input-side left-context (the continuity strategy)
-
-Per-chunk inference inherits no past audio across chunk boundaries.
-HuBERT, RMVPE (F0), and the index retrieval re-initialise on every
-call, so the first ~tens of ms of every chunk's output exhibits cold-
-start instability: boundary clicks, F0 wobble, sustained-vowel
-"flutter". The previous output-side crossfade did not fix this — it
-blended two temporally-disjoint regions, which is geometrically wrong.
-
-The model-faithful fix is to give the model real previous audio as
-*input* warmup, then discard the output region that corresponds to
-that warmup input. This is exactly what `--rvc-context-ms` does
-(default 200 ms):
-
-1. For each chunk N the engine receives `[chunk N−1's tail of
-   context_size samples, chunk N]` as one input.
-2. The model produces an output of length ~`(context_size +
-   chunk_size) * (out_per_in_ratio)`.
-3. The worker discards the first `round(context_size * out_len /
-   in_len)` samples of model output, then emits the remainder.
-4. The context buffer is refreshed to `chunk N[-context_size:]` for
-   the next call.
-
-Audit results (`tools/pseudo_stream.py --context-ms 0` vs `200`):
-
-| metric | ctx=0 | ctx=200 (default) |
-|---|---|---|
-| RMS error vs offline 40k→polyphase 48k | 0.0395 | 0.0366 (−7 %) |
-| SNR vs offline reference | +0.94 dB | **+1.60 dB** (+0.66 dB) |
-| Cross-corr alignment shift vs offline | −983 samples | **−547 samples** (−44 %) |
-| Pairwise SNR ctx=200 vs ctx=0 | — | **+5.31 dB** (materially different) |
-| Per-chunk time deficit | 1.96 % | 1.67 % (smaller is better) |
-| Steady-state inference time / chunk | 140 ms | 161 ms (+21 ms) |
-
-**Timeline preservation**: emit duration per chunk stays ≈ chunk_ms.
-Strictly, it grows slightly (47040 → 47200 samples per 1 s input at
-48 kHz) because a longer model input loses proportionally less audio
-to edge framing — but this *reduces* the running per-chunk time
-deficit, it does not introduce drift. There is NO accumulating
-timeline error of the sort the legacy output-side crossfade
-introduced (that one shifted by exactly one crossfade length per
-chunk and grew unboundedly with session length).
-
-**Latency cost**: zero added to the audio chain. Audio still arrives
-at the input callback at the same cadence and is emitted at the same
-cadence. Only the worker's per-chunk inference time grows by ~21 ms
-(measured), which is still far below `chunk_ms`, so the worker
-continues to keep up with the mic.
-
-**Diminishing returns past 200 ms**: `--rvc-context-ms 400` gives
-only +0.07 dB SNR over 200 ms in the audit, so 200 is the default.
-Set 0 to A/B against Stage 2G.
-
-The remaining structural ceiling is the per-chunk-vs-whole-file
-inference gap that left-context alone cannot fully close (chunk N's
-output for time T differs slightly from chunk N+1's output for the
-same T due to internal model state). A future revision could attempt
-true bilateral overlap with same-input-time crossfade; this is
-deferred until measured listening evidence justifies the added
-complexity.
-
-## VB-CABLE routing rules
-
-- **The app renders (outputs) to `CABLE Input`.**
-- **Discord / OBS / Zoom select `CABLE Output` as their microphone.**
-- **The app's input device is a physical microphone.** The runtime
-  refuses `CABLE Output` as input unless the explicit
-  `--allow-virtual-cable-input` diagnostic override is set.
-
-## Stage 1 commands (still relevant)
-
-```
-.\.venv310\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv310\Scripts\python.exe -m src.main --list-devices
-.\.venv310\Scripts\python.exe -m src.main --mode identity --config config/runtime.example.json --duration-seconds 30
-.\.venv310\Scripts\python.exe -m tools.verify_cable_route --duration-seconds 2
-.\.venv310\Scripts\python.exe -m tools.click_test --duration-seconds 2 --pulse-amplitude 0.5
-```
-
-## Audit tool — reproducing the model-faithfulness comparison
-
-`tools/pseudo_stream.py` runs the same model the realtime path uses,
-but in pure offline mode (no audio devices, no worker thread, no
-queues). It exists so a regression in the realtime chain can be
-isolated end-to-end without bringing the audio stack online.
-
-```
-.\.venv310\Scripts\python.exe -m tools.pseudo_stream `
-    --input-wav test.wav `
-    --output-wav audit_pseudo_stream.wav `
-    --model-profile config/model_profiles/kiki.example.json `
-    --device cuda `
-    --chunk-ms 1000 `
-    --crossfade-ms 0 `
-    --resampler polyphase `
-    --stream-sr 48000 `
-    --report-json audit_pseudo_stream.json
-```
-
-A/B the resulting WAV against `tools.offline_infer`'s output (the
-offline whole-file reference). The output is gitignored under
-`*.wav`. The JSON report captures per-chunk inference timing and
-amplitude metrics for regression tracking.
-
-## Stage 2 — offline RVC sanity (recommended invocation)
-
-```
-.\.venv310\Scripts\python.exe -m tools.offline_infer `
-    --input-wav test.wav `
-    --output-wav test_kiki_rvc.wav `
-    --model-profile config/model_profiles/kiki.example.json `
-    --device cuda
-```
-
-The profile supplies the voice. The CLI supplies only file I/O and
-device. No tuning knobs appear in this command.
-
-## Stage 4-A — full-chain validation
-
-Stage 4-A's purpose is to confirm the **complete fixed-model
-realtime chain** works end-to-end against the trained kiki model
-without changing voice identity. Run the validation command (next
-section) and inspect the final summary against the following gates:
-
-| Counter | Pass gate | Meaning if non-zero |
-| --- | --- | --- |
-| `input_queue_drops` | 0 | input arriving faster than the worker can pull — chunk size or queue too small |
-| `output_queue_drops` | 0 | worker producing faster than the output callback drains — queue too small |
-| `rvc_output_blocks_dropped` | 0 | same as above, accounted on the RVC path |
-| `rvc_fallback_count` | 0 | backend raised — investigate the exception, do NOT mask it |
-| `nan_inf_scrub_count` | 0 | model produced non-finite samples — investigate the input chunk |
-| `rvc_stale_chunk_drops` | 0, or explained | inference fell behind the mic; usually 0 in steady state |
-| `steady_state_output_underruns` | "low enough for local use" | small numbers acceptable; explain spikes |
-| `input_status_flag_count` / `output_status_flag_count` | 0, or explained | PortAudio host-API warnings |
-
-`startup_output_underruns` may be > 0 during the first ~1-2 chunks
-(before the warmup+prebuffer fully populate the queue) and is not a
-failure. Listening quality is the operator's judgment — the chain
-should reproduce a continuous kiki voice on `CABLE Output` for a
-downstream app or recorder configured to listen there.
-
-If a counter fails the gate, classify the issue as one of
-{runtime continuity, chunk/context artifact, model/backend
-limitation, training/model quality, audio device / CABLE monitoring
-issue} — but do NOT tune voice identity parameters.
-
-## Stage 3 — realtime RVC (recommended invocation)
-
-```
-.\.venv310\Scripts\python.exe -m src.main --mode rvc `
-    --config config/runtime.example.json `
-    --model-profile config/model_profiles/kiki.example.json `
-    --input-device-substring "WO Mic" `
-    --output-device-substring "CABLE Input" `
-    --device cuda `
-    --chunk-ms 1000 `
-    --rvc-context-ms 200 `
-    --frame-restore-method lookahead `
-    --tail-pad-ms 30 `
-    --rvc-queue-ms 6000 `
-    --warmup-rvc-count 2 `
-    --duration-seconds 60
-```
-
-`--rvc-context-ms 200` (the default — shown explicitly here) gives
-the model 200 ms of real previous input audio as warmup left-context
-before each chunk. `--frame-restore-method lookahead` (the default)
-additionally feeds a `--tail-pad-ms 30` look-ahead tail, then emits
-the exact `[context : context+chunk]` slice so emit duration is
-exactly chunk_ms with no timeline drift and no pitch shift. See
-"Stage 4-E2 — input-side frame restoration" above for the deficit
-probe and method table, and "Stage 3 — input-side left-context"
-below for the context audit measurements.
-
-`--rvc-prebuffer-ms` is omitted on purpose — it now defaults to
-5 × chunk_ms = 5000 ms (the Stage 4-C quality-first policy). Passing
-a smaller value here would silently re-introduce the Stage 4-B
-failure mode where a single inference spike consumed the prebuffer
-and produced ~1.7 s of silence on `CABLE Output`. `--crossfade-ms`
-is also omitted; the model-faithful default is 0.
-
-Discord / OBS / your recorder mic must be `CABLE Output (VB-Audio
-Virtual Cable)`.
-
-## Developer override flags (debug only)
-
-The runtime accepts the following flags so developers can diff against
-the model profile, but they are **not** part of normal usage:
-
-```
---model-path  --index-path  --hubert-path  --rmvpe-path
---f0-method   --index-rate  --protect      --filter-radius
---rms-mix-rate  --pitch-shift
-```
-
-If any of these are set AND differ from the profile, the runtime prints:
-
-```
-WARNING: developer override: profile <field>=<old> replaced by CLI
---<field> = <new>. Model-faithful behaviour is to omit this flag.
-```
-
-Use them only when investigating a specific model behaviour. They never
-appear in product-facing commands or recommendations.
+| `--rvc-prebuffer-ms` | 3 × chunk_ms | Output silence inserted before first real audio (hides cold-start + spikes) |
+| `--warmup-rvc-count` | 2 | Dummy inferences before opening the stream (hides the ~30 s cold start) |
+| `--drop-stale-input` / `--no-drop-stale-input` | on | If inference falls behind, drop oldest chunks so latency stays bounded |
+| `--input-device` / `--output-device` | system default / `CABLE Input` | Device name fragments |
+| `--duration-seconds` | run until Ctrl+C | Stop after N seconds |
+
+## Continuity & stability (why the chunked pipeline stays drift-free)
+
+Per-chunk RVC inference has three structural quirks; all are handled faithfully,
+with no reshaping of the model's samples (distilled from a study of five mature
+RVC projects — see [docs/realtime_study_notes.md](docs/realtime_study_notes.md)):
+
+- **Cold start per chunk.** HuBERT / RMVPE / index re-initialise each call, so
+  the first tens of ms of a chunk would wobble. `--rvc-context-ms` (500 ms)
+  feeds the model the previous chunk's real audio as warm-up, then the output
+  for that region is sliced away. 500 ms clears the RVC decoder's internal
+  ~240 ms lead-in margin. (Real past audio, faithfully sliced.)
+- **Tail-frame loss.** The model emits exactly one ~20 ms HuBERT frame less
+  than the input demands, at the tail. `--tail-pad-ms` feeds the next chunk's
+  real audio as a look-ahead tail so the lost frame lands in the pad, then the
+  worker emits the exact `chunk_size` slice. Output stays drift-free with no
+  time-stretch and no pitch change.
+- **Seam phase mismatch ("电音").** Two independent renders meeting at a hard
+  cut differ in phase → a comb-filter/electronic artifact. `--sola-search-ms`
+  cross-correlates each chunk's seam against the previously emitted tail and
+  **chooses the phase-matched cut offset** (SOLA *alignment* only — it picks
+  *where* to join; it never blends, gain-ramps, stretches, or pitch-shifts a
+  sample, so it stays a faithful carrier). This is the canonical fix every
+  reference project uses; we adopt only its faithful half (alignment), never
+  the voice-altering crossfade blend.
 
 ## Identity-first safety net
 
-Stage 2's RVC worker still falls back to identity passthrough on:
+On any backend error (CUDA OOM, NaN, model fault) or degenerate output, the
+worker emits **the chunk's own audio** (the user's own voice) for that chunk
+instead of silence or a crash. The link stays alive; `rvc_fallback_count`
+makes it observable.
 
-- backend exceptions (CUDA OOM, RMVPE NaN, model load failure)
-- inference returning invalid output (zero-length, invalid sample rate)
+## Health checks (bisect the link if it ever breaks)
 
-The audio link stays alive in these cases. Observability via
-`fallback_count`, `rvc_fallback_count`, `nan_inf_scrub_count`.
+- `python -m tools.offline_infer --input-wav test.wav --output-wav out.wav --model-profile config/model_profiles/kiki.example.json --device cuda`
+  — proves the **model + inference** are healthy on a file (no audio devices).
+- `python -m tools.verify_cable_route --duration-seconds 2`
+  — proves the **VB-CABLE transport** (CABLE Input → CABLE Output) carries audio.
+
+If offline inference works and the cable carries a tone, but downstream is
+silent, the problem is **device routing** (wrong/silent input device, or the
+downstream app not listening on `CABLE Output`).
 
 ## Metrics
 
-Per-second print line + final summary cover:
-
-- frames in / out, queue depths, queue drops
-- input/output peak/RMS dBFS, status flags
-- `rvc_chunks_processed`, `rvc_inference_mean_ms`, `rvc_inference_median_ms`,
-  `rvc_inference_p95_ms`, `rvc_inference_max_ms`
-- `rvc_output_blocks_enqueued` / `rvc_output_blocks_dropped`
-- `rvc_stale_chunk_drops`
-- `rvc_resample_count` / `rvc_resample_mean_ms`
-- `startup_output_underruns` vs `steady_state_output_underruns`
-- `max_input_queue_depth` / `max_output_queue_depth`
-- session info (model_basename, chunk_ms, crossfade_ms, etc.)
-
-## Project principles
-
-- **Identity-first.** RVC mode falls back to identity on any chunk
-  inference error. The user hears themselves rather than silence or a
-  crash.
-- **Model-faithful.** Voice identity comes from the trained model
-  bundle; the runtime plays it back as trained, with no "tone tuning"
-  product surface.
-- **No system mutation.** The app never changes the Windows default
-  audio device, never edits Discord / OBS / Zoom settings, never
-  touches the registry, PATH, drivers, or any global config.
-- **No generated artifact pollution.** Audio captures, sidecar JSON,
-  reports, and model files are not committed. `.gitignore` covers
-  `*.wav`, `*.jsonl`, `*.log`, `*.pt`, `*.pth`, `*.index`,
-  `models/local/`, `eval_corpus/reports/` recursively. Validation tools
-  never write artifacts unless `--save --report-dir PATH` is supplied.
-- **Async queue architecture.** Audio callbacks never block; the worker
-  thread owns RVC inference.
+A per-second line and a final summary report: frames in/out, queue depths and
+drops, output underruns (split startup vs steady-state), input/output peak/RMS
+dBFS, NaN scrubs, status flags, RVC chunks processed, inference last/mean/max
+ms vs the per-chunk budget, fallback count, stale-chunk drops, resample timing.
 
 ## Testing
 
-```
-.\.venv310\Scripts\python.exe -m pytest -q
+```powershell
+python -m pytest -q
 ```
 
-Pure tests only: no audio hardware, no GPU, no internet, no model
-files, no Discord. The full RVC stack is mocked via fake backends and
-fake engines so the tests run on any machine with numpy + pytest.
+Pure tests only — no audio hardware, no GPU, no internet, no model files. The
+RVC stack is faked via duck-typed engines so the suite runs anywhere with
+numpy + pytest.
 
 ## Dependencies
 
-`requirements.txt` lists only `numpy`, `sounddevice`, `pytest`. The
-RVC stack (`infer-rvc-python`, `torch`, `torchaudio`, `faiss-cpu`,
-`fairseq`, `pyworld`, etc.) is **not** installed by the project — you
-install it manually into `.venv310` once. See the install notes in the
-project plan.
+`requirements.txt` lists only `numpy`, `sounddevice`, `pytest`. The RVC stack
+(`infer-rvc-python`, `torch`+CUDA, `torchaudio`, `faiss-cpu`, `fairseq`,
+`pyworld`, `librosa`, `scipy`) is installed once into `.venv310` (the runtime
+venv). All caches/temp are redirected into `RVC\.cache` and `RVC\.tmp` by
+`setup_env.ps1` — nothing is written to the C: drive.
+
+## Principles
+
+- **Faithful.** The model defines the voice; the runtime is a clean carrier.
+  No runtime voice-shaping of any kind.
+- **Stable first.** Quality-first defaults trade latency for continuity; the
+  link should run without glitching, draining, or drifting.
+- **Identity-first safety.** Inference failure falls back to the user's own
+  voice, never silence or a crash.
+- **No system mutation.** Never changes the Windows default device, app
+  settings, registry, PATH, or drivers.

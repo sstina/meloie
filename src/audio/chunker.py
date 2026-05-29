@@ -183,96 +183,37 @@ def resample_audio(
     return out.astype(np.float32, copy=False)
 
 
-def reconcile_to_length(
-    audio: np.ndarray, target_length: int, method: str = "polyphase"
-) -> np.ndarray:
-    """Stretch / shrink ``audio`` to exactly ``target_length`` samples.
+def find_sola_offset(haystack: np.ndarray, needle: np.ndarray) -> int:
+    """Return the index in ``haystack`` where ``needle`` best aligns.
 
-    Stage 4-E timeline reconciliation. The chunked RVC pipeline emits
-    ~20 ms less audio per inference call than the input chunk
-    contained (structural framing loss in HuBERT / RMVPE / vocoder --
-    confirmed via a direct ``engine.infer_array`` probe: 48000 in ->
-    39200 out @ 40 kHz; 96000 in -> 79200 out @ 40 kHz; 24000 in ->
-    19200 out @ 40 kHz; *always* exactly 20 ms short). Without
-    reconciliation the realtime output queue drains at ~17 ms / s and
-    eventually empties (Stage 4-D 300 s run: 93 underruns).
+    Normalised cross-correlation (the alignment half of SOLA). Used to
+    phase-match a new chunk's seam region against the previously emitted
+    tail, so consecutive per-chunk renders join at a phase-aligned point
+    instead of an arbitrary one — which is what removes the comb-filter
+    "电音" at chunk boundaries.
 
-    Methods:
+    This is the FAITHFUL half of SOLA: it only chooses *where* to cut.
+    It returns an index; it never modifies, blends, stretches, or
+    pitch-shifts any sample. The caller emits the model's own untouched
+    samples starting at the returned offset.
 
-    * ``polyphase`` (default, recommended): ``scipy.signal.resample_poly``
-      stretches the audio with a rational up/down ratio. For the kiki
-      48 kHz / 1 s chunk case this is a 50:49 stretch -> ~34 cents
-      pitch flat, continuous, no clicks. The pitch shift is below the
-      "trained ear" threshold (~5 cents); for normal listeners on
-      speech material it is generally not perceptible. This is the
-      "timeline preservation, not voice shaping" choice.
-    * ``pad_zero`` (diagnostic): silence-pad at the end if short,
-      truncate if long. Preserves the model output verbatim but
-      creates periodic 20 ms gaps at chunk boundaries (1 Hz tremolo
-      at chunk_ms=1000).
-    * ``linear``: ``np.interp`` stretch -- same pitch effect as
-      polyphase but cheaper and slightly more aliasing.
-    * ``off``: returns the input unchanged (legacy Stage 4-D
-      behavior; reintroduces the buffer drain).
-
-    Returns audio with exactly ``target_length`` samples (except when
-    ``method="off"``, which returns the original).
+    ``haystack`` must be at least as long as ``needle``. Returns an index
+    in ``[0, haystack.size - needle.size]`` (0 if inputs are degenerate).
     """
-    if not isinstance(audio, np.ndarray):
-        raise TypeError(
-            f"audio must be a numpy array, got {type(audio).__name__}"
-        )
-    if audio.ndim != 1:
-        raise ValueError(f"audio must be 1-D mono, got shape {audio.shape}")
-    if int(target_length) < 0:
-        raise ValueError(f"target_length must be >= 0; got {target_length}")
-    if method == "off":
-        return audio
-    if int(target_length) == 0:
-        return np.zeros(0, dtype=np.float32)
-
-    target_length = int(target_length)
-    if audio.size == target_length:
-        return audio.astype(np.float32, copy=True)
-    if audio.size == 0:
-        return np.zeros(target_length, dtype=np.float32)
-
-    if method == "polyphase":
-        try:
-            from math import gcd
-            from scipy.signal import resample_poly  # type: ignore  # noqa: WPS433
-            g = gcd(int(audio.size), target_length)
-            up = target_length // g
-            down = audio.size // g
-            out = resample_poly(audio.astype(np.float64, copy=False), up, down)
-            # resample_poly may give target_length +/- one sample of
-            # rounding. Force exact length.
-            if out.size > target_length:
-                out = out[:target_length]
-            elif out.size < target_length:
-                pad = np.zeros(target_length - out.size, dtype=out.dtype)
-                out = np.concatenate([out, pad])
-            return out.astype(np.float32, copy=False)
-        except ImportError:
-            method = "linear"
-
-    if method == "linear":
-        x_old = np.arange(audio.size, dtype=np.float64)
-        x_new = np.linspace(0.0, audio.size - 1, target_length, dtype=np.float64)
-        return np.interp(x_new, x_old, audio).astype(np.float32)
-
-    if method == "pad_zero":
-        if audio.size < target_length:
-            pad = np.zeros(target_length - audio.size, dtype=np.float32)
-            return np.concatenate(
-                [audio.astype(np.float32, copy=False), pad]
-            ).astype(np.float32, copy=False)
-        return audio[:target_length].astype(np.float32, copy=True)
-
-    raise ValueError(
-        f"unknown reconcile method: {method!r}. "
-        "Expected one of: 'polyphase', 'linear', 'pad_zero', 'off'."
-    )
+    if not isinstance(haystack, np.ndarray) or not isinstance(needle, np.ndarray):
+        raise TypeError("haystack and needle must be numpy arrays")
+    n = int(needle.size)
+    if n == 0 or haystack.size < n:
+        return 0
+    hay = haystack.astype(np.float64, copy=False)
+    ndl = needle.astype(np.float64, copy=False)
+    # Numerator: sliding dot product of needle over haystack.
+    nom = np.correlate(hay, ndl, mode="valid")
+    # Denominator: per-window energy of haystack times needle energy, so
+    # the score is a normalised correlation (insensitive to loudness).
+    energy = np.convolve(hay * hay, np.ones(n, dtype=np.float64), mode="valid")
+    den = np.sqrt(energy * float(np.dot(ndl, ndl))) + 1e-8
+    return int(np.argmax(nom / den))
 
 
 def trim_to_region(

@@ -127,6 +127,11 @@ def _resolve_offline_voice(args, profile) -> dict:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    for _s in (sys.stdout, sys.stderr):  # tolerate non-GBK names on CN locale
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
     args = _build_parser().parse_args(argv)
 
     in_path = Path(args.input_wav)

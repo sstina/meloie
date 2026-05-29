@@ -1,9 +1,12 @@
-"""Tests for the Stage 2 RVC worker loop, using a fake engine.
+"""Tests for the realtime RVC worker loop, using fake engines.
 
-The worker is exercised through real ``queue.Queue`` instances and a
-real ``threading.Event``, but the RVC engine is faked so no torch /
-infer_rvc_python install is needed. The fake engine deterministically
-scales the audio by 0.5 so we can verify chunk wiring end-to-end.
+The worker runs through real ``queue.Queue`` instances and a real
+``threading.Event``; the RVC engine is faked so no torch /
+infer_rvc_python install is needed. These tests pin the faithful-carrier
+contract: every processed chunk emits exactly ``chunk_size`` samples (a
+sample-accurate slice — no stretch, no pitch change), the SR-adaptation
+resample runs when needed, and a backend error falls back to the user's
+own voice rather than killing the link.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import threading
 import numpy as np
 import pytest
 
+from src.audio.chunker import find_sola_offset, resample_audio
 from src.engine.worker import rvc_worker_loop
 from src.safety.metrics import RuntimeMetrics
 
@@ -28,11 +32,11 @@ class _FakeEngine:
         self.gain = float(gain)
         self.raise_on_call = raise_on_call
         self.call_count = 0
-        self.last_chunk_size = None
+        self.last_input_size = None
 
     def infer_array(self, audio, sample_rate):
         self.call_count += 1
-        self.last_chunk_size = int(audio.size)
+        self.last_input_size = int(audio.size)
         if self.raise_on_call:
             raise RuntimeError("simulated RVC failure")
         return audio.astype(np.float32, copy=False) * np.float32(self.gain), int(sample_rate)
@@ -45,116 +49,104 @@ def _drain(q: "queue.Queue"):
     return out
 
 
+def _run(engine, in_q, out_q, metrics, **kw):
+    kw.setdefault("sample_rate", 48000)
+    kw.setdefault("output_block_size", 480)
+    kw.setdefault("poll_timeout_seconds", 0.05)
+    rvc_worker_loop(engine, in_q, out_q, metrics, threading.Event(), SENTINEL, **kw)
+
+
 # ---------------------------------------------------------------------------
-# Happy path: accumulate into one chunk, infer, split into output blocks
+# Happy path: one chunk -> infer -> emit chunk_size as output blocks
 # ---------------------------------------------------------------------------
 
-def test_rvc_worker_processes_one_chunk_and_emits_blocks():
-    chunk_size = 2400      # 50 ms at 48 kHz, exact multiple of block_size
-    block_size = 480
+def test_processes_one_chunk_and_emits_chunk_size():
+    chunk_size = 2400      # 50 ms @ 48 kHz, exact multiple of block_size
     in_q: "queue.Queue" = queue.Queue(maxsize=32)
     out_q: "queue.Queue" = queue.Queue(maxsize=32)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
     engine = _FakeEngine(gain=0.5)
 
-    # 5 input blocks of 480 == 2400 == one chunk
-    for i in range(5):
-        in_q.put(np.full(block_size, 0.4, dtype=np.float32))
+    for _ in range(5):  # 5 * 480 == 2400 == one chunk
+        in_q.put(np.full(480, 0.4, dtype=np.float32))
     in_q.put(SENTINEL)
 
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-    )
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size)
 
     out_blocks = _drain(out_q)
     assert engine.call_count == 1
-    assert engine.last_chunk_size == chunk_size
+    assert engine.last_input_size == chunk_size      # no context, no tail
     assert metrics.rvc_chunks_processed == 1
     assert metrics.rvc_inference_count == 1
-    assert metrics.rvc_inference_mean_ms >= 0.0
     assert metrics.rvc_fallback_count == 0
-    # Should have emitted exactly chunk_size / block_size = 5 blocks.
-    assert len(out_blocks) == 5
     concat = np.concatenate(out_blocks)
     assert concat.shape == (chunk_size,)
-    np.testing.assert_allclose(concat, 0.4 * 0.5 * np.ones(chunk_size, dtype=np.float32),
-                               atol=1e-6)
+    np.testing.assert_allclose(concat, 0.2 * np.ones(chunk_size, np.float32), atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# Fallback path: engine raises -> identity output, link stays alive
+# Safety net: engine raises -> identity output (own voice), link alive
 # ---------------------------------------------------------------------------
 
-def test_rvc_worker_falls_back_to_identity_on_engine_error():
+def test_falls_back_to_identity_on_engine_error():
     chunk_size = 1920
-    block_size = 480
     in_q: "queue.Queue" = queue.Queue(maxsize=32)
     out_q: "queue.Queue" = queue.Queue(maxsize=32)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
     engine = _FakeEngine(raise_on_call=True)
 
     expected = np.full(chunk_size, 0.25, dtype=np.float32)
     for i in range(4):
-        in_q.put(expected[i * block_size:(i + 1) * block_size])
+        in_q.put(expected[i * 480:(i + 1) * 480])
     in_q.put(SENTINEL)
 
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-    )
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size)
 
     assert metrics.rvc_fallback_count == 1
-    assert metrics.rvc_chunks_processed == 1  # we did emit a chunk via identity
-    out_blocks = _drain(out_q)
-    concat = np.concatenate(out_blocks)
+    assert metrics.rvc_chunks_processed == 1
+    concat = np.concatenate(_drain(out_q))
     np.testing.assert_allclose(concat, expected, atol=1e-6)
 
 
+def test_falls_back_when_backend_returns_invalid_sr():
+    chunk_size = 4800
+
+    class _ZeroSrEngine:
+        def infer_array(self, audio, sample_rate):
+            return audio.astype(np.float32, copy=True), 0  # invalid SR
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=32)
+    out_q: "queue.Queue" = queue.Queue(maxsize=32)
+    metrics = RuntimeMetrics()
+    payload = np.full(chunk_size, 0.3, dtype=np.float32)
+    for i in range(chunk_size // 480):
+        in_q.put(payload[i * 480:(i + 1) * 480])
+    in_q.put(SENTINEL)
+
+    _run(_ZeroSrEngine(), in_q, out_q, metrics, chunk_size=chunk_size)
+
+    assert metrics.rvc_fallback_count == 1
+    np.testing.assert_allclose(np.concatenate(_drain(out_q)), payload, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
-# Scrub: engine returns NaN/Inf -> scrubbed and counted
+# NaN/Inf scrub
 # ---------------------------------------------------------------------------
 
-class _NaNyEngine:
-    """Engine that injects NaN/Inf into the output."""
+def test_scrubs_nan_inf_from_engine_output():
+    class _NaNyEngine:
+        def infer_array(self, audio, sample_rate):
+            out = audio.astype(np.float32, copy=True)
+            out[0], out[1], out[2] = np.nan, np.inf, -np.inf
+            return out, int(sample_rate)
 
-    def infer_array(self, audio, sample_rate):
-        out = audio.astype(np.float32, copy=True)
-        out[0] = np.nan
-        out[1] = np.inf
-        out[2] = -np.inf
-        return out, int(sample_rate)
-
-
-def test_rvc_worker_scrubs_nan_inf_from_engine_output():
-    chunk_size = 480
-    block_size = 480
     in_q: "queue.Queue" = queue.Queue(maxsize=8)
     out_q: "queue.Queue" = queue.Queue(maxsize=8)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
-
-    in_q.put(np.full(chunk_size, 0.1, dtype=np.float32))
+    in_q.put(np.full(480, 0.1, dtype=np.float32))
     in_q.put(SENTINEL)
 
-    rvc_worker_loop(
-        _NaNyEngine(), in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-    )
+    _run(_NaNyEngine(), in_q, out_q, metrics, chunk_size=480)
 
     assert metrics.nan_inf_scrub_count == 3
     out_blocks = _drain(out_q)
@@ -166,18 +158,13 @@ def test_rvc_worker_scrubs_nan_inf_from_engine_output():
 # Stop event
 # ---------------------------------------------------------------------------
 
-def test_rvc_worker_stop_event_exits_cleanly():
+def test_stop_event_exits_cleanly():
     metrics = RuntimeMetrics()
     stop = threading.Event()
     stop.set()
-    in_q: "queue.Queue" = queue.Queue(maxsize=4)
-    out_q: "queue.Queue" = queue.Queue(maxsize=4)
     rvc_worker_loop(
-        _FakeEngine(), in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=480,
-        output_block_size=480,
-        crossfade_size=0,
+        _FakeEngine(), queue.Queue(), queue.Queue(), metrics, stop, SENTINEL,
+        sample_rate=48000, chunk_size=480, output_block_size=480,
         poll_timeout_seconds=0.01,
     )
     assert metrics.rvc_chunks_processed == 0
@@ -185,565 +172,122 @@ def test_rvc_worker_stop_event_exits_cleanly():
 
 
 # ---------------------------------------------------------------------------
-# Crossfade smoke test
+# SR adaptation: backend returns its native SR -> worker resamples, then
+# still emits exactly chunk_size via the slice.
 # ---------------------------------------------------------------------------
 
-def test_rvc_worker_crossfade_preserves_output_length():
-    """With crossfade enabled, the worker holds back the last K samples
-    of each chunk for blending. After N chunks the total emitted should
-    be (N * chunk_size - K). When shutdown flushes the pending tail
-    there should be (N * chunk_size) emitted total."""
-    chunk_size = 1920
-    block_size = 480
-    crossfade = 240
+def test_resamples_native_sr_and_emits_chunk_size():
+    class _NativeSrEngine:
+        """Returns the audio resampled to 40 kHz (duration preserved),
+        like the kiki model's 40 kHz native output."""
 
+        def __init__(self):
+            self.call_count = 0
+
+        def infer_array(self, audio, sample_rate):
+            self.call_count += 1
+            return resample_audio(audio, int(sample_rate), 40000), 40000
+
+    chunk_size = 4800     # 100 ms @ 48 kHz
     in_q: "queue.Queue" = queue.Queue(maxsize=64)
     out_q: "queue.Queue" = queue.Queue(maxsize=64)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _FakeEngine(gain=1.0)  # identity gain for easier accounting
-
-    # Two full chunks of input
-    for i in range(2 * (chunk_size // block_size)):
-        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
+    engine = _NativeSrEngine()
+    for _ in range(chunk_size // 480):
+        in_q.put(np.full(480, 0.3, dtype=np.float32))
     in_q.put(SENTINEL)
 
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=crossfade,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-    )
-
-    assert engine.call_count == 2
-    assert metrics.rvc_chunks_processed == 2
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    # With a single hold-tail crossfade, each chunk after the first
-    # contributes (chunk_size - crossfade) net samples, plus the very
-    # first chunk contributes (chunk_size - crossfade), plus the final
-    # pending tail (crossfade) is emitted on flush.
-    # = (chunk_size - crossfade) + (chunk_size - crossfade) + crossfade
-    # = 2 * chunk_size - crossfade.
-    assert total == 2 * chunk_size - crossfade
-
-
-# ---------------------------------------------------------------------------
-# Inference timing metrics
-# ---------------------------------------------------------------------------
-
-def test_record_inference_ms_updates_mean_and_max():
-    metrics = RuntimeMetrics()
-    metrics.record_inference_ms(10.0)
-    metrics.record_inference_ms(20.0)
-    metrics.record_inference_ms(30.0)
-    assert metrics.rvc_inference_count == 3
-    assert metrics.rvc_inference_last_ms == pytest.approx(30.0)
-    assert metrics.rvc_inference_max_ms == pytest.approx(30.0)
-    assert metrics.rvc_inference_mean_ms == pytest.approx(20.0)
-
-
-# ---------------------------------------------------------------------------
-# Stage 2C: sample-rate mismatch safety
-# ---------------------------------------------------------------------------
-
-class _WrongSrEngine:
-    """Returns audio at a sample rate different from what the worker asked for.
-
-    This simulates a backend that ignores ``resample_sr`` or returns its
-    own native rate (e.g. the 40 kHz kiki model into a 48 kHz stream).
-    """
-
-    def __init__(self, returned_sr: int) -> None:
-        self.returned_sr = int(returned_sr)
-        self.call_count = 0
-
-    def infer_array(self, audio, sample_rate):
-        self.call_count += 1
-        return audio.astype(np.float32, copy=True), self.returned_sr
-
-
-def test_rvc_worker_resamples_when_returned_sr_mismatches_stream_sr():
-    """Stage 2D: if the backend returns valid audio at a different SR
-    than the stream uses, the worker now resamples to match (cheap
-    linear interp) instead of falling back to identity. This unlocks
-    the kiki@native_sr=40k path which is the only realtime-fits config.
-
-    Stage 4-E2 note: this test asserts the *post-SR-resample* emit size
-    (5760 samples). The input-side / stretch restoration would otherwise
-    force the emit to chunk_size (4800). We pin frame restoration to
-    ``off`` here so the test exercises only the SR-mismatch path.
-    """
-    chunk_size = 4800        # 100 ms @ 48 kHz
-    block_size = 480
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _WrongSrEngine(returned_sr=40000)  # model native SR
-
-    input_audio = np.full(chunk_size, 0.3, dtype=np.float32)
-    for i in range(chunk_size // block_size):
-        in_q.put(input_audio[i * block_size:(i + 1) * block_size])
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        frame_restore_method="off",
-    )
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size)
 
     assert engine.call_count == 1
-    # No fallback — the resample path took over.
     assert metrics.rvc_fallback_count == 0
-    # The fake engine returns the input audio at 40 kHz; the worker
-    # resamples back to 48 kHz, so the output length should match the
-    # original input chunk length when rounded.
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    # 4800 samples at 40 kHz -> resampled to 48 kHz -> 5760 samples,
-    # then chunked into 480-sample blocks; output_block_size divides it.
-    assert total == 5760
+    assert metrics.rvc_resample_count == 1
+    # The slice guarantees exactly chunk_size emitted regardless of native SR.
+    assert sum(b.size for b in _drain(out_q)) == chunk_size
 
 
-def test_rvc_worker_falls_back_when_backend_returns_invalid_sr():
-    """A backend returning result_sr <= 0 is a hard error -> identity."""
-    chunk_size = 4800
-    block_size = 480
-    in_q: "queue.Queue" = queue.Queue(maxsize=32)
-    out_q: "queue.Queue" = queue.Queue(maxsize=32)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _WrongSrEngine(returned_sr=0)  # invalid
-
-    input_audio = np.full(chunk_size, 0.3, dtype=np.float32)
-    for i in range(chunk_size // block_size):
-        in_q.put(input_audio[i * block_size:(i + 1) * block_size])
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-    )
-
-    assert metrics.rvc_fallback_count == 1
-    out_blocks = _drain(out_q)
-    concat = np.concatenate(out_blocks)
-    np.testing.assert_allclose(concat, input_audio, atol=1e-6)
-
-
-def test_rvc_worker_accepts_matching_sr():
-    """If the backend returns the same SR the worker asked for, the
-    safety net must NOT fire."""
+def test_no_resample_when_sr_matches():
     in_q: "queue.Queue" = queue.Queue(maxsize=8)
     out_q: "queue.Queue" = queue.Queue(maxsize=8)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _WrongSrEngine(returned_sr=48000)
-
     in_q.put(np.full(480, 0.2, dtype=np.float32))
     in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=480,
-        output_block_size=480,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-    )
-
-    assert metrics.rvc_fallback_count == 0
+    _run(_FakeEngine(gain=1.0), in_q, out_q, metrics, chunk_size=480)
+    assert metrics.rvc_resample_count == 0
     assert metrics.rvc_chunks_processed == 1
 
 
 # ---------------------------------------------------------------------------
-# Stage 2E: stale-input drop, output enqueue counting, resample timing,
-# first_real_output_seen flag
-# ---------------------------------------------------------------------------
-
-def test_rvc_worker_drops_stale_chunks_when_multiple_ready():
-    """When drained input produces more than one chunk in a single
-    worker cycle, only the latest is processed; the older ones are
-    counted as stale drops."""
-    chunk_size = 480     # 10 ms @ 48 kHz, tiny on purpose
-    block_size = 480
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _FakeEngine(gain=1.0)
-
-    # Pre-load 3 chunks worth of input before the worker starts so the
-    # initial drain will produce 3 chunks at once.
-    for i in range(3):
-        in_q.put(np.full(block_size, 0.1 * (i + 1), dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=True,
-    )
-
-    # Engine should have been called only for the latest chunk.
-    assert engine.call_count == 1
-    assert metrics.rvc_stale_chunk_drops == 2
-    assert metrics.rvc_chunks_processed == 1
-
-
-def test_rvc_worker_does_not_drop_when_drop_stale_off():
-    chunk_size = 480
-    block_size = 480
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _FakeEngine(gain=1.0)
-
-    for i in range(3):
-        in_q.put(np.full(block_size, 0.1 * (i + 1), dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-    )
-
-    assert engine.call_count == 3
-    assert metrics.rvc_stale_chunk_drops == 0
-
-
-def test_rvc_worker_counts_output_blocks_enqueued():
-    chunk_size = 2400      # 5 blocks at 480
-    block_size = 480
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _FakeEngine(gain=1.0)
-
-    for _ in range(5):
-        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-    )
-
-    # One chunk produced 5 output blocks.
-    assert metrics.rvc_output_blocks_enqueued == 5
-    assert metrics.rvc_output_blocks_dropped == 0
-    assert metrics.first_real_output_seen is True
-    assert metrics.max_output_queue_depth >= 1
-
-
-def test_rvc_worker_records_resample_timing_on_sr_mismatch():
-    chunk_size = 4800
-    block_size = 480
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _WrongSrEngine(returned_sr=40000)
-
-    for _ in range(chunk_size // block_size):
-        in_q.put(np.full(block_size, 0.3, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-    )
-
-    assert metrics.rvc_resample_count == 1
-    assert metrics.rvc_resample_total_ms >= 0.0
-    assert metrics.rvc_resample_mean_ms >= 0.0
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: input-side left-context with proportional output trim
+# Input-side left-context warm-up (faithful: sliced away)
 # ---------------------------------------------------------------------------
 
 class _RecordingEngine:
-    """Engine that records every input shape it was called with and
-    returns its input unchanged (identity gain, same SR).
-
-    This makes it trivial to assert what the worker actually sent to
-    ``infer_array`` — specifically that the left-context was prepended.
-    """
+    """Records every input it was called with; returns it unchanged."""
 
     def __init__(self) -> None:
-        self.calls: list = []   # list of (np.ndarray copy, sr)
+        self.calls: list = []
 
     def infer_array(self, audio, sample_rate):
-        self.calls.append((audio.astype(np.float32, copy=True), int(sample_rate)))
+        self.calls.append(audio.astype(np.float32, copy=True))
         return audio.astype(np.float32, copy=False), int(sample_rate)
 
 
-def test_rvc_worker_prepends_left_context_to_engine_input():
-    """With context_size > 0 the engine sees chunk_size + context_size
-    samples per call; the first call's context is zeros (true start-of-
-    signal); subsequent calls' context is the previous chunk's tail."""
+def test_prepends_left_context_and_emits_chunk_size():
     chunk_size = 2400
-    block_size = 480
-    context_size = 480     # 10 ms @ 48 kHz; convenient block multiple
-
+    context_size = 480
     in_q: "queue.Queue" = queue.Queue(maxsize=64)
     out_q: "queue.Queue" = queue.Queue(maxsize=64)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
     engine = _RecordingEngine()
 
-    chunk_1 = np.linspace(0.1, 0.5, chunk_size, dtype=np.float32)
-    chunk_2 = np.linspace(0.5, 0.9, chunk_size, dtype=np.float32)
-    for i in range(chunk_size // block_size):
-        in_q.put(chunk_1[i * block_size:(i + 1) * block_size].copy())
-    for i in range(chunk_size // block_size):
-        in_q.put(chunk_2[i * block_size:(i + 1) * block_size].copy())
+    c1 = np.linspace(0.1, 0.5, chunk_size, dtype=np.float32)
+    c2 = np.linspace(0.5, 0.9, chunk_size, dtype=np.float32)
+    for i in range(chunk_size // 480):
+        in_q.put(c1[i * 480:(i + 1) * 480].copy())
+    for i in range(chunk_size // 480):
+        in_q.put(c2[i * 480:(i + 1) * 480].copy())
     in_q.put(SENTINEL)
 
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        context_size=context_size,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-    )
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size,
+         context_size=context_size, drop_stale_input=False)
 
     assert len(engine.calls) == 2
-    a0, _ = engine.calls[0]
-    a1, _ = engine.calls[1]
-    # Each engine input is context_size + chunk_size long.
+    a0, a1 = engine.calls
     assert a0.size == context_size + chunk_size
-    assert a1.size == context_size + chunk_size
-    # First call's context is zeros.
-    np.testing.assert_array_equal(a0[:context_size], np.zeros(context_size, dtype=np.float32))
-    # First call's new region matches chunk_1 exactly.
-    np.testing.assert_allclose(a0[context_size:], chunk_1, atol=1e-6)
+    # First call's context is zeros (true start-of-signal).
+    np.testing.assert_array_equal(a0[:context_size], np.zeros(context_size, np.float32))
+    np.testing.assert_allclose(a0[context_size:], c1, atol=1e-6)
     # Second call's context is chunk_1's tail.
-    np.testing.assert_allclose(a1[:context_size], chunk_1[-context_size:], atol=1e-6)
-    np.testing.assert_allclose(a1[context_size:], chunk_2, atol=1e-6)
+    np.testing.assert_allclose(a1[:context_size], c1[-context_size:], atol=1e-6)
+    # Emit duration is exactly chunk_size per chunk (no drift).
+    assert sum(b.size for b in _drain(out_q)) == 2 * chunk_size
 
 
-def test_rvc_worker_trims_output_proportionally_to_preserve_chunk_duration():
-    """With an identity-gain engine, the EMITTED output per chunk must
-    equal the chunk_size in input samples — no timeline drift."""
-    chunk_size = 2400
-    block_size = 480
-    context_size = 480
-
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _RecordingEngine()
-
-    for _ in range(3 * (chunk_size // block_size)):
-        in_q.put(np.full(block_size, 0.25, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        context_size=context_size,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-    )
-
-    assert len(engine.calls) == 3
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    # 3 chunks * 2400 samples each = exactly 7200 emitted samples.
-    # (Identity engine -> 1:1 input/output ratio -> trim removes exactly
-    # context_size samples per chunk.)
-    assert total == 3 * chunk_size
-
-
-def test_rvc_worker_zero_context_is_identical_to_legacy_behaviour():
-    """context_size=0 must reproduce the no-context legacy path: the
-    engine sees the chunk only, and no trim is applied."""
+def test_zero_context_feeds_chunk_only():
     chunk_size = 1920
-    block_size = 480
-
     in_q: "queue.Queue" = queue.Queue(maxsize=64)
     out_q: "queue.Queue" = queue.Queue(maxsize=64)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
     engine = _RecordingEngine()
-
     payload = np.linspace(-0.5, 0.5, chunk_size, dtype=np.float32)
-    for i in range(chunk_size // block_size):
-        in_q.put(payload[i * block_size:(i + 1) * block_size].copy())
+    for i in range(chunk_size // 480):
+        in_q.put(payload[i * 480:(i + 1) * 480].copy())
     in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        context_size=0,
-        poll_timeout_seconds=0.05,
-    )
-
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size, context_size=0)
     assert len(engine.calls) == 1
-    a0, _ = engine.calls[0]
-    assert a0.size == chunk_size
-    np.testing.assert_allclose(a0, payload, atol=1e-6)
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    assert total == chunk_size
+    assert engine.calls[0].size == chunk_size
+    assert sum(b.size for b in _drain(out_q)) == chunk_size
 
 
-def test_rvc_worker_fallback_path_does_not_apply_trim():
-    """When the engine raises, the worker emits the chunk's own audio
-    via identity fallback. The trim path (which assumes the model ran
-    on chunk+context) must NOT engage in that case, otherwise the
-    listener loses the first ``context_size`` samples of fallback
-    audio."""
-    chunk_size = 2400
-    block_size = 480
-    context_size = 480
-
-    in_q: "queue.Queue" = queue.Queue(maxsize=32)
-    out_q: "queue.Queue" = queue.Queue(maxsize=32)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _FakeEngine(raise_on_call=True)
-
-    payload = np.full(chunk_size, 0.42, dtype=np.float32)
-    for i in range(chunk_size // block_size):
-        in_q.put(payload[i * block_size:(i + 1) * block_size].copy())
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        context_size=context_size,
-        poll_timeout_seconds=0.05,
-    )
-
-    assert metrics.rvc_fallback_count == 1
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    assert total == chunk_size
-    concat = np.concatenate(out_blocks)
-    np.testing.assert_allclose(concat, payload, atol=1e-6)
-
-
-def test_rvc_worker_rejects_negative_context_size():
-    in_q: "queue.Queue" = queue.Queue()
-    out_q: "queue.Queue" = queue.Queue()
-    with pytest.raises(ValueError):
-        rvc_worker_loop(
-            _FakeEngine(), in_q, out_q, RuntimeMetrics(), threading.Event(), SENTINEL,
-            sample_rate=48000, chunk_size=480, output_block_size=480,
-            context_size=-1,
-            poll_timeout_seconds=0.01,
-        )
-
-
-class _SlowEngine:
-    """Engine that sleeps for a configurable wall-clock duration on each
-    inference call so we can test Stage 4-C over-budget tracking without
-    actually loading a model."""
-
-    def __init__(self, sleep_seconds: float) -> None:
-        self.sleep_seconds = float(sleep_seconds)
-
-    def infer_array(self, audio, sample_rate):
-        import time as _time
-        _time.sleep(self.sleep_seconds)
-        return audio.astype(np.float32, copy=False), int(sample_rate)
-
-
-def test_rvc_worker_passes_chunk_ms_budget_into_record_inference_ms():
-    """Stage 4-C: the worker derives the per-chunk budget from
-    chunk_size / sample_rate and passes it into record_inference_ms,
-    so an over-budget inference shows up in the spike counters.
-
-    Uses a small chunk and a 50 ms sleep so the inference reliably
-    exceeds the ~10 ms budget."""
-    chunk_size = 480       # 10 ms @ 48 kHz -> budget = 10 ms
-    block_size = 480
-
-    in_q: "queue.Queue" = queue.Queue(maxsize=8)
-    out_q: "queue.Queue" = queue.Queue(maxsize=8)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _SlowEngine(sleep_seconds=0.05)   # 50 ms >> 10 ms budget
-
-    in_q.put(np.full(chunk_size, 0.1, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.01,
-    )
-
-    assert metrics.rvc_chunk_ms_budget == pytest.approx(10.0)
-    assert metrics.rvc_inference_count == 1
-    assert metrics.rvc_inference_over_budget_count == 1
-    assert metrics.rvc_inference_over_budget_max_consecutive == 1
-    # The over-budget debt should be roughly (50 - 10) = 40 ms
-    # but with timing slop, just check it's positive and < the
-    # actual measured last-inference time.
-    assert 30.0 < metrics.rvc_inference_over_budget_total_ms <= metrics.rvc_inference_last_ms
-
+# ---------------------------------------------------------------------------
+# Look-ahead tail pad restores the model's structural ~20 ms tail deficit
+# without stretch/pitch: emit stays exactly chunk_size, no queue drain.
+# ---------------------------------------------------------------------------
 
 class _DeficitEngine:
-    """Engine that drops a fixed tail of N samples from the output.
+    """Drops a fixed tail of N samples (simulates kiki's framing loss)."""
 
-    Simulates the kiki backend's structural 20 ms framing loss
-    (`infer_rvc_python` returns ~960 fewer samples per call than the
-    input chunk demands, regardless of input length). Useful for end-
-    to-end Stage 4-E reconciliation testing without loading a model.
-    """
-
-    def __init__(self, deficit_samples: int = 960) -> None:
+    def __init__(self, deficit_samples: int = 96) -> None:
         self.deficit_samples = int(deficit_samples)
         self.call_count = 0
 
@@ -753,261 +297,229 @@ class _DeficitEngine:
         return audio[:n].astype(np.float32, copy=True), int(sample_rate)
 
 
-def test_rvc_worker_lookahead_restores_each_chunk_to_chunk_size_by_default():
-    """Stage 4-E2 default (lookahead): every chunk's emit equals
-    chunk_size via a sample-accurate slice — no stretch — regardless of
-    the model's structural tail deficit. The tail pad (real look-ahead)
-    absorbs the lost frame."""
-    chunk_size = 4800     # 100 ms @ 48 kHz
-    block_size = 480
-    deficit = 96          # tail loss the engine simulates
+def test_lookahead_tail_pad_keeps_emit_at_chunk_size():
+    chunk_size = 4800
+    deficit = 96
     tail_pad = 192        # > deficit so the lost frame lands in the pad
-
     in_q: "queue.Queue" = queue.Queue(maxsize=128)
     out_q: "queue.Queue" = queue.Queue(maxsize=128)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
     engine = _DeficitEngine(deficit_samples=deficit)
 
-    # 32 blocks = 15360 samples: enough to process 3 chunks each with a
-    # real 192-sample look-ahead tail (3*4800 + 192 = 14592 needed),
-    # leaving < chunk_size so the shutdown flush does not fire.
+    # 32 blocks = 15360 samples: 3 chunks each with a 192-sample look-ahead
+    # tail, leaving < chunk_size so the shutdown flush does not add a 4th.
     for _ in range(32):
-        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
+        in_q.put(np.full(480, 0.2, dtype=np.float32))
     in_q.put(SENTINEL)
 
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-        tail_pad_size=tail_pad,
-        # frame_restore_method defaults to "lookahead"
-    )
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size,
+         drop_stale_input=False, tail_pad_size=tail_pad)
 
     assert engine.call_count == 3
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    # Exactly 3 * chunk_size emitted — no drain, no per-chunk deficit.
-    assert total == 3 * chunk_size
-    assert metrics.frame_restore_method == "lookahead"
-    assert metrics.frame_restore_enabled is True
+    assert sum(b.size for b in _drain(out_q)) == 3 * chunk_size
+    assert metrics.frame_restoration_shortfall_count == 0
     assert metrics.input_tail_pad_frames == tail_pad
-    assert metrics.frame_restoration_count == 3
-    assert metrics.frame_restoration_shortfall_count == 0
-    assert metrics.frame_restoration_expected_frames_total == 3 * chunk_size
-    assert metrics.frame_restoration_emitted_frames_total == 3 * chunk_size
-    # actual render per chunk = chunk + tail - deficit = 4800 + 192 - 96.
-    assert metrics.frame_restoration_actual_frames_total == 3 * (chunk_size + tail_pad - deficit)
-    # trim_start = context_size = 0; trim_end = surplus = tail - deficit.
-    assert metrics.frame_restoration_trim_start_frames_total == 0
-    assert metrics.frame_restoration_trim_end_frames_total == 3 * (tail_pad - deficit)
-    # No output-side stretch was used at all.
-    assert metrics.output_stretch_used_count == 0
-    assert metrics.timeline_reconcile_enabled is False
-    assert metrics.timeline_reconcile_count == 0
 
 
-def test_rvc_worker_silence_restores_each_chunk_to_chunk_size():
-    """``silence`` synthesises a zero tail pad (no look-ahead latency) and
-    still emits exactly chunk_size per chunk via the exact slice."""
-    chunk_size = 4800
-    block_size = 480
-    deficit = 96
-    tail_pad = 192
+# ---------------------------------------------------------------------------
+# Stability fail-safe: drop-stale keeps latency bounded
+# ---------------------------------------------------------------------------
 
-    in_q: "queue.Queue" = queue.Queue(maxsize=128)
-    out_q: "queue.Queue" = queue.Queue(maxsize=128)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _DeficitEngine(deficit_samples=deficit)
-
-    # silence needs only chunk_size available per chunk (tail is synthetic).
-    for _ in range(3 * (chunk_size // block_size)):
-        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-        frame_restore_method="silence",
-        tail_pad_size=tail_pad,
-    )
-
-    assert engine.call_count == 3
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    assert total == 3 * chunk_size
-    assert metrics.frame_restore_method == "silence"
-    assert metrics.frame_restoration_count == 3
-    assert metrics.frame_restoration_shortfall_count == 0
-    assert metrics.output_stretch_used_count == 0
-
-
-def test_rvc_worker_stretch_mode_uses_output_side_polyphase():
-    """``stretch`` reproduces the Stage 4-E output-side reconciliation:
-    no tail pad, the model render is polyphase-stretched up to chunk_size."""
-    chunk_size = 4800
-    block_size = 480
-    deficit = 96
-
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _DeficitEngine(deficit_samples=deficit)
-
-    for _ in range(3 * (chunk_size // block_size)):
-        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-        frame_restore_method="stretch",
-    )
-
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    assert total == 3 * chunk_size
-    assert metrics.frame_restore_enabled is False
-    assert metrics.timeline_reconcile_enabled is True
-    assert metrics.timeline_reconcile_method == "polyphase"
-    assert metrics.timeline_reconcile_count == 3
-    assert metrics.timeline_actual_output_frames_total == 3 * (chunk_size - deficit)
-    assert metrics.timeline_reconciliation_total_frame_error == -3 * deficit
-    assert metrics.output_stretch_used_count == 3
-    # Input-side restoration did NOT run.
-    assert metrics.frame_restoration_count == 0
-
-
-def test_rvc_worker_off_mode_preserves_legacy_drain_behavior():
-    """``off`` must reproduce the Stage 4-D drain: emit size matches what
-    the model returned, NOT chunk_size."""
-    chunk_size = 4800
-    block_size = 480
-    deficit = 96
-
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _DeficitEngine(deficit_samples=deficit)
-
-    for _ in range(3 * (chunk_size // block_size)):
-        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=False,
-        frame_restore_method="off",
-    )
-
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    # Without restoration, the worker emits chunk_size - deficit per chunk;
-    # the final block_size leftover bookkeeping rounds the count.
-    assert total <= 3 * chunk_size - (3 * deficit) + block_size
-    assert total >= 3 * (chunk_size - deficit) - block_size
-    assert metrics.frame_restore_enabled is False
-    assert metrics.frame_restoration_count == 0
-    assert metrics.output_stretch_used_count == 0
-    assert metrics.timeline_reconcile_count == 0
-
-
-def test_rvc_worker_restoration_skipped_on_identity_fallback():
-    """Identity fallback emits the chunk's own audio (already chunk_size).
-    Frame restoration must NOT count that, otherwise the totals would
-    falsely include fallback frames."""
-    chunk_size = 2400
-    block_size = 480
-
-    in_q: "queue.Queue" = queue.Queue(maxsize=32)
-    out_q: "queue.Queue" = queue.Queue(maxsize=32)
-    metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _FakeEngine(raise_on_call=True)
-
-    for _ in range(chunk_size // block_size):
-        in_q.put(np.full(block_size, 0.25, dtype=np.float32))
-    in_q.put(SENTINEL)
-
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        poll_timeout_seconds=0.05,
-        tail_pad_size=192,
-    )
-
-    assert metrics.rvc_fallback_count == 1
-    out_blocks = _drain(out_q)
-    total = sum(b.size for b in out_blocks)
-    # Fallback emits chunk_size samples directly; restoration does NOT
-    # apply (the chain already matches the timeline).
-    assert total == chunk_size
-    assert metrics.frame_restoration_count == 0
-
-
-def test_rvc_worker_context_preserved_across_stale_drop():
-    """When drop_stale_input drops intermediate chunks, the context
-    buffer must carry forward from the LAST processed chunk (we never
-    saw the dropped ones individually). This is documented behaviour."""
+def test_drop_stale_drops_oldest_when_behind():
     chunk_size = 480
-    block_size = 480
-    context_size = 240
-
     in_q: "queue.Queue" = queue.Queue(maxsize=64)
     out_q: "queue.Queue" = queue.Queue(maxsize=64)
     metrics = RuntimeMetrics()
-    stop = threading.Event()
-    engine = _RecordingEngine()
+    engine = _FakeEngine(gain=1.0)
+    for i in range(3):  # 3 chunks pre-loaded, drained at once
+        in_q.put(np.full(480, 0.1 * (i + 1), dtype=np.float32))
+    in_q.put(SENTINEL)
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size, drop_stale_input=True)
+    assert engine.call_count == 1
+    assert metrics.rvc_stale_chunk_drops == 2
+    assert metrics.rvc_chunks_processed == 1
 
-    # 3 chunks of distinct content. The worker should pull all 3 in one
-    # drain cycle and process only the latest under drop_stale_input.
+
+def test_drop_stale_refreshes_context_to_true_left_neighbour():
+    """When drop-stale discards chunks, the surviving chunk must warm up on
+    its TRUE left neighbour (the last dropped chunk's tail), not on stale,
+    non-adjacent audio. Regression guard for the context-on-drop fix."""
+    chunk_size = 480
+    context_size = 240
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    engine = _RecordingEngine()
     c1 = np.full(chunk_size, 0.1, dtype=np.float32)
-    c2 = np.full(chunk_size, 0.2, dtype=np.float32)
+    c2 = np.full(chunk_size, 0.2, dtype=np.float32)  # immediate left neighbour of c3
     c3 = np.full(chunk_size, 0.3, dtype=np.float32)
     for blk in (c1, c2, c3):
         in_q.put(blk.copy())
     in_q.put(SENTINEL)
 
-    rvc_worker_loop(
-        engine, in_q, out_q, metrics, stop, SENTINEL,
-        sample_rate=48000,
-        chunk_size=chunk_size,
-        output_block_size=block_size,
-        crossfade_size=0,
-        context_size=context_size,
-        poll_timeout_seconds=0.05,
-        drop_stale_input=True,
-    )
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size,
+         context_size=context_size, drop_stale_input=True)
 
     assert metrics.rvc_stale_chunk_drops == 2
     assert len(engine.calls) == 1
-    a0, _ = engine.calls[0]
-    # The single engine call's context is zeros (no prior chunk had been
-    # processed yet); its new region is c3.
-    np.testing.assert_array_equal(a0[:context_size], np.zeros(context_size, dtype=np.float32))
+    a0 = engine.calls[0]
+    # Context is c2's tail (the true left neighbour), NOT zeros / c-something-stale.
+    np.testing.assert_allclose(a0[:context_size], c2[-context_size:], atol=1e-6)
     np.testing.assert_allclose(a0[context_size:], c3, atol=1e-6)
+
+
+def test_no_drop_when_drop_stale_off():
+    chunk_size = 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    engine = _FakeEngine(gain=1.0)
+    for i in range(3):
+        in_q.put(np.full(480, 0.1 * (i + 1), dtype=np.float32))
+    in_q.put(SENTINEL)
+    _run(engine, in_q, out_q, metrics, chunk_size=chunk_size, drop_stale_input=False)
+    assert engine.call_count == 3
+    assert metrics.rvc_stale_chunk_drops == 0
+
+
+# ---------------------------------------------------------------------------
+# Output enqueue accounting
+# ---------------------------------------------------------------------------
+
+def test_counts_output_blocks_enqueued():
+    chunk_size = 2400      # 5 blocks at 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    for _ in range(5):
+        in_q.put(np.full(480, 0.2, dtype=np.float32))
+    in_q.put(SENTINEL)
+    _run(_FakeEngine(gain=1.0), in_q, out_q, metrics, chunk_size=chunk_size)
+    assert metrics.rvc_output_blocks_enqueued == 5
+    assert metrics.rvc_output_blocks_dropped == 0
+    assert metrics.first_real_output_seen is True
+
+
+# ---------------------------------------------------------------------------
+# Inference timing + validation
+# ---------------------------------------------------------------------------
+
+def test_record_inference_ms_updates_mean_and_max():
+    metrics = RuntimeMetrics()
+    for ms in (10.0, 20.0, 30.0):
+        metrics.record_inference_ms(ms)
+    assert metrics.rvc_inference_count == 3
+    assert metrics.rvc_inference_last_ms == pytest.approx(30.0)
+    assert metrics.rvc_inference_max_ms == pytest.approx(30.0)
+    assert metrics.rvc_inference_mean_ms == pytest.approx(20.0)
+
+
+def test_rejects_negative_context_size():
+    with pytest.raises(ValueError):
+        rvc_worker_loop(
+            _FakeEngine(), queue.Queue(), queue.Queue(), RuntimeMetrics(),
+            threading.Event(), SENTINEL,
+            sample_rate=48000, chunk_size=480, output_block_size=480,
+            context_size=-1, poll_timeout_seconds=0.01,
+        )
+
+
+def test_rejects_zero_chunk_size():
+    with pytest.raises(ValueError):
+        rvc_worker_loop(
+            _FakeEngine(), queue.Queue(), queue.Queue(), RuntimeMetrics(),
+            threading.Event(), SENTINEL,
+            sample_rate=48000, chunk_size=0, output_block_size=480,
+            poll_timeout_seconds=0.01,
+        )
+
+
+# ---------------------------------------------------------------------------
+# SOLA seam alignment (faithful: chooses the cut offset, never edits samples)
+# ---------------------------------------------------------------------------
+
+def test_find_sola_offset_locates_known_alignment():
+    rng = np.random.default_rng(1)
+    sig = rng.standard_normal(3000).astype(np.float32)
+    needle = sig[1000:1120]            # 120-sample phase signature
+    haystack = sig[940:1180]           # needle sits at index 60
+    assert find_sola_offset(haystack, needle) == 60
+
+
+def test_find_sola_offset_degenerate_returns_zero():
+    assert find_sola_offset(np.zeros(0, np.float32), np.ones(4, np.float32)) == 0
+    assert find_sola_offset(np.ones(3, np.float32), np.ones(5, np.float32)) == 0
+
+
+def _feed_signal(in_q, signal, block=480):
+    n = signal.size - (signal.size % block)
+    for i in range(0, n, block):
+        in_q.put(signal[i:i + block].copy())
+
+
+def test_sola_identity_aligns_at_anchor_with_no_drift():
+    """With an identity engine, consecutive renders are byte-identical, so
+    SOLA must find the seam already aligned (offset 0) and emit exactly
+    chunk_size per chunk — no timeline drift."""
+    chunk_size, ctx, tail = 4800, 2400, 480
+    search, link = 240, 480
+    in_q: "queue.Queue" = queue.Queue(maxsize=256)
+    out_q: "queue.Queue" = queue.Queue(maxsize=256)
+    metrics = RuntimeMetrics()
+    rng = np.random.default_rng(7)
+    sig = (0.2 * rng.standard_normal(chunk_size * 3 + tail + 960)).astype(np.float32)
+    _feed_signal(in_q, sig)
+    in_q.put(SENTINEL)
+
+    _run(_FakeEngine(gain=1.0), in_q, out_q, metrics,
+         chunk_size=chunk_size, context_size=ctx, tail_pad_size=tail,
+         sola_search_size=search, sola_link_size=link, drop_stale_input=False)
+
+    total = sum(b.size for b in _drain(out_q))
+    assert metrics.rvc_chunks_processed >= 2
+    # Exactly chunk_size emitted per chunk — SOLA introduced no drift.
+    assert total == metrics.rvc_chunks_processed * chunk_size
+    # Every chunk after the first ran SOLA, and identical renders align at 0.
+    assert metrics.rvc_sola_applied_count == metrics.rvc_chunks_processed - 1
+    assert metrics.rvc_sola_offset_last == 0
+
+
+def test_sola_disabled_emits_at_context_anchor():
+    chunk_size, ctx = 4800, 2400
+    in_q: "queue.Queue" = queue.Queue(maxsize=256)
+    out_q: "queue.Queue" = queue.Queue(maxsize=256)
+    metrics = RuntimeMetrics()
+    rng = np.random.default_rng(3)
+    sig = (0.2 * rng.standard_normal(chunk_size * 2 + 960)).astype(np.float32)
+    _feed_signal(in_q, sig)
+    in_q.put(SENTINEL)
+
+    _run(_FakeEngine(gain=1.0), in_q, out_q, metrics,
+         chunk_size=chunk_size, context_size=ctx, tail_pad_size=480,
+         sola_search_size=0, sola_link_size=0, drop_stale_input=False)
+
+    assert metrics.rvc_sola_applied_count == 0
+    total = sum(b.size for b in _drain(out_q))
+    assert total == metrics.rvc_chunks_processed * chunk_size
+
+
+def test_sola_disabled_when_context_too_small():
+    """If left context can't fit search+link, SOLA self-disables (no crash,
+    no drift) rather than reading outside the render."""
+    chunk_size = 4800
+    in_q: "queue.Queue" = queue.Queue(maxsize=256)
+    out_q: "queue.Queue" = queue.Queue(maxsize=256)
+    metrics = RuntimeMetrics()
+    rng = np.random.default_rng(5)
+    sig = (0.2 * rng.standard_normal(chunk_size * 2 + 960)).astype(np.float32)
+    _feed_signal(in_q, sig)
+    in_q.put(SENTINEL)
+
+    _run(_FakeEngine(gain=1.0), in_q, out_q, metrics,
+         chunk_size=chunk_size, context_size=240,   # < search+link
+         tail_pad_size=480, sola_search_size=240, sola_link_size=480,
+         drop_stale_input=False)
+
+    assert metrics.rvc_sola_applied_count == 0
+    total = sum(b.size for b in _drain(out_q))
+    assert total == metrics.rvc_chunks_processed * chunk_size

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.audio.devices import FeedbackLoopRisk
+from src.audio.devices import FeedbackLoopRisk, select_default_input_device
 from src.audio.streams import (
     AudioRuntimeConfig,
     queue_blocks_from_ms,
@@ -115,18 +115,45 @@ def test_audio_runtime_config_rejects_zero_sample_rate():
         AudioRuntimeConfig(sample_rate=0).validate()
 
 
-def test_audio_runtime_config_rejects_three_channels():
+def test_audio_runtime_config_rejects_non_mono():
+    # The route is mono end-to-end; stereo would drop/garble a channel.
+    with pytest.raises(ValueError):
+        AudioRuntimeConfig(channels=2).validate()
     with pytest.raises(ValueError):
         AudioRuntimeConfig(channels=3).validate()
 
 
-def test_audio_runtime_config_accepts_rvc_mode():
-    AudioRuntimeConfig(mode="rvc").validate()
+def test_audio_runtime_config_default_input_is_system_default():
+    # None means "follow the Windows default recording device".
+    assert AudioRuntimeConfig().input_device_substring is None
 
 
-def test_audio_runtime_config_rejects_unknown_mode():
-    with pytest.raises(ValueError):
-        AudioRuntimeConfig(mode="totally_made_up").validate()
+# ---------------------------------------------------------------------------
+# select_default_input_device (the "系统默认 mic" path)
+# ---------------------------------------------------------------------------
+
+def test_default_input_picks_device_at_default_index():
+    info = select_default_input_device(FAKE_DEVICES, 0)
+    assert info.name == "Microphone (USB Audio Device)"
+
+
+def test_default_input_refuses_cable_output():
+    # index 1 in FAKE_DEVICES is the VB-CABLE capture side.
+    with pytest.raises(FeedbackLoopRisk):
+        select_default_input_device(FAKE_DEVICES, 1)
+
+
+def test_default_input_rejects_output_only_device():
+    # index 2 (Speakers) has no input channels.
+    with pytest.raises(LookupError):
+        select_default_input_device(FAKE_DEVICES, 2)
+
+
+def test_default_input_rejects_invalid_index():
+    with pytest.raises(LookupError):
+        select_default_input_device(FAKE_DEVICES, -1)
+    with pytest.raises(LookupError):
+        select_default_input_device(FAKE_DEVICES, 999)
 
 
 # ---------------------------------------------------------------------------

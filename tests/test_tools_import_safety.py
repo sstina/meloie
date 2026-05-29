@@ -1,10 +1,10 @@
-"""Import-safety guard for the Stage 1 validation tools.
+"""Import-safety guard for the validation tools.
 
-Both ``tools.click_test`` and ``tools.verify_cable_route`` are CLI
-scripts that lazy-import ``sounddevice`` inside their ``main()``.
+``tools.verify_cable_route`` and ``tools.offline_infer`` are CLI scripts
+that lazy-import ``sounddevice`` / the RVC stack inside their ``main()``.
 Importing the module by itself must NOT pull sounddevice in, so the
-unit-test process can load them on machines where sounddevice is
-not installed.
+unit-test process can load them on machines where sounddevice is not
+installed.
 """
 
 from __future__ import annotations
@@ -35,10 +35,6 @@ def _import_under_trip_wire(module_name: str, monkeypatch) -> None:
     if not had_sounddevice_before:
         assert "sounddevice" not in sys.modules
     assert hasattr(module, "main")
-
-
-def test_importing_click_test_is_lazy(monkeypatch):
-    _import_under_trip_wire("tools.click_test", monkeypatch)
 
 
 def test_importing_verify_cable_route_is_lazy(monkeypatch):

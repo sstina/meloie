@@ -1,8 +1,9 @@
-"""Pure safety helpers: dBFS measurement, NaN/Inf scrub, soft limiter.
+"""Pure safety helpers: dBFS measurement and NaN/Inf scrub.
 
 No audio hardware dependency, no sounddevice import. All helpers are
 numpy-based and handle silence (all zeros) without producing NaN or
-crashing.
+crashing. The runtime does NO gain shaping / limiting (model-faithful);
+the only safety transform here is replacing non-finite samples with 0.
 """
 
 from __future__ import annotations
@@ -79,38 +80,3 @@ def scrub_nan_inf(audio: np.ndarray) -> ScrubResult:
     if nan_count or inf_count:
         out[nan_mask | inf_mask] = 0.0
     return ScrubResult(audio=out, nan_count=nan_count, inf_count=inf_count)
-
-
-@dataclass(frozen=True)
-class LimiterResult:
-    """Outcome of a hard-ceiling limiter pass."""
-
-    audio: np.ndarray
-    ceiling_dbfs: float
-    samples_clipped: int
-
-    @property
-    def engaged(self) -> bool:
-        return self.samples_clipped > 0
-
-
-def simple_limiter(audio: np.ndarray, ceiling_dbfs: float) -> LimiterResult:
-    """Hard-ceiling limiter at ``ceiling_dbfs`` (e.g. -1.0).
-
-    Anything above the ceiling magnitude is clamped to the ceiling.
-    """
-    if ceiling_dbfs >= 0.0:
-        raise ValueError(
-            f"ceiling_dbfs must be < 0 (full-scale headroom), got {ceiling_dbfs}"
-        )
-    a = _as_float(audio)
-    ceiling_lin = float(10.0 ** (ceiling_dbfs / 20.0))
-    over = np.abs(a) > ceiling_lin
-    clipped = int(over.sum())
-    if clipped:
-        out = np.clip(a, -ceiling_lin, ceiling_lin).astype(audio.dtype, copy=False)
-    else:
-        out = audio.astype(audio.dtype, copy=True)
-    return LimiterResult(
-        audio=out, ceiling_dbfs=ceiling_dbfs, samples_clipped=clipped
-    )

@@ -1,26 +1,23 @@
-"""Realtime audio stream layer.
+"""Realtime audio stream layer for the RVC voice changer.
 
-Stage 1 ``run_identity_stream`` and Stage 2 ``run_rvc_stream`` share
-the same audio plumbing — the only difference is which worker thread
-is started. The shared core lives in ``_run_stream``; mode-specific
-metadata + the worker-startup callable are injected by the two public
-entry points.
+One job: open ``system default mic -> in_queue -> RVC worker -> out_queue
+-> CABLE Input`` and run it. There is exactly one realtime path.
 
 Hard rules baked into this module:
 
-* Importing this module must NOT import sounddevice. The import is
-  lazy and lives inside the functions that actually touch hardware.
-* Audio callbacks must never block. They do put_nowait/get_nowait
-  only; the worker thread does any meaningful work.
-* The input device must be a physical microphone. The output device
-  must be ``CABLE Input``. ``CABLE Output`` is refused for both sides
-  unless the diagnostic override is set.
+* Importing this module must NOT import sounddevice. The import is lazy
+  and lives inside the functions that actually touch hardware.
+* Audio callbacks must never block. They do put_nowait/get_nowait only;
+  the worker thread does all meaningful work.
+* The input device is the user's microphone — by default the Windows
+  default recording device ("系统默认 mic"); an explicit substring may
+  override it. The output device must be ``CABLE Input``. ``CABLE Output``
+  is refused for both sides (feedback-loop guard).
 * No system / device defaults are changed.
 """
 
 from __future__ import annotations
 
-import os
 import queue
 import sys
 import threading
@@ -38,6 +35,7 @@ from .devices import (
     is_probable_cable_output,
     iter_device_infos,
     normalize_device_name,
+    select_default_input_device,
     select_device_by_substring,
 )
 
@@ -49,31 +47,31 @@ _SHUTDOWN_SENTINEL = object()
 class AudioRuntimeConfig:
     """Runtime config for the realtime audio loop.
 
-    Fields map 1-to-1 to keys in ``config/runtime.example.json``.
+    ``input_device_substring=None`` (the default) means "follow the
+    Windows default recording device". Set a substring to pin a specific
+    microphone instead.
     """
 
     sample_rate: int = 48000
     block_size: int = 480           # 10 ms at 48 kHz
-    channels: int = 1
-    input_device_substring: str = "Microphone"
+    channels: int = 1               # mono only — the whole route is mono
+    input_device_substring: Optional[str] = None
     output_device_substring: str = "CABLE Input"
     queue_blocks: int = 64
-    mode: str = "identity"
 
     def validate(self) -> None:
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be > 0")
         if self.block_size <= 0:
             raise ValueError("block_size must be > 0")
-        if self.channels not in (1, 2):
-            raise ValueError("channels must be 1 or 2")
+        if self.channels != 1:
+            # The pipeline is mono end-to-end: input reads channel 0, the
+            # worker/model/resampler/slice are all mono, output writes
+            # channel 0. Stereo would silently drop the right input channel
+            # and leave the right output channel uninitialised.
+            raise ValueError("channels must be 1 (the route is mono)")
         if self.queue_blocks <= 0:
             raise ValueError("queue_blocks must be > 0")
-        if self.mode not in ("identity", "rvc", "rvc_not_implemented"):
-            raise ValueError(
-                f"mode must be 'identity', 'rvc', or 'rvc_not_implemented', "
-                f"got {self.mode!r}"
-            )
 
 
 @dataclass
@@ -103,13 +101,24 @@ def list_audio_devices() -> List[AudioDeviceInfo]:
 
 
 def describe_devices() -> str:
+    try:
+        import sounddevice as sd  # noqa: WPS433
+        default_in, default_out = sd.default.device
+    except Exception:
+        default_in, default_out = (None, None)
     infos = list_audio_devices()
-    lines = ["index  in  out  name"]
+    lines = ["index  in  out  default  name"]
     for info in infos:
+        marker = ""
+        if info.index == default_in:
+            marker += "I"
+        if info.index == default_out:
+            marker += "O"
         lines.append(
             f"{info.index:>5}  "
             f"{info.max_input_channels:>2}  "
             f"{info.max_output_channels:>3}  "
+            f"{marker:>7}  "
             f"{info.name}"
         )
     return "\n".join(lines)
@@ -153,142 +162,121 @@ def resolve_output_device(
 
 
 # ---------------------------------------------------------------------------
-# Shared stream runner
+# Metrics printing
 # ---------------------------------------------------------------------------
 
-def _print_metrics_line(metrics, in_q, out_q, mode_label: str) -> None:
-    base = (
+def _print_metrics_line(metrics, in_q, out_q) -> None:
+    print(
         f"[{metrics.elapsed_seconds:6.1f}s] "
         f"in={metrics.input_frames:>9d}f out={metrics.output_frames:>9d}f "
         f"qin={in_q.qsize():>3d} qout={out_q.qsize():>3d} "
         f"drop(in={metrics.input_queue_drops},out={metrics.output_queue_drops}) "
         f"under={metrics.output_underruns} "
         f"in_pk={metrics.input_peak_dbfs:6.1f}dB out_pk={metrics.output_peak_dbfs:6.1f}dB "
-        f"fb={metrics.fallback_count} nan={metrics.nan_inf_scrub_count} "
-        f"st(in={metrics.input_status_flag_count},out={metrics.output_status_flag_count})"
+        f"nan={metrics.nan_inf_scrub_count} "
+        f"rvc_n={metrics.rvc_chunks_processed} "
+        f"infer(last={metrics.rvc_inference_last_ms:4.0f} "
+        f"mean={metrics.rvc_inference_mean_ms:4.0f} "
+        f"max={metrics.rvc_inference_max_ms:4.0f})ms "
+        f"fb={metrics.rvc_fallback_count} "
+        f"stale={metrics.rvc_stale_chunk_drops} "
+        f"odrop={metrics.rvc_output_blocks_dropped} "
+        f"sola={metrics.rvc_sola_offset_last:+d}",
+        flush=True,
     )
-    if mode_label == "rvc":
-        # Stage 4-C: cumulative input-vs-output frame delta. Positive
-        # means the output queue is behind the input -- expected to grow
-        # slowly with the per-chunk framing deficit; a sudden spike means
-        # the worker stalled and the prebuffer is being eaten.
-        delta = metrics.cumulative_frame_delta
-        min_qo = metrics.min_output_queue_depth_after_steady
-        min_qo_str = "n/a" if min_qo is None else str(min_qo)
-        base += (
-            f" rvc_n={metrics.rvc_chunks_processed} "
-            f"infer_last={metrics.rvc_inference_last_ms:5.0f}ms "
-            f"mean={metrics.rvc_inference_mean_ms:5.0f}ms "
-            f"max={metrics.rvc_inference_max_ms:5.0f}ms "
-            f"rfb={metrics.rvc_fallback_count} "
-            f"stale={metrics.rvc_stale_chunk_drops} "
-            f"enq={metrics.rvc_output_blocks_enqueued} "
-            f"odrop={metrics.rvc_output_blocks_dropped} "
-            f"ob={metrics.rvc_inference_over_budget_count} "
-            f"ne={metrics.output_queue_near_empty_events} "
-            f"minq={min_qo_str} "
-            f"delta={delta:+d}f "
-            f"rs_mean={metrics.rvc_resample_mean_ms:4.1f}ms"
-        )
-    print(base, flush=True)
 
 
 def _print_summary(
-    metrics, input_info: AudioDeviceInfo, output_info: AudioDeviceInfo, mode_label: str
+    metrics, input_info: AudioDeviceInfo, output_info: AudioDeviceInfo
 ) -> None:
     print("\n--- final summary ---")
-    print(f"mode                     = {mode_label}")
     print(f"elapsed_seconds          = {metrics.elapsed_seconds:.2f}")
+    print(f"input_device             = [{input_info.index}] {input_info.name}")
+    print(f"output_device            = [{output_info.index}] {output_info.name}")
     print(f"input_frames             = {metrics.input_frames}")
     print(f"output_frames            = {metrics.output_frames}")
     print(f"input_queue_drops        = {metrics.input_queue_drops}")
     print(f"output_queue_drops       = {metrics.output_queue_drops}")
     print(f"output_underruns         = {metrics.output_underruns}")
-    print(f"fallback_count           = {metrics.fallback_count}")
+    print(f"  startup_underruns      = {metrics.startup_output_underruns}")
+    print(f"  steady_state_underruns = {metrics.steady_state_output_underruns}")
     print(f"nan_inf_scrub_count      = {metrics.nan_inf_scrub_count}")
     print(f"input_status_flag_count  = {metrics.input_status_flag_count}")
     print(f"output_status_flag_count = {metrics.output_status_flag_count}")
-    print(f"input_device             = [{input_info.index}] {input_info.name}")
-    print(f"output_device            = [{output_info.index}] {output_info.name}")
-    if mode_label == "rvc":
-        print(f"rvc_chunks_processed     = {metrics.rvc_chunks_processed}")
-        print(f"rvc_inference_count      = {metrics.rvc_inference_count}")
-        print(f"rvc_inference_mean_ms    = {metrics.rvc_inference_mean_ms:.2f}")
-        print(f"rvc_inference_median_ms  = {metrics.inference_median_ms():.2f}")
-        print(f"rvc_inference_p95_ms     = {metrics.inference_percentile_ms(95.0):.2f}")
-        print(f"rvc_inference_max_ms     = {metrics.rvc_inference_max_ms:.2f}")
-        # Stage 4-C: spike protection counters.
-        print(f"rvc_chunk_ms_budget      = {metrics.rvc_chunk_ms_budget:.2f}")
-        print(f"rvc_inference_over_budget_count = {metrics.rvc_inference_over_budget_count}")
-        print(f"rvc_inference_over_budget_max_consecutive = "
-              f"{metrics.rvc_inference_over_budget_max_consecutive}")
-        print(f"rvc_inference_over_budget_total_ms = "
-              f"{metrics.rvc_inference_over_budget_total_ms:.1f}")
-        print(f"rvc_fallback_count       = {metrics.rvc_fallback_count}")
-        print(f"rvc_stale_chunk_drops    = {metrics.rvc_stale_chunk_drops}")
-        print(f"rvc_output_blocks_enqueued = {metrics.rvc_output_blocks_enqueued}")
-        print(f"rvc_output_blocks_dropped  = {metrics.rvc_output_blocks_dropped}")
-        print(f"rvc_resample_count       = {metrics.rvc_resample_count}")
-        print(f"rvc_resample_mean_ms     = {metrics.rvc_resample_mean_ms:.2f}")
-        print(f"max_input_queue_depth    = {metrics.max_input_queue_depth}")
-        print(f"max_output_queue_depth   = {metrics.max_output_queue_depth}")
-        # Stage 4-C: queue-health + frame-delta accounting.
-        min_qo = metrics.min_output_queue_depth_after_steady
-        print(f"min_output_queue_depth_after_steady = "
-              f"{'n/a (no steady-state samples yet)' if min_qo is None else min_qo}")
-        print(f"output_queue_near_empty_threshold_blocks = "
-              f"{metrics.output_queue_near_empty_threshold_blocks}")
-        print(f"output_queue_near_empty_events = {metrics.output_queue_near_empty_events}")
-        print(f"cumulative_frame_delta   = {metrics.cumulative_frame_delta}")
-        # Stage 4-E2: input-side frame restoration summary.
-        print(f"frame_restore_method     = {metrics.frame_restore_method!r}")
-        print(f"frame_restore_enabled    = {metrics.frame_restore_enabled}")
-        print(f"input_tail_pad_ms        = {metrics.input_tail_pad_ms:.2f}")
-        print(f"input_tail_pad_frames    = {metrics.input_tail_pad_frames}")
-        print(f"frame_restoration_count  = {metrics.frame_restoration_count}")
-        print(f"frame_restoration_shortfall_count = "
-              f"{metrics.frame_restoration_shortfall_count}")
-        print(f"frame_restoration_expected_frames_total = "
-              f"{metrics.frame_restoration_expected_frames_total}")
-        print(f"frame_restoration_actual_frames_total   = "
-              f"{metrics.frame_restoration_actual_frames_total}")
-        print(f"frame_restoration_emitted_frames_total  = "
-              f"{metrics.frame_restoration_emitted_frames_total}")
-        print(f"frame_restoration_trim_start_frames_total = "
-              f"{metrics.frame_restoration_trim_start_frames_total}")
-        print(f"frame_restoration_trim_end_frames_total   = "
-              f"{metrics.frame_restoration_trim_end_frames_total}")
-        print(f"frame_restoration_max_abs_per_chunk_frame_error = "
-              f"{metrics.frame_restoration_max_abs_per_chunk_frame_error}")
-        print(f"output_stretch_used_count = {metrics.output_stretch_used_count}")
-        # Stage 4-E diagnostic: only meaningful under frame_restore_method='stretch'.
-        print(f"timeline_reconcile_count   = {metrics.timeline_reconcile_count}")
-        print(f"timeline_reconciliation_total_frame_error = "
-              f"{metrics.timeline_reconciliation_total_frame_error}")
-        print(f"startup_output_underruns = {metrics.startup_output_underruns}")
-        print(f"steady_state_output_underruns = {metrics.steady_state_output_underruns}")
-        print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")
-        print(f"crossfade_ms             = {metrics.rvc_crossfade_ms}")
-        print(f"model                    = {metrics.rvc_model_basename or '(none)'}")
-        print(f"index                    = {metrics.rvc_index_basename or '(none)'}")
-        print(f"f0_method                = {metrics.rvc_f0_method}")
-        print(f"index_rate               = {metrics.rvc_index_rate}")
-        print(f"protect                  = {metrics.rvc_protect}")
-        print(f"pitch_shift              = {metrics.rvc_pitch_shift}")
+    print(f"rvc_chunks_processed     = {metrics.rvc_chunks_processed}")
+    print(f"rvc_inference_mean_ms    = {metrics.rvc_inference_mean_ms:.1f}")
+    print(f"rvc_inference_max_ms     = {metrics.rvc_inference_max_ms:.1f}")
+    print(f"rvc_chunk_ms_budget      = {metrics.rvc_chunk_ms_budget:.1f}")
+    print(f"rvc_fallback_count       = {metrics.rvc_fallback_count}")
+    print(f"rvc_stale_chunk_drops    = {metrics.rvc_stale_chunk_drops}")
+    print(f"rvc_output_blocks_enqueued = {metrics.rvc_output_blocks_enqueued}")
+    print(f"rvc_output_blocks_dropped  = {metrics.rvc_output_blocks_dropped}")
+    print(f"frame_restoration_shortfall_count = {metrics.frame_restoration_shortfall_count}")
+    print(f"rvc_sola_applied_count   = {metrics.rvc_sola_applied_count}")
+    print(f"rvc_sola_offset_last     = {metrics.rvc_sola_offset_last}")
+    print(f"rvc_resample_mean_ms     = {metrics.rvc_resample_mean_ms:.2f}")
+    print(f"max_input_queue_depth    = {metrics.max_input_queue_depth}")
+    print(f"model                    = {metrics.rvc_model_basename or '(none)'}")
+    print(f"index                    = {metrics.rvc_index_basename or '(none)'}")
+    print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")
 
 
-def _run_stream(
+# ---------------------------------------------------------------------------
+# Queue sizing
+# ---------------------------------------------------------------------------
+
+def queue_blocks_from_ms(
+    queue_ms: float, block_size: int, sample_rate: int, minimum: int = 64
+) -> int:
+    """Convert a queue capacity in ms to a number of blocks (>= minimum)."""
+    if block_size <= 0 or sample_rate <= 0:
+        raise ValueError("block_size and sample_rate must be > 0")
+    if queue_ms <= 0:
+        return int(minimum)
+    block_ms = float(block_size) * 1000.0 / float(sample_rate)
+    n = int(round(float(queue_ms) / block_ms))
+    return max(int(minimum), n)
+
+
+# ---------------------------------------------------------------------------
+# The realtime RVC stream
+# ---------------------------------------------------------------------------
+
+def run_rvc_stream(
     config: AudioRuntimeConfig,
-    worker_factory: Callable,
-    mode_label: str,
-    duration_seconds: Optional[float],
-    allow_virtual_cable_input: bool,
-    metrics_interval_seconds: float,
-    intro_extra: Optional[List[str]] = None,
-    input_queue_capacity: Optional[int] = None,
-    output_queue_capacity: Optional[int] = None,
-    output_prebuffer_blocks: int = 0,
+    engine,
+    chunk_ms: float,
+    duration_seconds: Optional[float] = None,
+    allow_virtual_cable_input: bool = False,
+    metrics_interval_seconds: float = 1.0,
+    rvc_queue_ms: float = 6000.0,
+    rvc_prebuffer_ms: Optional[float] = None,
+    drop_stale_input: bool = True,
+    context_ms: float = 500.0,
+    tail_pad_ms: float = 30.0,
+    sola_search_ms: float = 10.0,
 ) -> RuntimeMetrics:
+    """Open ``system default mic -> RVC worker -> CABLE Input`` and run it.
+
+    The caller owns ``engine`` and must have already called
+    ``engine.load()`` so any dependency/model failure happens before any
+    audio device is opened.
+    """
+    if engine is None:
+        raise ValueError("engine must be provided for run_rvc_stream")
+    if not getattr(engine, "is_loaded", False):
+        raise RuntimeError(
+            "engine.load() must be called before run_rvc_stream (so model "
+            "/ dependency errors fail before any audio device opens)."
+        )
+    if chunk_ms <= 0:
+        raise ValueError("chunk_ms must be > 0")
+    if context_ms < 0:
+        raise ValueError("context_ms must be >= 0")
+    if tail_pad_ms < 0:
+        raise ValueError("tail_pad_ms must be >= 0")
+    if sola_search_ms < 0:
+        raise ValueError("sola_search_ms must be >= 0")
     config.validate()
     if duration_seconds is not None and duration_seconds <= 0:
         raise ValueError("duration_seconds must be > 0 or None for unbounded")
@@ -302,70 +290,101 @@ def _run_stream(
         ) from exc
 
     raw_devices = list(sd.query_devices())
-    input_info = resolve_input_device(
-        raw_devices,
-        config.input_device_substring,
-        allow_virtual_cable=allow_virtual_cable_input,
+    if config.input_device_substring:
+        input_info = resolve_input_device(
+            raw_devices,
+            config.input_device_substring,
+            allow_virtual_cable=allow_virtual_cable_input,
+        )
+        input_source = f"substring {config.input_device_substring!r}"
+    else:
+        try:
+            default_in = int(sd.default.device[0])
+        except (TypeError, ValueError, IndexError):
+            default_in = -1
+        input_info = select_default_input_device(raw_devices, default_in)
+        input_source = "system default"
+    output_info = resolve_output_device(raw_devices, config.output_device_substring)
+
+    chunk_size = max(1, int(round(chunk_ms / 1000.0 * config.sample_rate)))
+    context_size = max(0, int(round(context_ms / 1000.0 * config.sample_rate)))
+    tail_pad_size = max(0, int(round(tail_pad_ms / 1000.0 * config.sample_rate)))
+    # SOLA: search window (± shift) and the link signature length (2x the
+    # search, for a robust correlation). 0 disables seam alignment.
+    sola_search_size = max(0, int(round(sola_search_ms / 1000.0 * config.sample_rate)))
+    sola_link_size = 2 * sola_search_size
+
+    rvc_queue_blocks = queue_blocks_from_ms(
+        float(rvc_queue_ms), config.block_size, config.sample_rate,
+        minimum=config.queue_blocks,
     )
-    output_info = resolve_output_device(
-        raw_devices, config.output_device_substring
+    # Prebuffer: silence inserted into the output queue before the first
+    # real chunk lands. Hides first-chunk inference + absorbs an inference
+    # spike, at the cost of that much added latency. Quality-first default
+    # = 3 x chunk_ms.
+    prebuffer_ms = (
+        float(rvc_prebuffer_ms)
+        if rvc_prebuffer_ms is not None
+        else float(chunk_ms) * 3.0
+    )
+    prebuffer_blocks = max(
+        0, int(round(prebuffer_ms * config.sample_rate / 1000.0 / config.block_size))
+    )
+
+    import os
+    model_basename = os.path.basename(engine.config.model_path or "")
+    index_basename = (
+        os.path.basename(engine.config.index_path) if engine.config.index_path else ""
     )
 
     print(
-        f"input device  [{input_info.index:>3}]: {input_info.name}\n"
+        f"input device  [{input_info.index:>3}] ({input_source}): {input_info.name}\n"
         f"output device [{output_info.index:>3}]: {output_info.name}\n"
         f"sample_rate={config.sample_rate} block_size={config.block_size} "
-        f"channels={config.channels} queue_blocks={config.queue_blocks} "
-        f"mode={mode_label}"
+        f"channels={config.channels}\n"
+        f"chunk_ms={chunk_ms:.0f} ({chunk_size} samples)  "
+        f"context_ms={context_ms:.0f} ({context_size})  "
+        f"tail_pad_ms={tail_pad_ms:.0f} ({tail_pad_size})\n"
+        f"sola_search_ms={sola_search_ms:.0f} ({sola_search_size} samples"
+        f"{', OFF' if sola_search_size == 0 else ''}) -- seam alignment, no blend\n"
+        f"model={model_basename or '(none)'}  index={index_basename or '(none)'}  "
+        f"backend={engine.backend_name}  device={engine.resolved_device or '(unknown)'}"
+        + (f" / {engine.cuda_device_name}" if engine.cuda_device_name else "")
+        + f"\nqueue={rvc_queue_blocks} blocks (~{rvc_queue_ms:.0f} ms)  "
+        f"prebuffer={prebuffer_blocks} blocks (~{prebuffer_ms:.0f} ms)  "
+        f"drop_stale_input={drop_stale_input}\n"
+        "faithful-carrier: model defines the voice; runtime only resamples "
+        "to the stream SR, slices exactly, and scrubs NaN. No pitch/stretch/"
+        "crossfade/EQ. Identity fallback only on backend error."
     )
-    if intro_extra:
-        for line in intro_extra:
-            print(line)
     if allow_virtual_cable_input:
         print(
-            "WARNING: --allow-virtual-cable-input is ON. Diagnostic mode "
-            "only. Verify there is no feedback loop with Discord/OBS."
+            "WARNING: --allow-virtual-cable-input is ON (diagnostic). Verify "
+            "there is no feedback loop with Discord/OBS."
         )
 
-    in_cap = int(input_queue_capacity or config.queue_blocks)
-    out_cap = int(output_queue_capacity or config.queue_blocks)
-    in_q: "queue.Queue" = queue.Queue(maxsize=in_cap)
-    out_q: "queue.Queue" = queue.Queue(maxsize=out_cap)
+    in_q: "queue.Queue" = queue.Queue(maxsize=rvc_queue_blocks)
+    out_q: "queue.Queue" = queue.Queue(maxsize=rvc_queue_blocks)
     metrics = RuntimeMetrics()
     stop_event = threading.Event()
 
-    # Stage 4-C: output-queue near-empty threshold = 50 ms of buffered
-    # audio. Anything at or below this depth is reported as a near-empty
-    # event (edge-triggered) and pulls down min_output_queue_depth.
-    near_empty_threshold_blocks = max(
-        1,
-        int(round(50.0 * config.sample_rate / 1000.0 / config.block_size)),
-    )
+    # Seed session metadata so the summary is populated even on a short run.
+    metrics.rvc_chunk_ms = float(chunk_ms)
+    metrics.rvc_model_basename = model_basename
+    metrics.rvc_index_basename = index_basename
 
-    in_q_ms = in_cap * config.block_size * 1000.0 / max(1, config.sample_rate)
-    out_q_ms = out_cap * config.block_size * 1000.0 / max(1, config.sample_rate)
-    print(
-        f"queues: input {in_cap} blocks (~{in_q_ms:.0f} ms)  "
-        f"output {out_cap} blocks (~{out_q_ms:.0f} ms)"
-    )
-
-    # Optional silence prebuffer for the output stream so the first ~N
-    # output blocks have something to play while the worker spins up
-    # / finishes its first chunk's inference. Audible as "extra
-    # latency" but masks startup underruns.
-    if output_prebuffer_blocks > 0:
-        silence_block = np.zeros(config.block_size, dtype=np.float32)
-        actually_buffered = 0
-        for _ in range(output_prebuffer_blocks):
+    if prebuffer_blocks > 0:
+        silence = np.zeros(config.block_size, dtype=np.float32)
+        buffered = 0
+        for _ in range(prebuffer_blocks):
             try:
-                out_q.put_nowait(silence_block.copy())
-                actually_buffered += 1
+                out_q.put_nowait(silence.copy())
+                buffered += 1
             except queue.Full:
                 break
-        pre_ms = actually_buffered * config.block_size * 1000.0 / max(1, config.sample_rate)
         print(
-            f"prebuffered {actually_buffered} silence blocks "
-            f"(~{pre_ms:.0f} ms of safety margin before first real audio)"
+            f"prebuffered {buffered} silence blocks "
+            f"(~{buffered * config.block_size * 1000.0 / config.sample_rate:.0f} ms)"
         )
 
     def in_callback(indata, frames, time_info, status):  # noqa: ANN001
@@ -388,17 +407,13 @@ def _run_stream(
         except queue.Empty:
             outdata.fill(0.0)
             metrics.output_underruns += 1
-            # Bin into startup vs steady-state by checking whether the
-            # worker has yet emitted any real audio.
             if metrics.first_real_output_seen:
                 metrics.steady_state_output_underruns += 1
             else:
                 metrics.startup_output_underruns += 1
-            metrics.output_peak_dbfs = dbfs_peak(np.zeros(frames, dtype=np.float32))
-            metrics.output_rms_dbfs = dbfs_rms(np.zeros(frames, dtype=np.float32))
+            metrics.output_peak_dbfs = dbfs_peak(np.zeros(1, dtype=np.float32))
             metrics.output_frames += int(frames)
             return
-
         n = min(int(block.shape[0]), int(frames))
         outdata[:n, 0] = block[:n]
         if n < frames:
@@ -407,7 +422,24 @@ def _run_stream(
         metrics.output_rms_dbfs = dbfs_rms(block[:n])
         metrics.output_frames += int(frames)
 
-    worker_thread = worker_factory(in_q, out_q, metrics, stop_event, _SHUTDOWN_SENTINEL)
+    from ..engine.worker import rvc_worker_loop
+    worker_thread = threading.Thread(
+        target=rvc_worker_loop,
+        args=(engine, in_q, out_q, metrics, stop_event, _SHUTDOWN_SENTINEL),
+        kwargs={
+            "sample_rate": int(config.sample_rate),
+            "chunk_size": int(chunk_size),
+            "output_block_size": int(config.block_size),
+            "context_size": int(context_size),
+            "tail_pad_size": int(tail_pad_size),
+            "sola_search_size": int(sola_search_size),
+            "sola_link_size": int(sola_link_size),
+            "drop_stale_input": bool(drop_stale_input),
+        },
+        name="rvc-worker",
+        daemon=True,
+    )
+    worker_thread.start()
 
     common = dict(
         samplerate=config.sample_rate,
@@ -429,24 +461,16 @@ def _run_stream(
             while True:
                 now = time.monotonic()
                 metrics.elapsed_seconds = now - start_wall
-                # Track high-water marks of queue depths.
                 qi = in_q.qsize()
-                qo = out_q.qsize()
                 if qi > metrics.max_input_queue_depth:
                     metrics.max_input_queue_depth = qi
+                qo = out_q.qsize()
                 if qo > metrics.max_output_queue_depth:
                     metrics.max_output_queue_depth = qo
-                # Stage 4-C: also feed qo into the steady-state
-                # min/near-empty tracker. record_output_queue_depth no-
-                # ops until first_real_output_seen=True, so the prebuffer
-                # drain doesn't count.
-                metrics.record_output_queue_depth(
-                    qo, near_empty_threshold_blocks=near_empty_threshold_blocks
-                )
                 if duration_seconds is not None and metrics.elapsed_seconds >= duration_seconds:
                     break
                 if now - last_print >= metrics_interval_seconds:
-                    _print_metrics_line(metrics, in_q, out_q, mode_label)
+                    _print_metrics_line(metrics, in_q, out_q)
                     last_print = now
                 time.sleep(0.05)
     except KeyboardInterrupt:
@@ -460,220 +484,7 @@ def _run_stream(
             pass
         worker_thread.join(timeout=2.0)
         metrics.elapsed_seconds = time.monotonic() - start_wall
-        _print_metrics_line(metrics, in_q, out_q, mode_label)
-        _print_summary(metrics, input_info, output_info, mode_label)
+        _print_metrics_line(metrics, in_q, out_q)
+        _print_summary(metrics, input_info, output_info)
 
     return metrics
-
-
-# ---------------------------------------------------------------------------
-# Public entry points
-# ---------------------------------------------------------------------------
-
-def run_identity_stream(
-    config: AudioRuntimeConfig,
-    duration_seconds: Optional[float] = None,
-    allow_virtual_cable_input: bool = False,
-    metrics_interval_seconds: float = 1.0,
-) -> RuntimeMetrics:
-    """Open the realtime identity audio loop and run it."""
-
-    def factory(in_q, out_q, metrics, stop_event, sentinel):
-        from ..engine.worker import WorkerConfig, WorkerMode, worker_loop
-        wc = WorkerConfig(mode=WorkerMode.IDENTITY)
-        t = threading.Thread(
-            target=worker_loop,
-            args=(wc, in_q, out_q, metrics, stop_event, sentinel),
-            name="identity-worker",
-            daemon=True,
-        )
-        t.start()
-        return t
-
-    return _run_stream(
-        config, factory, "identity",
-        duration_seconds, allow_virtual_cable_input, metrics_interval_seconds,
-    )
-
-
-def queue_blocks_from_ms(
-    queue_ms: float, block_size: int, sample_rate: int, minimum: int = 64
-) -> int:
-    """Convert a queue capacity in ms to a number of blocks.
-
-    Caps to at least ``minimum`` blocks so identity-era defaults still
-    work even with very small ``queue_ms`` values.
-    """
-    if block_size <= 0 or sample_rate <= 0:
-        raise ValueError("block_size and sample_rate must be > 0")
-    if queue_ms <= 0:
-        return int(minimum)
-    block_ms = float(block_size) * 1000.0 / float(sample_rate)
-    n = int(round(float(queue_ms) / block_ms))
-    return max(int(minimum), n)
-
-
-def run_rvc_stream(
-    config: AudioRuntimeConfig,
-    engine,
-    chunk_ms: float,
-    crossfade_ms: float = 0.0,
-    duration_seconds: Optional[float] = None,
-    allow_virtual_cable_input: bool = False,
-    metrics_interval_seconds: float = 1.0,
-    rvc_queue_ms: float = 6000.0,
-    rvc_prebuffer_ms: Optional[float] = None,
-    drop_stale_input: bool = True,
-    context_ms: float = 0.0,
-    frame_restore_method: str = "lookahead",
-    tail_pad_ms: float = 30.0,
-) -> RuntimeMetrics:
-    """Open the realtime RVC chunk loop and run it.
-
-    The caller owns ``engine`` and must have already called
-    ``engine.load()`` (so that any DependencyMissing / ModelLoad
-    failure happens *before* we touch any audio device).
-    """
-    if engine is None:
-        raise ValueError("engine must be provided for run_rvc_stream")
-    if not getattr(engine, "is_loaded", False):
-        raise RuntimeError(
-            "engine.load() must be called before run_rvc_stream (so model "
-            "/ dependency errors fail before any audio device opens)."
-        )
-    if chunk_ms <= 0:
-        raise ValueError("chunk_ms must be > 0")
-    if crossfade_ms < 0:
-        raise ValueError("crossfade_ms must be >= 0")
-    if context_ms < 0:
-        raise ValueError("context_ms must be >= 0")
-    if tail_pad_ms < 0:
-        raise ValueError("tail_pad_ms must be >= 0")
-    if frame_restore_method not in ("lookahead", "silence", "stretch", "off"):
-        raise ValueError(
-            f"frame_restore_method must be one of "
-            f"'lookahead', 'silence', 'stretch', 'off'; "
-            f"got {frame_restore_method!r}"
-        )
-
-    chunk_size = max(1, int(round(chunk_ms / 1000.0 * config.sample_rate)))
-    crossfade_size = max(0, int(round(crossfade_ms / 1000.0 * config.sample_rate)))
-    context_size = max(0, int(round(context_ms / 1000.0 * config.sample_rate)))
-    tail_pad_size = max(0, int(round(tail_pad_ms / 1000.0 * config.sample_rate)))
-    output_block_size = int(config.block_size)
-
-    # RVC mode needs much larger queues than identity. The identity-era
-    # default of 64 blocks (~640 ms at 48 kHz / 480-frame blocks) is too
-    # small to hold a single ~1 s chunk's worth of output blocks, so
-    # post-inference audio gets discarded.
-    rvc_queue_blocks = queue_blocks_from_ms(
-        float(rvc_queue_ms), config.block_size, config.sample_rate,
-        minimum=config.queue_blocks,
-    )
-    # Prebuffer: silence blocks placed in out_q before opening the audio
-    # stream. Hides the first-chunk inference time at the cost of that
-    # much added latency. Stage 4-C default = 5 × chunk_ms (quality-first):
-    # absorbs (a) the per-chunk framing deficit that drains the queue over
-    # time and (b) a single inference outlier up to ~2 × chunk_ms before
-    # the queue runs dry. The Stage 4-B failure (1713 ms inference spike
-    # at t=47s with 3000 ms prebuffer -> 167 underruns) is the empirical
-    # justification. Override via --rvc-prebuffer-ms for latency tradeoffs.
-    prebuffer_ms = (
-        float(rvc_prebuffer_ms)
-        if rvc_prebuffer_ms is not None
-        else float(chunk_ms) * 5.0
-    )
-    prebuffer_blocks = max(
-        0, int(round(prebuffer_ms * config.sample_rate / 1000.0 / config.block_size))
-    )
-
-    model_basename = os.path.basename(engine.config.model_path or "")
-    index_basename = (
-        os.path.basename(engine.config.index_path) if engine.config.index_path else ""
-    )
-
-    intro_extra = [
-        f"chunk_ms={chunk_ms:.1f} ({chunk_size} samples)  "
-        f"crossfade_ms={crossfade_ms:.1f} ({crossfade_size} samples)",
-        f"model={model_basename or '(none)'}  "
-        f"index={index_basename or '(none)'}  "
-        f"backend={engine.backend_name}  "
-        f"device={engine.resolved_device or '(unknown)'}"
-        + (f" / {engine.cuda_device_name}" if engine.cuda_device_name else ""),
-        f"resample_sr={engine.config.resample_sr}  "
-        f"stream_sr={config.sample_rate}  "
-        "(SR mismatch -> worker resample_audio, sinc-polyphase if scipy)",
-        f"rvc_queue_blocks={rvc_queue_blocks}  "
-        f"rvc_prebuffer_blocks={prebuffer_blocks}  "
-        f"drop_stale_input={drop_stale_input}",
-        f"context_ms={context_ms:.1f} ({context_size} samples) "
-        f"-- input-left-context fed to model as warm-up",
-        f"frame_restore_method={frame_restore_method}  "
-        f"tail_pad_ms={tail_pad_ms:.1f} ({tail_pad_size} samples) -- Stage 4-E2: "
-        f"the model loses exactly one ~20 ms HuBERT frame at the TAIL of every "
-        f"chunk. lookahead (default) / silence feed [context][chunk][tail_pad] "
-        f"so the lost frame lands in the pad, then emit the exact slice "
-        f"[context:context+chunk] -- NO stretch, NO pitch shift. lookahead uses "
-        f"the next chunk's real audio as the tail (most faithful, +tail_pad_ms "
-        f"latency); silence pads zeros. stretch = Stage 4-E output-side polyphase "
-        f"(~34 cents flat, diagnostic); off = Stage 4-D drain-prone (diagnostic).",
-        f"f0_method={engine.config.f0_method}  "
-        f"index_rate={engine.config.index_rate}  "
-        f"protect={engine.config.protect}  "
-        f"pitch_shift={engine.config.pitch_shift}  "
-        f"filter_radius={engine.config.filter_radius}  "
-        f"rms_mix_rate={engine.config.rms_mix_rate}",
-        "model-faithful posture: no post-model EQ / limiter / normalize. "
-        "Identity fallback only on hard backend error. "
-        "Per-chunk inference = the structural quality ceiling vs offline "
-        "whole-file (no input-overlap; deferred).",
-    ]
-    if crossfade_size == 0:
-        intro_extra.append(
-            "NOTE: stitched crossfade is OFF (model-faithful default). "
-            "The OUTPUT timeline is therefore not shifted; chunk boundaries "
-            "may produce occasional clicks on plosive onsets. Set "
-            "--crossfade-ms >0 only to reproduce legacy stitched-blend "
-            "behaviour."
-        )
-
-    def factory(in_q, out_q, metrics, stop_event, sentinel):
-        from ..engine.worker import rvc_worker_loop
-        # Seed session metadata into metrics so the summary has it even
-        # if the run is short.
-        metrics.rvc_chunk_ms = float(chunk_ms)
-        metrics.rvc_crossfade_ms = float(crossfade_ms)
-        metrics.rvc_model_basename = model_basename
-        metrics.rvc_index_basename = index_basename
-        metrics.rvc_f0_method = engine.config.f0_method
-        metrics.rvc_index_rate = float(engine.config.index_rate)
-        metrics.rvc_protect = float(engine.config.protect)
-        metrics.rvc_pitch_shift = int(engine.config.pitch_shift)
-
-        t = threading.Thread(
-            target=rvc_worker_loop,
-            args=(engine, in_q, out_q, metrics, stop_event, sentinel),
-            kwargs={
-                "sample_rate": int(config.sample_rate),
-                "chunk_size": int(chunk_size),
-                "output_block_size": int(output_block_size),
-                "crossfade_size": int(crossfade_size),
-                "drop_stale_input": bool(drop_stale_input),
-                "context_size": int(context_size),
-                "frame_restore_method": str(frame_restore_method),
-                "tail_pad_size": int(tail_pad_size),
-            },
-            name="rvc-worker",
-            daemon=True,
-        )
-        t.start()
-        return t
-
-    return _run_stream(
-        config, factory, "rvc",
-        duration_seconds, allow_virtual_cable_input, metrics_interval_seconds,
-        intro_extra=intro_extra,
-        input_queue_capacity=rvc_queue_blocks,
-        output_queue_capacity=rvc_queue_blocks,
-        output_prebuffer_blocks=prebuffer_blocks,
-    )

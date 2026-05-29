@@ -2,16 +2,11 @@
   "sample_rate": 48000,
   "block_size": 480,
   "channels": 1,
-  "input_device_substring": "Microphone",
+  "input_device_substring": null,
   "output_device_substring": "CABLE Input",
   "queue_blocks": 64,
-  "mode": "identity",
-  "safety": {
-    "limiter_enabled": true,
-    "limiter_ceiling_dbfs": -1.0
-  },
-  "rvc": {
-    "enabled": false,
-    "note": "Stage 2 placeholder. RVC inference is not implemented in this skeleton."
+  "_notes": {
+    "input_device_substring": "null = follow the Windows default recording device (系统默认 mic). Set a name fragment (e.g. \"Realtek\") to pin a specific mic, or override at runtime with --input-device.",
+    "output_device_substring": "Must be the VB-CABLE render endpoint 'CABLE Input'. Downstream apps (Discord/OBS/recorder) select 'CABLE Output' as their microphone."
   }
 }
