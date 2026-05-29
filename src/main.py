@@ -102,9 +102,14 @@ def _build_parser() -> argparse.ArgumentParser:
     eng.add_argument("--device", default="auto",
                      choices=["auto", "cpu", "cuda"],
                      help="Inference device. 'auto' = cuda if available else cpu.")
-    eng.add_argument("--chunk-ms", type=float, default=1000.0,
+    eng.add_argument("--chunk-ms", type=float, default=500.0,
                      help="RVC chunk size in ms (accumulation latency). "
-                          "Default 1000.")
+                          "Default 500 — the conservative low-latency setting "
+                          "(steady-state underruns ~0 on an RTX 4080). Do NOT go "
+                          "below ~400: worst-case inference is a fixed ~350 ms "
+                          "(constant reflect-pad, not chunk-scaled), so a smaller "
+                          "budget risks dropouts. Larger = more model context, "
+                          "more latency.")
     eng.add_argument("--rvc-context-ms", type=float, default=500.0,
                      help="Input-side left-context fed to the model as warm-up, "
                           "then sliced away. Continuity only; no voice change. "
@@ -124,8 +129,11 @@ def _build_parser() -> argparse.ArgumentParser:
     eng.add_argument("--rvc-queue-ms", type=float, default=6000.0,
                      help="Per-direction queue capacity in ms.")
     eng.add_argument("--rvc-prebuffer-ms", type=float, default=None,
-                     help="Output silence prebuffer before first real audio. "
-                          "Default: 3 x chunk_ms.")
+                     help="Output silence prebuffer before first real audio = the "
+                          "standing output latency. Default: 800 ms (an absolute "
+                          "cushion sized to cover one ~350 ms inference spike plus "
+                          "one chunk's output burst; decoupled from chunk_ms on "
+                          "purpose). Lower = less latency but more underruns.")
     eng.add_argument("--warmup-rvc-count", type=int, default=2,
                      help="Dummy inferences before opening the stream (hides "
                           "the cold-start stall). 0 to disable.")

@@ -318,14 +318,18 @@ def run_rvc_stream(
         float(rvc_queue_ms), config.block_size, config.sample_rate,
         minimum=config.queue_blocks,
     )
-    # Prebuffer: silence inserted into the output queue before the first
-    # real chunk lands. Hides first-chunk inference + absorbs an inference
-    # spike, at the cost of that much added latency. Quality-first default
-    # = 3 x chunk_ms.
+    # Prebuffer: silence inserted into the output queue before the first real
+    # chunk lands. It is the standing output latency, and it must cover one
+    # output burst (~chunk_ms of blocks emitted at once after each inference)
+    # plus one ~350 ms inference spike, or the queue underruns between bursts.
+    # The cushion tracks the (roughly constant) inference spike, NOT chunk size,
+    # so the default is an absolute 800 ms — decoupled from chunk_ms. (The old
+    # 3 x chunk_ms coupling made a 1 s chunk cost a needless 3 s of standing
+    # silence; that was the dominant term in the historic ~2 s latency.)
     prebuffer_ms = (
         float(rvc_prebuffer_ms)
         if rvc_prebuffer_ms is not None
-        else float(chunk_ms) * 3.0
+        else 800.0
     )
     prebuffer_blocks = max(
         0, int(round(prebuffer_ms * config.sample_rate / 1000.0 / config.block_size))
