@@ -31,7 +31,11 @@ no gain shaping** anywhere in the runtime. To get a different voice, train or
 load a different model. Voice-identity parameters (`f0_method`, `index_rate`,
 `protect`, `filter_radius`, `rms_mix_rate`, `pitch_shift`) live in the model
 profile — they are properties of the trained model, not user knobs, and the
-CLI has no flags to override them.
+CLI has no flags to override them. One of them, `rms_mix_rate`, is special:
+it must stay at **1.0** to be faithful. Below 1.0 the backend's `change_rms`
+imposes the *source mic's* loudness envelope onto the model output — runtime
+gain shaping that breaks the contract — so 1.0 (the model's own loudness) is
+the only contract-compliant value.
 
 ## Quick start (PowerShell)
 
@@ -85,7 +89,7 @@ Voice identity is a JSON file under `config/model_profiles/`
   "hubert_path": "models/kiki/hubert_base.pt",
   "rmvpe_path":  "models/kiki/rmvpe.pt",
   "f0_method": "rmvpe", "index_rate": 0.5, "protect": 0.33,
-  "filter_radius": 3, "rms_mix_rate": 0.25, "pitch_shift": 0, "resample_sr": 0
+  "filter_radius": 3, "rms_mix_rate": 1.0, "pitch_shift": 0, "resample_sr": 0
 }
 ```
 

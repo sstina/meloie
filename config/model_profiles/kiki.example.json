@@ -8,8 +8,8 @@
   "index_rate": 0.5,
   "protect": 0.33,
   "filter_radius": 3,
-  "rms_mix_rate": 0.25,
+  "rms_mix_rate": 1.0,
   "pitch_shift": 0,
   "resample_sr": 0,
-  "notes": "Example profile for the 'kiki' trained model. These values are the model's intended inference settings, not sound-design knobs. Do not change them to 'tune the voice'; train a different model instead. Paths are relative to the project root (the directory you run python -m from)."
+  "notes": "Example profile for the 'kiki' trained model. These values are the model's intended inference settings, not sound-design knobs. Do not change them to 'tune the voice'; train a different model instead. rms_mix_rate is kept at 1.0 (model's own loudness); lowering it imposes the source mic's loudness envelope on the output (change_rms), which is runtime gain shaping and breaks the faithful-carrier contract. Paths are relative to the project root (the directory you run python -m from)."
 }

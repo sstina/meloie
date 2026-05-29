@@ -24,7 +24,7 @@ Schema (all fields optional except ``model_path``)::
       "index_rate":  0.5,
       "protect":     0.33,
       "filter_radius": 3,
-      "rms_mix_rate":  0.25,
+      "rms_mix_rate":  1.0,
       "pitch_shift":   0,
       "resample_sr":   0,
       "notes":         "Example profile. Do not tune these knobs to "
@@ -58,7 +58,10 @@ class ModelProfile:
     index_rate: float = 0.5
     protect: float = 0.33
     filter_radius: int = 3
-    rms_mix_rate: float = 0.25
+    # 1.0 = faithful: keep the model's own loudness envelope. Values < 1.0
+    # impose the SOURCE mic's loudness onto the output (change_rms), which is
+    # runtime gain shaping and breaks the faithful-carrier contract.
+    rms_mix_rate: float = 1.0
     pitch_shift: int = 0
     resample_sr: int = 0
     notes: str = ""

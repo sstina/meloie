@@ -273,7 +273,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         index_rate=pick("index_rate", 0.5),
         protect=pick("protect", 0.33),
         filter_radius=pick("filter_radius", 3),
-        rms_mix_rate=pick("rms_mix_rate", 0.25),
+        rms_mix_rate=pick("rms_mix_rate", 1.0),
         pitch_shift=pick("pitch_shift", 0),
         sample_rate=config.sample_rate,
         resample_sr=resample_sr,

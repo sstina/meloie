@@ -90,7 +90,7 @@ _OFFLINE_VOICE_FIELDS = (
     ("index_rate",  "index_rate",  0.5),
     ("protect",     "protect",     0.33),
     ("filter_radius", "filter_radius", 3),
-    ("rms_mix_rate",  "rms_mix_rate",  0.25),
+    ("rms_mix_rate",  "rms_mix_rate",  1.0),
     ("pitch_shift",   "pitch_shift",   0),
 )
 

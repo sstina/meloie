@@ -31,7 +31,7 @@ documented public API:
     converter.apply_conf(
         tag=..., file_model=..., pitch_algo="rmvpe", pitch_lvl=0,
         file_index=..., index_influence=0.5, respiration_median_filtering=3,
-        resample_sr=0, envelope_ratio=0.25, consonant_protection=0.33,
+        resample_sr=0, envelope_ratio=1.0, consonant_protection=0.33,
     )
     result_audio, result_sr = converter.generate_from_cache(
         audio_data=(audio_array, sample_rate), tag=...,
@@ -88,7 +88,11 @@ class RvcEngineConfig:
     index_rate: float = 0.5
     protect: float = 0.33
     filter_radius: int = 3
-    rms_mix_rate: float = 0.25
+    # 1.0 = keep the model's OWN loudness envelope (faithful-carrier).
+    # < 1.0 makes the backend's change_rms impose the SOURCE mic's loudness
+    # envelope onto the model output — that is runtime gain/RMS shaping and
+    # violates the faithful-carrier contract, so the default is 1.0.
+    rms_mix_rate: float = 1.0
     pitch_shift: int = 0
     sample_rate: Optional[int] = None      # informational; backend decides
     resample_sr: int = 0                   # 0 = backend's natural SR; non-zero = ask backend to resample

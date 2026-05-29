@@ -36,7 +36,7 @@ def test_config_defaults_validate():
     assert cfg.index_rate == pytest.approx(0.5)
     assert cfg.protect == pytest.approx(0.33)
     assert cfg.filter_radius == 3
-    assert cfg.rms_mix_rate == pytest.approx(0.25)
+    assert cfg.rms_mix_rate == pytest.approx(1.0)
     assert cfg.pitch_shift == 0
     assert cfg.device == "auto"
     assert cfg.resample_sr == 0
