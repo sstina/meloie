@@ -360,6 +360,65 @@ def test_runtime_metrics_dict_includes_new_stage4e_timeline_fields():
     assert decoded["timeline_reconcile_count"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Stage 4-E2: input-side frame restoration recording
+# ---------------------------------------------------------------------------
+
+def test_record_frame_restore_accumulates_totals():
+    m = RuntimeMetrics()
+    # 3 chunks: emit target 4800, render 4896 (= chunk + tail 192 - deficit 96),
+    # trim_start 0 (no context), trim_end 96 surplus, no shortfall.
+    for _ in range(3):
+        m.record_frame_restore(
+            expected=4800, actual_before_trim=4896, emitted=4800,
+            trim_start=0, trim_end=96, shortfall_frames=0,
+        )
+    assert m.frame_restoration_count == 3
+    assert m.frame_restoration_expected_frames_total == 3 * 4800
+    assert m.frame_restoration_actual_frames_total == 3 * 4896
+    assert m.frame_restoration_emitted_frames_total == 3 * 4800
+    assert m.frame_restoration_trim_start_frames_total == 0
+    assert m.frame_restoration_trim_end_frames_total == 3 * 96
+    assert m.frame_restoration_shortfall_count == 0
+    # |actual - expected| per chunk = 96.
+    assert m.frame_restoration_max_abs_per_chunk_frame_error == 96
+
+
+def test_record_frame_restore_counts_shortfall():
+    m = RuntimeMetrics()
+    # Healthy chunk, then a chunk where the model render was too short and
+    # the slice had to be zero-padded (shortfall > 0).
+    m.record_frame_restore(4800, 4896, 4800, 0, 96, 0)
+    m.record_frame_restore(4800, 4700, 4800, 0, 0, 100)
+    assert m.frame_restoration_count == 2
+    assert m.frame_restoration_shortfall_count == 1
+
+
+def test_runtime_metrics_dict_includes_frame_restore_fields():
+    """Sidecar JSON consumers depend on the dataclass shape."""
+    m = RuntimeMetrics()
+    m.record_frame_restore(4800, 4896, 4800, 0, 96, 0)
+    d = m.to_dict()
+    for k in (
+        "frame_restore_method",
+        "frame_restore_enabled",
+        "input_tail_pad_ms",
+        "input_tail_pad_frames",
+        "frame_restoration_count",
+        "frame_restoration_shortfall_count",
+        "frame_restoration_expected_frames_total",
+        "frame_restoration_actual_frames_total",
+        "frame_restoration_emitted_frames_total",
+        "frame_restoration_trim_start_frames_total",
+        "frame_restoration_trim_end_frames_total",
+        "frame_restoration_max_abs_per_chunk_frame_error",
+        "output_stretch_used_count",
+    ):
+        assert k in d, f"missing {k}"
+    decoded = json.loads(json.dumps(d))
+    assert decoded["frame_restoration_count"] == 1
+
+
 def test_runtime_metrics_dict_includes_new_stage4c_fields_and_is_json_safe():
     """Sidecar JSON consumers depend on the dataclass shape; make sure
     the new Stage 4-C fields are present, JSON-encodable (None ->

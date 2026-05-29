@@ -96,14 +96,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         "before inference. Output trimmed proportionally "
                         "to preserve chunk duration exactly. Default 200; "
                         "set 0 to disable for A/B against Stage 2G.")
-    p.add_argument("--reconcile-timeline-method", default="polyphase",
-                   choices=["polyphase", "linear", "pad_zero", "off"],
-                   help="Stage 4-E timeline reconciliation. polyphase "
-                        "(default) stretches each chunk's output to the "
-                        "exact chunk-input-duration sample count so the "
-                        "live runtime does not slowly drain its output "
-                        "queue. 'off' reproduces the Stage 4-D legacy "
-                        "behavior for A/B fidelity testing.")
+    p.add_argument("--frame-restore-method", default="lookahead",
+                   choices=["lookahead", "silence", "stretch", "off"],
+                   help="Stage 4-E2 frame restoration (mirrors the realtime "
+                        "worker). lookahead (default): feed "
+                        "[context][chunk][tail_pad] where the tail is the next "
+                        "chunk's real audio, then take the exact slice "
+                        "[context:context+chunk] -- no stretch, no pitch shift. "
+                        "silence: tail pad = zeros. stretch: Stage 4-E output-"
+                        "side polyphase stretch. off: Stage 4-D verbatim "
+                        "(drain-prone). Use for offline A/B fidelity testing.")
+    p.add_argument("--tail-pad-ms", type=float, default=30.0,
+                   help="Input tail pad in ms for lookahead/silence "
+                        "(default 30; the model's tail loss is ~20 ms).")
     p.add_argument("--resampler", default="polyphase",
                    choices=["polyphase", "linear", "torchaudio"],
                    help="Resampler used between engine native SR and "
@@ -293,14 +298,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"cuda={engine.cuda_device_name or '(n/a)'}  resample_sr={cfg.resample_sr}"
     )
 
-    from src.audio.chunker import reconcile_to_length
+    from src.audio.chunker import reconcile_to_length, trim_to_region
     chunk_size = max(1, int(round(args.chunk_ms / 1000.0 * stream_sr)))
     crossfade_size = max(0, int(round(args.crossfade_ms / 1000.0 * stream_sr)))
     context_size = max(0, int(round(args.context_ms / 1000.0 * stream_sr)))
+    tail_pad_size = max(0, int(round(args.tail_pad_ms / 1000.0 * stream_sr)))
+    input_side = args.frame_restore_method in ("lookahead", "silence")
     print(
         f"chunk_size={chunk_size} samples ({args.chunk_ms:.1f} ms @ {stream_sr} Hz)  "
         f"crossfade_size={crossfade_size} samples  "
         f"context_size={context_size} samples ({args.context_ms:.1f} ms)  "
+        f"frame_restore_method={args.frame_restore_method} "
+        f"tail_pad_size={tail_pad_size} samples  "
         f"resampler={args.resampler}"
     )
 
@@ -337,10 +346,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     for i, chunk in enumerate(chunks):
+        parts = []
         if context_buffer is not None and context_size > 0:
-            input_to_model = np.concatenate([context_buffer, chunk])
-        else:
-            input_to_model = chunk
+            parts.append(context_buffer)
+        parts.append(chunk)
+        if input_side and tail_pad_size > 0:
+            if args.frame_restore_method == "lookahead":
+                nxt = chunks[i + 1] if i + 1 < len(chunks) else None
+                tail = (
+                    nxt[:tail_pad_size].astype(np.float32, copy=True)
+                    if nxt is not None
+                    else np.zeros(tail_pad_size, dtype=np.float32)
+                )
+            else:  # silence
+                tail = np.zeros(tail_pad_size, dtype=np.float32)
+            parts.append(tail)
+        input_to_model = parts[0] if len(parts) == 1 else np.concatenate(parts)
         t0 = time.perf_counter()
         processed, result_sr = engine.infer_array(input_to_model, stream_sr)
         dur_ms = (time.perf_counter() - t0) * 1000.0
@@ -360,29 +381,36 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"(size={processed.size} sr={result_sr})", file=sys.stderr)
             continue
 
-        # Trim the leading context-warmup region BEFORE resampling so the
-        # downstream length math is in input-time terms.
-        if context_size > 0 and input_to_model.size > 0 and processed.size > 0:
-            trim = int(round(context_size * processed.size / input_to_model.size))
-            trim = max(0, min(trim, processed.size - 1))
-            processed = processed[trim:]
-
-        if result_sr != stream_sr:
-            processed = _RESAMPLERS[args.resampler](processed, result_sr, stream_sr)
-
-        # Stage 4-E timeline reconciliation: stretch each chunk's
-        # output to exactly chunk_size samples so the realtime
-        # equivalent does not drain its output queue. Matches the
-        # worker's behavior.
-        if (
-            args.reconcile_timeline_method != "off"
-            and processed.size > 0
-            and chunk_size > 0
-            and processed.size != chunk_size
-        ):
-            processed = reconcile_to_length(
-                processed, chunk_size, method=args.reconcile_timeline_method
-            )
+        if input_side:
+            # Resample the WHOLE render to the stream SR, then take the
+            # chunk's own region as an exact slice (no stretch, no pitch
+            # shift). Mirrors src.engine.worker.rvc_worker_loop.
+            if result_sr != stream_sr:
+                processed = _RESAMPLERS[args.resampler](processed, result_sr, stream_sr)
+            emit_region, shortfall = trim_to_region(processed, context_size, chunk_size)
+            if shortfall > 0:
+                print(f"  chunk {i}: shortfall {shortfall} samples "
+                      f"(tail pad too small)", file=sys.stderr)
+            processed = emit_region
+        else:
+            # Legacy diagnostic path ('stretch' / 'off'): proportional
+            # native context trim BEFORE resampling so the length math is
+            # in input-time terms.
+            if context_size > 0 and input_to_model.size > 0 and processed.size > 0:
+                trim = int(round(context_size * processed.size / input_to_model.size))
+                trim = max(0, min(trim, processed.size - 1))
+                processed = processed[trim:]
+            if result_sr != stream_sr:
+                processed = _RESAMPLERS[args.resampler](processed, result_sr, stream_sr)
+            if (
+                args.frame_restore_method == "stretch"
+                and processed.size > 0
+                and chunk_size > 0
+                and processed.size != chunk_size
+            ):
+                processed = reconcile_to_length(
+                    processed, chunk_size, method="polyphase"
+                )
 
         # Refresh context for the NEXT inference using the chunk's own tail.
         if context_buffer is not None and context_size > 0:
@@ -446,7 +474,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "chunk_ms": float(args.chunk_ms),
             "crossfade_ms": float(args.crossfade_ms),
             "context_ms": float(args.context_ms),
-            "reconcile_timeline_method": str(args.reconcile_timeline_method),
+            "frame_restore_method": str(args.frame_restore_method),
+            "tail_pad_ms": float(args.tail_pad_ms),
             "resampler": args.resampler,
             "resample_sr": int(args.resample_sr or 0),
             "n_chunks": len(per_chunk_ms),

@@ -46,33 +46,33 @@ def test_parser_accepts_cuda_device_and_explicit_resample_sr():
     assert args.resample_sr == 48000
 
 
-def test_parser_reconcile_timeline_method_default_is_polyphase():
-    """Stage 4-E default: quality-first timeline reconciliation is ON
-    via polyphase. This is the value that closes the Stage 4-D
-    sustained-session drain. Tuning it is an engineering choice, not
-    a voice-tuning choice."""
+def test_parser_frame_restore_method_default_is_lookahead():
+    """Stage 4-E2 default: model-faithful input-side frame restoration.
+    lookahead feeds [context][chunk][tail_pad] and emits an exact slice
+    -- no time stretch, no pitch shift. This replaces the Stage 4-E
+    output-side polyphase stretch as the production default."""
     parser = _build_parser()
     args = parser.parse_args([
         "--mode", "rvc",
         "--config", "config/runtime.example.json",
         "--model-path", "models/local/x.pth",
     ])
-    assert args.reconcile_timeline_method == "polyphase"
+    assert args.frame_restore_method == "lookahead"
 
 
-def test_parser_reconcile_timeline_method_accepts_alternatives():
+def test_parser_frame_restore_method_accepts_alternatives():
     parser = _build_parser()
-    for value in ("polyphase", "linear", "pad_zero", "off"):
+    for value in ("lookahead", "silence", "stretch", "off"):
         args = parser.parse_args([
             "--mode", "rvc",
             "--config", "config/runtime.example.json",
             "--model-path", "models/local/x.pth",
-            "--reconcile-timeline-method", value,
+            "--frame-restore-method", value,
         ])
-        assert args.reconcile_timeline_method == value
+        assert args.frame_restore_method == value
 
 
-def test_parser_rejects_unknown_reconcile_method():
+def test_parser_rejects_unknown_frame_restore_method():
     parser = _build_parser()
     import pytest
     with pytest.raises(SystemExit):
@@ -80,8 +80,31 @@ def test_parser_rejects_unknown_reconcile_method():
             "--mode", "rvc",
             "--config", "config/runtime.example.json",
             "--model-path", "models/local/x.pth",
-            "--reconcile-timeline-method", "bogus",
+            "--frame-restore-method", "bogus",
         ])
+
+
+def test_parser_tail_pad_ms_default_is_30():
+    """Stage 4-E2: the tail pad covers the deterministic ~20 ms model
+    tail-frame loss with margin. ENGINEERING knob, fully trimmed away."""
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+    ])
+    assert args.tail_pad_ms == 30.0
+
+
+def test_parser_tail_pad_ms_explicit():
+    parser = _build_parser()
+    args = parser.parse_args([
+        "--mode", "rvc",
+        "--config", "config/runtime.example.json",
+        "--model-path", "models/local/x.pth",
+        "--tail-pad-ms", "40",
+    ])
+    assert args.tail_pad_ms == 40.0
 
 
 def test_parser_context_default_is_200ms():

@@ -240,22 +240,31 @@ def _print_summary(
               f"{metrics.output_queue_near_empty_threshold_blocks}")
         print(f"output_queue_near_empty_events = {metrics.output_queue_near_empty_events}")
         print(f"cumulative_frame_delta   = {metrics.cumulative_frame_delta}")
-        # Stage 4-E: timeline reconciliation summary.
-        print(f"timeline_reconcile_enabled = {metrics.timeline_reconcile_enabled}")
-        print(f"timeline_reconcile_method  = {metrics.timeline_reconcile_method!r}")
+        # Stage 4-E2: input-side frame restoration summary.
+        print(f"frame_restore_method     = {metrics.frame_restore_method!r}")
+        print(f"frame_restore_enabled    = {metrics.frame_restore_enabled}")
+        print(f"input_tail_pad_ms        = {metrics.input_tail_pad_ms:.2f}")
+        print(f"input_tail_pad_frames    = {metrics.input_tail_pad_frames}")
+        print(f"frame_restoration_count  = {metrics.frame_restoration_count}")
+        print(f"frame_restoration_shortfall_count = "
+              f"{metrics.frame_restoration_shortfall_count}")
+        print(f"frame_restoration_expected_frames_total = "
+              f"{metrics.frame_restoration_expected_frames_total}")
+        print(f"frame_restoration_actual_frames_total   = "
+              f"{metrics.frame_restoration_actual_frames_total}")
+        print(f"frame_restoration_emitted_frames_total  = "
+              f"{metrics.frame_restoration_emitted_frames_total}")
+        print(f"frame_restoration_trim_start_frames_total = "
+              f"{metrics.frame_restoration_trim_start_frames_total}")
+        print(f"frame_restoration_trim_end_frames_total   = "
+              f"{metrics.frame_restoration_trim_end_frames_total}")
+        print(f"frame_restoration_max_abs_per_chunk_frame_error = "
+              f"{metrics.frame_restoration_max_abs_per_chunk_frame_error}")
+        print(f"output_stretch_used_count = {metrics.output_stretch_used_count}")
+        # Stage 4-E diagnostic: only meaningful under frame_restore_method='stretch'.
         print(f"timeline_reconcile_count   = {metrics.timeline_reconcile_count}")
-        print(f"timeline_expected_output_frames_total   = "
-              f"{metrics.timeline_expected_output_frames_total}")
-        print(f"timeline_actual_output_frames_total     = "
-              f"{metrics.timeline_actual_output_frames_total}")
-        print(f"timeline_reconciled_output_frames_total = "
-              f"{metrics.timeline_reconciled_output_frames_total}")
         print(f"timeline_reconciliation_total_frame_error = "
               f"{metrics.timeline_reconciliation_total_frame_error}")
-        print(f"timeline_max_reconciliation_frames_per_chunk = "
-              f"{metrics.timeline_max_reconciliation_frames_per_chunk}")
-        print(f"timeline_reconciliation_mean_ratio = "
-              f"{metrics.timeline_reconciliation_mean_ratio:.6f}")
         print(f"startup_output_underruns = {metrics.startup_output_underruns}")
         print(f"steady_state_output_underruns = {metrics.steady_state_output_underruns}")
         print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")
@@ -516,7 +525,8 @@ def run_rvc_stream(
     rvc_prebuffer_ms: Optional[float] = None,
     drop_stale_input: bool = True,
     context_ms: float = 0.0,
-    reconcile_timeline_method: str = "polyphase",
+    frame_restore_method: str = "lookahead",
+    tail_pad_ms: float = 30.0,
 ) -> RuntimeMetrics:
     """Open the realtime RVC chunk loop and run it.
 
@@ -537,16 +547,19 @@ def run_rvc_stream(
         raise ValueError("crossfade_ms must be >= 0")
     if context_ms < 0:
         raise ValueError("context_ms must be >= 0")
-    if reconcile_timeline_method not in ("polyphase", "linear", "pad_zero", "off"):
+    if tail_pad_ms < 0:
+        raise ValueError("tail_pad_ms must be >= 0")
+    if frame_restore_method not in ("lookahead", "silence", "stretch", "off"):
         raise ValueError(
-            f"reconcile_timeline_method must be one of "
-            f"'polyphase', 'linear', 'pad_zero', 'off'; "
-            f"got {reconcile_timeline_method!r}"
+            f"frame_restore_method must be one of "
+            f"'lookahead', 'silence', 'stretch', 'off'; "
+            f"got {frame_restore_method!r}"
         )
 
     chunk_size = max(1, int(round(chunk_ms / 1000.0 * config.sample_rate)))
     crossfade_size = max(0, int(round(crossfade_ms / 1000.0 * config.sample_rate)))
     context_size = max(0, int(round(context_ms / 1000.0 * config.sample_rate)))
+    tail_pad_size = max(0, int(round(tail_pad_ms / 1000.0 * config.sample_rate)))
     output_block_size = int(config.block_size)
 
     # RVC mode needs much larger queues than identity. The identity-era
@@ -594,13 +607,16 @@ def run_rvc_stream(
         f"rvc_prebuffer_blocks={prebuffer_blocks}  "
         f"drop_stale_input={drop_stale_input}",
         f"context_ms={context_ms:.1f} ({context_size} samples) "
-        f"-- input-left-context fed to model; output trimmed proportionally "
-        f"so emit duration == chunk_ms (no timeline drift)",
-        f"reconcile_timeline_method={reconcile_timeline_method} -- Stage 4-E: "
-        f"each chunk's output is stretched to exactly chunk_size samples so "
-        f"the per-chunk ~20 ms model framing deficit does not drain the output "
-        f"queue over time. polyphase = ~34 cents flat (sub-perceptible); "
-        f"'off' restores the Stage 4-D drain-prone behavior.",
+        f"-- input-left-context fed to model as warm-up",
+        f"frame_restore_method={frame_restore_method}  "
+        f"tail_pad_ms={tail_pad_ms:.1f} ({tail_pad_size} samples) -- Stage 4-E2: "
+        f"the model loses exactly one ~20 ms HuBERT frame at the TAIL of every "
+        f"chunk. lookahead (default) / silence feed [context][chunk][tail_pad] "
+        f"so the lost frame lands in the pad, then emit the exact slice "
+        f"[context:context+chunk] -- NO stretch, NO pitch shift. lookahead uses "
+        f"the next chunk's real audio as the tail (most faithful, +tail_pad_ms "
+        f"latency); silence pads zeros. stretch = Stage 4-E output-side polyphase "
+        f"(~34 cents flat, diagnostic); off = Stage 4-D drain-prone (diagnostic).",
         f"f0_method={engine.config.f0_method}  "
         f"index_rate={engine.config.index_rate}  "
         f"protect={engine.config.protect}  "
@@ -644,7 +660,8 @@ def run_rvc_stream(
                 "crossfade_size": int(crossfade_size),
                 "drop_stale_input": bool(drop_stale_input),
                 "context_size": int(context_size),
-                "reconcile_timeline_method": str(reconcile_timeline_method),
+                "frame_restore_method": str(frame_restore_method),
+                "tail_pad_size": int(tail_pad_size),
             },
             name="rvc-worker",
             daemon=True,

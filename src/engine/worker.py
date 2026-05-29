@@ -5,7 +5,7 @@ Two worker loops live here:
 * ``worker_loop``    — Stage 1, identity / per-block. Used by the
                        identity stream and by tests of the fallback
                        machinery.
-* ``rvc_worker_loop`` — Stage 2, chunk-accumulating, RVC inference.
+* ``rvc_worker_loop`` — Stage 2+, chunk-accumulating, RVC inference.
                        Used by the realtime ``--mode rvc`` stream.
 
 Both loops do NOT start threads on import. The streams layer starts
@@ -39,6 +39,7 @@ from ..audio.chunker import (
     ChunkerConfig,
     reconcile_to_length,
     resample_audio,
+    trim_to_region,
 )
 from ..audio.devices import iter_device_infos  # noqa: F401  (re-export friendliness)
 from ..engine.crossfade import linear_crossfade
@@ -136,7 +137,7 @@ def worker_loop(
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: RVC chunk worker loop
+# Stage 2+: RVC chunk worker loop
 # ---------------------------------------------------------------------------
 
 def rvc_worker_loop(
@@ -155,61 +156,53 @@ def rvc_worker_loop(
     poll_timeout_seconds: float = 0.1,
     drop_stale_input: bool = True,
     context_size: int = 0,
-    reconcile_timeline_method: str = "polyphase",
+    frame_restore_method: str = "lookahead",
+    tail_pad_size: int = 0,
 ) -> None:
-    """Chunked RVC worker.
+    """Chunked RVC worker with input-side frame restoration (Stage 4-E2).
 
-    Per-block flow::
+    The model structurally emits exactly one 50 Hz HuBERT frame (~20 ms)
+    less audio than the input demands, and the loss sits entirely at the
+    **tail** (confirmed deterministic across input lengths and content —
+    see ``tools/probe_frame_deficit.py``). Left uncorrected the realtime
+    output queue drains at ~17 ms / s and eventually underruns.
 
-        block = in_queue.get(timeout=...)
-        append to input_acc (BlockAccumulator at chunk_size)
-        for each full chunk:
-            if context_size > 0:
-                input_to_model = concat(context_buffer, chunk)
-            else:
-                input_to_model = chunk
-            t0 = perf_counter()
-            try:
-                processed, _sr = engine.infer_array(input_to_model, sample_rate)
-            except Exception:
-                processed = identity(chunk)   # fallback, link stays alive
-                metrics.rvc_fallback_count += 1
-            if context_size > 0:
-                # Trim leading region proportionally — preserves the chunk's
-                # output duration exactly while letting the model see real
-                # previous audio as warmup context.
-                trim = round(context_size * processed.size / input_to_model.size)
-                processed = processed[trim:]
-                context_buffer = chunk[-context_size:]
-            scrub NaN/Inf
-            crossfade with previous chunk's tail (if crossfade_size > 0)
-            feed processed into output_acc (BlockAccumulator at block_size)
-            push each emitted block to out_queue (put_nowait; full -> drop++)
+    Production correction (``frame_restore_method`` in
+    ``{"lookahead", "silence"}``) is **input-side**: feed the backend
+    ``[left_context][chunk][tail_pad]`` so the dropped frame falls inside
+    the tail pad, resample the whole model render to the stream SR, then
+    take a **sample-accurate slice** ``[context_size : context_size +
+    chunk_size]``. The emit is exactly ``chunk_size`` samples, generated
+    by the model, **not time-stretched and not pitch-shifted**.
 
-    Stage 3 — input-left-context (``context_size > 0``):
+    * ``lookahead`` (default, most faithful): ``tail_pad`` is the next
+      chunk's first ``tail_pad_size`` real input samples, so the chunk's
+      last frame is rendered with real continuation and chunk boundaries
+      stay seamless. Costs ``tail_pad_size`` of look-ahead latency: a
+      chunk is processed only once ``chunk_size + tail_pad_size`` input
+      samples are available; only ``chunk_size`` are consumed (the tail
+      becomes the next chunk's head).
+    * ``silence``: ``tail_pad`` is zeros — the dropped frame still lands
+      in the pad, but the chunk's last frame is vocoded with silence as
+      right-context. Zero added latency.
 
-    Per-chunk inference inherits no past audio across chunk boundaries,
-    so HuBERT / F0 / index re-initialise on every call. The first
-    ~tens of ms of every chunk's output exhibits cold-start instability
-    (boundary clicks, F0 wobble, sustained-vowel flutter). The
-    model-faithful fix is to feed the model some real previous input
-    audio as left-context, then discard the proportional output region.
+    Diagnostic / fallback methods preserve earlier-stage behaviour:
 
-    * Each inference receives ``[context_buffer, chunk]`` (``context_size
-      + chunk_size`` samples). On the very first chunk the buffer is
-      zeros, which mirrors a true start-of-signal.
-    * The output is trimmed by ``round(context_size * out_len / in_len)``
-      samples from the front. This preserves the chunk's nominal
-      output duration exactly (no timeline drift).
-    * ``context_buffer`` is then refreshed to ``chunk[-context_size:]``
-      so the next call sees the correct preceding audio.
-    * On ``drop_stale_input`` engagement, intermediate chunks' tails
-      are not propagated; the buffer carries the LAST processed
-      chunk's tail. This is a known small discontinuity that only
-      fires when inference falls behind; identity fallback semantics
-      are unchanged.
+    * ``stretch`` — Stage 4-E output-side polyphase stretch of the model
+      render up to ``chunk_size`` (~34 cents flat for kiki). No tail pad.
+    * ``off`` — Stage 4-D: emit the model render verbatim (drain-prone).
+      No tail pad.
 
-    On shutdown, flush any pending crossfade tail and partial block.
+    Stage 3 input-left-context (``context_size > 0``) composes with all
+    methods: the engine sees real previous input as warm-up; for the
+    input-side methods the exact slice drops it, for the legacy methods
+    the proportional native trim does. On the very first chunk the context
+    is zeros (a true start-of-signal).
+
+    Identity fallback on any backend error emits the chunk's own audio
+    (already ``chunk_size`` at the stream SR) and skips restoration. On
+    shutdown a final full chunk still buffered is flushed with a silence
+    tail so the last ~chunk_ms is not lost.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
@@ -219,34 +212,54 @@ def rvc_worker_loop(
         raise ValueError("crossfade_size must be >= 0")
     if context_size < 0:
         raise ValueError("context_size must be >= 0")
+    if tail_pad_size < 0:
+        raise ValueError("tail_pad_size must be >= 0")
+    if frame_restore_method not in ("lookahead", "silence", "stretch", "off"):
+        raise ValueError(
+            f"frame_restore_method must be one of 'lookahead', 'silence', "
+            f"'stretch', 'off'; got {frame_restore_method!r}"
+        )
     if engine is None:
         raise ValueError("engine must not be None")
 
-    input_acc = BlockAccumulator(ChunkerConfig(chunk_size=int(chunk_size)))
+    chunk_size = int(chunk_size)
+    context_size = int(context_size)
+    tail_pad_size = int(tail_pad_size)
+    sample_rate = int(sample_rate)
+
     output_acc = BlockAccumulator(ChunkerConfig(chunk_size=int(output_block_size)))
     pending_tail: Optional[np.ndarray] = None
     saw_shutdown = False
     # Stage 3 input-left-context buffer. Zero-initialised so the very
     # first chunk sees a silent past (matches true start-of-signal).
     context_buffer: Optional[np.ndarray] = (
-        np.zeros(int(context_size), dtype=np.float32) if context_size > 0 else None
+        np.zeros(context_size, dtype=np.float32) if context_size > 0 else None
     )
 
     # Stage 4-C: per-chunk wall-clock budget for the inference call.
-    # If an inference exceeds this it consumes part of the output-queue
-    # safety margin. ``record_inference_ms(..., budget_ms=)`` tracks how
-    # often this happens, the longest consecutive streak, and the total
-    # over-budget debt in ms.
     chunk_ms_budget: float = float(chunk_size) * 1000.0 / float(sample_rate)
     metrics.rvc_chunk_ms_budget = chunk_ms_budget
 
-    # Stage 4-E: timeline reconciliation target. Each emitted chunk's
-    # output sample count must match this so the output queue does not
-    # drain over a sustained session. ``method='off'`` leaves the legacy
-    # Stage 4-D behavior (model output verbatim, drain-prone).
-    reconcile_target_samples: int = int(chunk_size)
-    metrics.timeline_reconcile_enabled = (reconcile_timeline_method != "off")
-    metrics.timeline_reconcile_method = str(reconcile_timeline_method)
+    # Stage 4-E2: frame-restoration mode.
+    input_side = frame_restore_method in ("lookahead", "silence")
+    eff_tail_pad = tail_pad_size if input_side else 0
+    metrics.frame_restore_method = str(frame_restore_method)
+    metrics.frame_restore_enabled = bool(input_side)
+    metrics.input_tail_pad_frames = int(eff_tail_pad)
+    metrics.input_tail_pad_ms = float(eff_tail_pad) * 1000.0 / float(sample_rate)
+    # Stage 4-E compat flags (only the 'stretch' diagnostic touches these).
+    metrics.timeline_reconcile_enabled = (frame_restore_method == "stretch")
+    metrics.timeline_reconcile_method = (
+        "polyphase" if frame_restore_method == "stretch" else ""
+    )
+    reconcile_target_samples = chunk_size
+
+    # Look-ahead needs real future samples in the buffer before a chunk can
+    # be processed; silence synthesises the tail so it needs only the chunk.
+    lookahead_size = eff_tail_pad if frame_restore_method == "lookahead" else 0
+    required = chunk_size + lookahead_size
+
+    stream_buf = np.zeros(0, dtype=np.float32)
 
     def _emit(buf: np.ndarray) -> None:
         if buf.size == 0:
@@ -264,6 +277,149 @@ def rvc_worker_loop(
                 metrics.output_queue_drops += 1
                 metrics.rvc_output_blocks_dropped += 1
 
+    def _emit_with_crossfade(buf: np.ndarray) -> None:
+        nonlocal pending_tail
+        if crossfade_size == 0 or buf.size < (2 * crossfade_size):
+            if pending_tail is not None:
+                _emit(pending_tail)
+                pending_tail = None
+            _emit(buf)
+        elif pending_tail is None:
+            _emit(buf[:-crossfade_size])
+            pending_tail = buf[-crossfade_size:].astype(np.float32, copy=True)
+        else:
+            head = buf[:crossfade_size]
+            blended = linear_crossfade(pending_tail, head)
+            _emit(blended)
+            _emit(buf[crossfade_size:-crossfade_size])
+            pending_tail = buf[-crossfade_size:].astype(np.float32, copy=True)
+
+    def _refresh_context(consumed_chunk: np.ndarray) -> None:
+        nonlocal context_buffer
+        if context_buffer is None or context_size <= 0:
+            return
+        if consumed_chunk.size >= context_size:
+            context_buffer = consumed_chunk[-context_size:].astype(
+                np.float32, copy=True
+            )
+        else:
+            new_ctx = np.zeros(context_size, dtype=np.float32)
+            new_ctx[-consumed_chunk.size:] = consumed_chunk
+            context_buffer = new_ctx
+
+    def _scrub(buf: np.ndarray) -> np.ndarray:
+        scrub = scrub_nan_inf(buf)
+        if scrub.replaced_count:
+            metrics.nan_inf_scrub_count += int(scrub.replaced_count)
+            return scrub.audio
+        return buf
+
+    def _handle_chunk(chunk: np.ndarray, tail: np.ndarray) -> None:
+        # Build the model input: [context?][chunk][tail?].
+        parts = []
+        if context_buffer is not None and context_size > 0:
+            parts.append(context_buffer)
+        parts.append(chunk)
+        if tail.size > 0:
+            parts.append(tail)
+        input_to_model = parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+        t0 = time.perf_counter()
+        result_sr = sample_rate
+        used_fallback = False
+        try:
+            processed, result_sr_raw = engine.infer_array(input_to_model, sample_rate)
+            processed = np.asarray(processed, dtype=np.float32).reshape(-1)
+            result_sr = int(result_sr_raw)
+        except Exception:
+            if not fallback_to_identity_on_error:
+                raise
+            processed = chunk.astype(np.float32, copy=True)
+            metrics.rvc_fallback_count += 1
+            used_fallback = True
+        metrics.record_inference_ms(
+            (time.perf_counter() - t0) * 1000.0, budget_ms=chunk_ms_budget
+        )
+
+        # Identity fallback (engine raised): chunk is already chunk_size @
+        # stream SR. Skip restoration.
+        if used_fallback:
+            processed = _scrub(processed)
+            metrics.rvc_chunks_processed += 1
+            _emit_with_crossfade(processed)
+            return
+
+        # Degenerate backend output -> identity fallback.
+        if processed.size == 0 or result_sr <= 0:
+            processed = _scrub(chunk.astype(np.float32, copy=True))
+            metrics.rvc_fallback_count += 1
+            metrics.rvc_chunks_processed += 1
+            _emit_with_crossfade(processed)
+            return
+
+        if input_side:
+            # Resample the WHOLE render to the stream SR, then take the
+            # chunk's own region as an exact slice. The slice replaces both
+            # the Stage-3 proportional context trim and the Stage-4-E stretch.
+            if result_sr != sample_rate:
+                t_rs = time.perf_counter()
+                processed = resample_audio(processed, result_sr, sample_rate)
+                metrics.record_resample_ms((time.perf_counter() - t_rs) * 1000.0)
+            processed = _scrub(processed)
+            actual_before = int(processed.size)
+            trim_start = context_size
+            emit, shortfall = trim_to_region(processed, trim_start, chunk_size)
+            trim_end = max(0, actual_before - trim_start - chunk_size)
+            metrics.record_frame_restore(
+                expected=chunk_size,
+                actual_before_trim=actual_before,
+                emitted=int(emit.size),
+                trim_start=trim_start,
+                trim_end=trim_end,
+                shortfall_frames=int(shortfall),
+            )
+            processed = emit
+            metrics.rvc_chunks_processed += 1
+            _emit_with_crossfade(processed)
+            return
+
+        # ---- Legacy diagnostic path: 'stretch' / 'off' ----
+        # Proportional native context trim (Stage 3), in input-time terms.
+        if context_size > 0 and processed.size > 0 and input_to_model.size > 0:
+            trim = int(round(context_size * processed.size / input_to_model.size))
+            if trim < 0:
+                trim = 0
+            if trim >= processed.size:
+                # Defensive: would leave nothing -> identity fallback.
+                processed = _scrub(chunk.astype(np.float32, copy=True))
+                metrics.rvc_fallback_count += 1
+                metrics.rvc_chunks_processed += 1
+                _emit_with_crossfade(processed)
+                return
+            processed = processed[trim:]
+
+        if result_sr != sample_rate:
+            t_rs = time.perf_counter()
+            processed = resample_audio(processed, result_sr, sample_rate)
+            metrics.record_resample_ms((time.perf_counter() - t_rs) * 1000.0)
+        processed = _scrub(processed)
+
+        if frame_restore_method == "stretch" and processed.size > 0:
+            actual = int(processed.size)
+            target = reconcile_target_samples
+            if actual != target:
+                processed = reconcile_to_length(processed, target, method="polyphase")
+                metrics.output_stretch_used_count += 1
+            metrics.record_timeline_reconcile(
+                expected_frames=target,
+                actual_frames=actual,
+                reconciled_frames=int(processed.size),
+            )
+        # 'off': emit the model render verbatim (drain-prone, diagnostic).
+
+        metrics.rvc_chunks_processed += 1
+        _emit_with_crossfade(processed)
+
     while not stop_event.is_set():
         # Wait for at least one input block. ``poll_timeout_seconds`` keeps
         # the loop responsive to ``stop_event`` even when the mic is silent.
@@ -274,10 +430,8 @@ def rvc_worker_loop(
         if first_block is shutdown_sentinel:
             break
 
-        # Drain everything that arrived while we were busy with the
-        # previous chunk's inference. This is the fix for the live-vs-
-        # benchmark gap: without this drain, we processed 640 ms-stale
-        # audio on every cycle.
+        # Drain everything that arrived while we were busy with the previous
+        # chunk's inference (avoids processing stale audio every cycle).
         pulled_blocks = [first_block]
         while True:
             try:
@@ -288,170 +442,64 @@ def rvc_worker_loop(
                 pulled_blocks.append(b)
             except queue.Empty:
                 break
-        # Sample max input queue depth right after we just drained — qsize
-        # is sticky-low at that point, so we count what we just removed.
         observed_depth = len(pulled_blocks) + in_queue.qsize()
         if observed_depth > metrics.max_input_queue_depth:
             metrics.max_input_queue_depth = observed_depth
 
-        # Feed all pulled blocks into the chunk accumulator.
-        chunks: list = []
+        # Append pulled blocks to the rolling raw input buffer.
         try:
-            for b in pulled_blocks:
-                chunks.extend(input_acc.feed(b))
+            stream_buf = np.concatenate(
+                [stream_buf]
+                + [np.asarray(b, dtype=np.float32).reshape(-1) for b in pulled_blocks]
+            )
         except Exception:
             metrics.rvc_fallback_count += 1
             if saw_shutdown:
                 break
             continue
 
-        # If multiple chunks are ready and stale-drop is on, keep only the
-        # latest — the older chunks would otherwise add latency without
-        # adding listenable content (we'd never catch up).
-        if drop_stale_input and len(chunks) > 1:
-            metrics.rvc_stale_chunk_drops += len(chunks) - 1
-            chunks = chunks[-1:]
+        # Drop-stale: if more than one full chunk is queued beyond what we
+        # need for the next processable window, drop whole oldest chunks.
+        # Dropped chunks do NOT update the context buffer — the documented
+        # Stage-3 behaviour is that context carries forward only the last
+        # *processed* chunk's tail (the skipped chunks are a known gap).
+        if drop_stale_input:
+            while stream_buf.size >= required + chunk_size:
+                stream_buf = stream_buf[chunk_size:]
+                metrics.rvc_stale_chunk_drops += 1
 
-        for chunk in chunks:
-            # Stage 3: prepend left-context before sending to the model.
-            # ``input_to_model`` is what the engine sees; ``chunk`` is the
-            # caller's "new audio" that should map to chunk_size samples
-            # of OUTPUT after trimming.
-            if context_buffer is not None and context_size > 0:
-                input_to_model = np.concatenate([context_buffer, chunk])
-            else:
-                input_to_model = chunk
-            t0 = time.perf_counter()
-            result_sr = int(sample_rate)
-            used_fallback = False
-            try:
-                processed, result_sr_raw = engine.infer_array(
-                    input_to_model, int(sample_rate)
+        # Process every fully-available window. Consume only chunk_size per
+        # iteration; the look-ahead tail (if any) stays as the next head.
+        while stream_buf.size >= required:
+            chunk = stream_buf[:chunk_size].astype(np.float32, copy=True)
+            if frame_restore_method == "lookahead":
+                tail = stream_buf[chunk_size:chunk_size + tail_pad_size].astype(
+                    np.float32, copy=True
                 )
-                processed = np.asarray(processed, dtype=np.float32).reshape(-1)
-                result_sr = int(result_sr_raw)
-            except Exception:
-                if not fallback_to_identity_on_error:
-                    raise
-                processed = chunk.astype(np.float32, copy=True)
-                metrics.rvc_fallback_count += 1
-                used_fallback = True
-            metrics.record_inference_ms(
-                (time.perf_counter() - t0) * 1000.0,
-                budget_ms=chunk_ms_budget,
-            )
-
-            # Trim the leading region that corresponds to the context
-            # input. Skipped when context is off, when the model failed
-            # (the fallback is already the chunk's own audio), or when
-            # the backend returned a degenerate output (the SR-handling
-            # block below will treat that as fallback anyway).
-            if (
-                context_size > 0
-                and not used_fallback
-                and processed.size > 0
-                and input_to_model.size > 0
-            ):
-                trim = int(round(
-                    int(context_size) * processed.size / input_to_model.size
-                ))
-                if trim < 0:
-                    trim = 0
-                if trim >= processed.size:
-                    # Defensive: would leave nothing; treat as fallback so the
-                    # chain stays alive. Should never happen in practice.
-                    processed = chunk.astype(np.float32, copy=True)
-                    metrics.rvc_fallback_count += 1
-                else:
-                    processed = processed[trim:]
-
-            # Refresh context buffer for the next inference. We refresh
-            # from the chunk's actual input regardless of whether the
-            # model succeeded — the next chunk's correct left-context is
-            # always "this chunk's tail" in input time.
-            if context_buffer is not None and context_size > 0:
-                if chunk.size >= context_size:
-                    context_buffer = chunk[-context_size:].astype(np.float32, copy=True)
-                else:
-                    # Partial chunk (shorter than context). Pad-shift.
-                    new_ctx = np.zeros(context_size, dtype=np.float32)
-                    new_ctx[-chunk.size:] = chunk
-                    context_buffer = new_ctx
-
-            # SR handling. The kiki model returns 40 kHz natively while the
-            # stream is 48 kHz; asking infer_rvc_python to resample
-            # internally (resample_sr=stream_sr) is too slow for realtime
-            # (Stage 2D benchmark: +230 ms / chunk). The worker resamples
-            # post-model instead, using ``resample_audio`` which prefers
-            # scipy polyphase (sinc-windowed) and falls back to np.interp
-            # if scipy is unavailable. Audit measurement (tools/pseudo_
-            # stream) showed polyphase yields ~+11 dB output-vs-reference
-            # SNR upgrade vs np.interp at negligible CPU cost.
-            if processed.size == 0 or result_sr <= 0:
-                # Genuine garbage from backend -> identity fallback.
-                processed = chunk.astype(np.float32, copy=True)
-                metrics.rvc_fallback_count += 1
-            elif result_sr != int(sample_rate):
-                t_rs = time.perf_counter()
-                processed = resample_audio(processed, result_sr, int(sample_rate))
-                metrics.record_resample_ms((time.perf_counter() - t_rs) * 1000.0)
-
-            # NaN/Inf scrub — RVC can produce these on edge cases.
-            scrub = scrub_nan_inf(processed)
-            if scrub.replaced_count:
-                metrics.nan_inf_scrub_count += int(scrub.replaced_count)
-                processed = scrub.audio
-
-            # Stage 4-E: timeline reconciliation. The kiki backend
-            # consistently emits ~20 ms less audio per call than the
-            # input chunk demands. Without this step the output queue
-            # drains at ~17 ms / s (the Stage 4-D 300 s spoken failure).
-            # The reconciliation is applied to non-fallback paths only;
-            # identity fallback already emits exactly chunk_size samples.
-            if (
-                reconcile_timeline_method != "off"
-                and not used_fallback
-                and processed.size > 0
-                and reconcile_target_samples > 0
-            ):
-                actual = int(processed.size)
-                target = reconcile_target_samples
-                if actual != target:
-                    processed = reconcile_to_length(
-                        processed, target, method=reconcile_timeline_method
-                    )
-                metrics.record_timeline_reconcile(
-                    expected_frames=target,
-                    actual_frames=actual,
-                    reconciled_frames=int(processed.size),
-                )
-
-            metrics.rvc_chunks_processed += 1
-
-            # Chunk-boundary crossfade. Hold back the last ``crossfade_size``
-            # samples of each chunk; when the next chunk arrives, blend its
-            # head with the held tail before emitting it.
-            if crossfade_size == 0 or processed.size < (2 * crossfade_size):
-                # Too short to crossfade safely — emit as-is, no tail.
-                if pending_tail is not None:
-                    _emit(pending_tail)
-                    pending_tail = None
-                _emit(processed)
-            elif pending_tail is None:
-                # First crossfade-eligible chunk: emit body, hold tail.
-                _emit(processed[:-crossfade_size])
-                pending_tail = processed[-crossfade_size:].astype(np.float32, copy=True)
+            elif frame_restore_method == "silence":
+                tail = np.zeros(eff_tail_pad, dtype=np.float32)
             else:
-                head = processed[:crossfade_size]
-                blended = linear_crossfade(pending_tail, head)
-                _emit(blended)
-                _emit(processed[crossfade_size:-crossfade_size])
-                pending_tail = processed[-crossfade_size:].astype(np.float32, copy=True)
+                tail = np.zeros(0, dtype=np.float32)
+            stream_buf = stream_buf[chunk_size:]
+            _handle_chunk(chunk, tail)
+            _refresh_context(chunk)
 
         if saw_shutdown:
             break
 
-    # Shutdown: emit any held tail and partial block leftover.
+    # Shutdown: flush a final full chunk (with a silence tail — no future
+    # input remains) so the last ~chunk_ms is not lost, then any held
+    # crossfade tail and partial output block.
+    if stream_buf.size >= chunk_size:
+        chunk = stream_buf[:chunk_size].astype(np.float32, copy=True)
+        tail = (
+            np.zeros(eff_tail_pad, dtype=np.float32)
+            if input_side and eff_tail_pad > 0
+            else np.zeros(0, dtype=np.float32)
+        )
+        _handle_chunk(chunk, tail)
+        _refresh_context(chunk)
+
     if pending_tail is not None:
         _emit(pending_tail)
     leftover = output_acc.flush_pending()

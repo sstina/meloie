@@ -26,6 +26,7 @@ from src.audio.chunker import (
     linear_resample,
     reconcile_to_length,
     resample_audio,
+    trim_to_region,
 )
 from src.engine.crossfade import linear_crossfade
 from src.engine.rvc_engine import RvcEngine
@@ -426,6 +427,62 @@ def test_resample_audio_falls_back_when_scipy_missing(monkeypatch):
     np.testing.assert_allclose(
         out, np.full(48000, 0.5, dtype=np.float32), atol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 4-E2: trim_to_region (input-side frame restoration slice)
+# ---------------------------------------------------------------------------
+
+def test_trim_to_region_exact_slice_no_pad():
+    audio = np.arange(100, dtype=np.float32)
+    out, shortfall = trim_to_region(audio, trim_start=10, target_length=50)
+    assert out.size == 50
+    assert shortfall == 0
+    np.testing.assert_array_equal(out, np.arange(10, 60, dtype=np.float32))
+
+
+def test_trim_to_region_zero_trim_start():
+    audio = np.arange(100, dtype=np.float32)
+    out, shortfall = trim_to_region(audio, trim_start=0, target_length=64)
+    assert out.size == 64
+    assert shortfall == 0
+    np.testing.assert_array_equal(out, np.arange(64, dtype=np.float32))
+
+
+def test_trim_to_region_pads_when_audio_too_short():
+    # 100 samples, want [80:80+40] but only 20 remain -> 20 real + 20 zeros.
+    audio = np.arange(100, dtype=np.float32)
+    out, shortfall = trim_to_region(audio, trim_start=80, target_length=40)
+    assert out.size == 40
+    assert shortfall == 20
+    np.testing.assert_array_equal(out[:20], np.arange(80, 100, dtype=np.float32))
+    np.testing.assert_array_equal(out[20:], np.zeros(20, dtype=np.float32))
+
+
+def test_trim_to_region_trim_start_beyond_end_all_zeros():
+    audio = np.arange(50, dtype=np.float32)
+    out, shortfall = trim_to_region(audio, trim_start=100, target_length=30)
+    assert out.size == 30
+    assert shortfall == 30
+    np.testing.assert_array_equal(out, np.zeros(30, dtype=np.float32))
+
+
+def test_trim_to_region_zero_target_returns_empty():
+    out, shortfall = trim_to_region(np.arange(10, dtype=np.float32), 0, 0)
+    assert out.size == 0
+    assert shortfall == 0
+
+
+def test_trim_to_region_rejects_stereo():
+    with pytest.raises(ValueError):
+        trim_to_region(np.zeros((10, 2), dtype=np.float32), 0, 5)
+
+
+def test_trim_to_region_rejects_negative_args():
+    with pytest.raises(ValueError):
+        trim_to_region(np.zeros(10, dtype=np.float32), -1, 5)
+    with pytest.raises(ValueError):
+        trim_to_region(np.zeros(10, dtype=np.float32), 0, -5)
 
 
 # ---------------------------------------------------------------------------

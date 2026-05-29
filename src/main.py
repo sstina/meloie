@@ -142,23 +142,30 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="If inference falls behind, drop older queued "
                           "chunks and keep only the latest. Reduces "
                           "perceived latency drift. Default: on for RVC.")
-    rvc.add_argument("--reconcile-timeline-method", default="polyphase",
-                     choices=["polyphase", "linear", "pad_zero", "off"],
-                     help="Stage 4-E timeline reconciliation method. "
-                          "The chunked RVC pipeline emits ~20 ms less "
-                          "audio per call than the input chunk demands "
-                          "(structural framing loss in HuBERT / RMVPE / "
-                          "vocoder). Without reconciliation the output "
-                          "queue drains at ~17 ms / s and eventually "
-                          "underruns. polyphase (default, recommended): "
-                          "scipy.signal.resample_poly stretches each "
-                          "chunk's output to exactly chunk_size samples "
-                          "via a rational up/down ratio (~50:49 for "
-                          "kiki at 48 kHz / 1 s chunks; introduces "
-                          "~34 cents pitch flat - sub-perceptible on "
-                          "speech material). linear: np.interp stretch. "
-                          "pad_zero: silence-pad / truncate. off: "
-                          "Stage 4-D legacy, drain-prone.")
+    rvc.add_argument("--frame-restore-method", default="lookahead",
+                     choices=["lookahead", "silence", "stretch", "off"],
+                     help="Stage 4-E2 frame restoration. The chunked RVC "
+                          "pipeline loses exactly one ~20 ms HuBERT frame at "
+                          "the TAIL of every chunk (deterministic; see "
+                          "tools/probe_frame_deficit.py). Left uncorrected the "
+                          "output queue drains at ~17 ms / s and underruns. "
+                          "lookahead (default, recommended): feed "
+                          "[context][chunk][tail_pad] where the tail is the "
+                          "next chunk's real audio, then emit the exact slice "
+                          "[context:context+chunk] -- NO time stretch, NO pitch "
+                          "shift; chunk boundaries stay seamless (costs "
+                          "--tail-pad-ms of look-ahead latency). silence: same "
+                          "but the tail pad is zeros (zero added latency, slight "
+                          "boundary coloring). stretch: Stage 4-E output-side "
+                          "polyphase stretch (~34 cents flat; diagnostic). off: "
+                          "Stage 4-D, drain-prone (diagnostic).")
+    rvc.add_argument("--tail-pad-ms", type=float, default=30.0,
+                     help="Input tail pad for --frame-restore-method "
+                          "lookahead/silence, in ms. The model's tail loss is "
+                          "a deterministic ~20 ms; default 30 ms (1.5x) is the "
+                          "smallest-safe value with margin. ENGINEERING "
+                          "frame-restoration knob, NOT a voice-tuning knob; it "
+                          "is fully trimmed away and never reaches the output.")
     rvc.add_argument("--rvc-context-ms", type=float, default=200.0,
                      help="Stage 3 input-side LEFT context fed to the "
                           "model before each chunk. Default 200 ms. The "
@@ -464,7 +471,8 @@ def _cmd_mode_rvc(args: argparse.Namespace) -> int:
             rvc_prebuffer_ms=args.rvc_prebuffer_ms,
             drop_stale_input=args.drop_stale_input,
             context_ms=args.rvc_context_ms,
-            reconcile_timeline_method=args.reconcile_timeline_method,
+            frame_restore_method=args.frame_restore_method,
+            tail_pad_ms=args.tail_pad_ms,
         )
     except FeedbackLoopRisk as exc:
         print(f"error: {exc}", file=sys.stderr)

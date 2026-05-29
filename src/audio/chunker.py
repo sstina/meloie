@@ -273,3 +273,54 @@ def reconcile_to_length(
         f"unknown reconcile method: {method!r}. "
         "Expected one of: 'polyphase', 'linear', 'pad_zero', 'off'."
     )
+
+
+def trim_to_region(
+    audio: np.ndarray, trim_start: int, target_length: int
+) -> tuple:
+    """Return exactly ``target_length`` samples starting at ``trim_start``.
+
+    Stage 4-E2 input-side frame restoration. The realtime worker feeds the
+    backend ``[left_context][chunk][tail_pad]`` so the structural ~20 ms
+    tail-frame loss falls inside the tail pad, then resamples the whole
+    model output to the stream SR. This function extracts the chunk's own
+    region from that resampled output as a **sample-accurate slice** —
+    no stretch, no pitch shift, no proportional rounding.
+
+    * ``trim_start`` = the left-context region to drop (= context_size at
+      the stream SR). The probe confirmed the model's front render maps
+      cleanly (no start deficit), so the chunk begins exactly here.
+    * ``target_length`` = chunk_size at the stream SR (what we emit).
+
+    Returns ``(out, shortfall_frames)`` where ``out.size == target_length``
+    always. ``shortfall_frames`` is how many trailing samples had to be
+    zero-padded because ``audio`` was shorter than ``trim_start +
+    target_length`` (0 in healthy operation, since the tail pad covers the
+    deficit). A non-zero shortfall is the signal that the tail pad was not
+    large enough for that chunk.
+    """
+    if not isinstance(audio, np.ndarray):
+        raise TypeError(
+            f"audio must be a numpy array, got {type(audio).__name__}"
+        )
+    if audio.ndim != 1:
+        raise ValueError(f"audio must be 1-D mono, got shape {audio.shape}")
+    if int(trim_start) < 0:
+        raise ValueError(f"trim_start must be >= 0; got {trim_start}")
+    if int(target_length) < 0:
+        raise ValueError(f"target_length must be >= 0; got {target_length}")
+
+    trim_start = int(trim_start)
+    target_length = int(target_length)
+    if target_length == 0:
+        return np.zeros(0, dtype=np.float32), 0
+
+    region = audio[trim_start: trim_start + target_length].astype(
+        np.float32, copy=True
+    )
+    shortfall = target_length - region.size
+    if shortfall > 0:
+        region = np.concatenate(
+            [region, np.zeros(shortfall, dtype=np.float32)]
+        ).astype(np.float32, copy=False)
+    return region, int(shortfall)

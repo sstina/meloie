@@ -272,10 +272,10 @@ def test_rvc_worker_resamples_when_returned_sr_mismatches_stream_sr():
     linear interp) instead of falling back to identity. This unlocks
     the kiki@native_sr=40k path which is the only realtime-fits config.
 
-    Stage 4-E note: this test asserts the *post-SR-resample* emit size
-    (5760 samples). The new timeline-reconciliation step would otherwise
-    stretch that to chunk_size (4800). We pin reconcile to ``off`` here
-    so the test continues to exercise only the SR-mismatch path.
+    Stage 4-E2 note: this test asserts the *post-SR-resample* emit size
+    (5760 samples). The input-side / stretch restoration would otherwise
+    force the emit to chunk_size (4800). We pin frame restoration to
+    ``off`` here so the test exercises only the SR-mismatch path.
     """
     chunk_size = 4800        # 100 ms @ 48 kHz
     block_size = 480
@@ -297,7 +297,7 @@ def test_rvc_worker_resamples_when_returned_sr_mismatches_stream_sr():
         output_block_size=block_size,
         crossfade_size=0,
         poll_timeout_seconds=0.05,
-        reconcile_timeline_method="off",
+        frame_restore_method="off",
     )
 
     assert engine.call_count == 1
@@ -753,20 +753,79 @@ class _DeficitEngine:
         return audio[:n].astype(np.float32, copy=True), int(sample_rate)
 
 
-def test_rvc_worker_reconciles_each_chunk_to_chunk_size_by_default():
-    """Stage 4-E default (polyphase): every chunk's emit must equal
-    chunk_size in samples, regardless of the model's structural deficit."""
+def test_rvc_worker_lookahead_restores_each_chunk_to_chunk_size_by_default():
+    """Stage 4-E2 default (lookahead): every chunk's emit equals
+    chunk_size via a sample-accurate slice — no stretch — regardless of
+    the model's structural tail deficit. The tail pad (real look-ahead)
+    absorbs the lost frame."""
     chunk_size = 4800     # 100 ms @ 48 kHz
     block_size = 480
-    deficit = 96          # 2 ms loss @ 48 kHz, ~analogous to kiki's 20 ms
+    deficit = 96          # tail loss the engine simulates
+    tail_pad = 192        # > deficit so the lost frame lands in the pad
 
-    in_q: "queue.Queue" = queue.Queue(maxsize=64)
-    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    in_q: "queue.Queue" = queue.Queue(maxsize=128)
+    out_q: "queue.Queue" = queue.Queue(maxsize=128)
     metrics = RuntimeMetrics()
     stop = threading.Event()
     engine = _DeficitEngine(deficit_samples=deficit)
 
-    # 3 full chunks of input.
+    # 32 blocks = 15360 samples: enough to process 3 chunks each with a
+    # real 192-sample look-ahead tail (3*4800 + 192 = 14592 needed),
+    # leaving < chunk_size so the shutdown flush does not fire.
+    for _ in range(32):
+        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=False,
+        tail_pad_size=tail_pad,
+        # frame_restore_method defaults to "lookahead"
+    )
+
+    assert engine.call_count == 3
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    # Exactly 3 * chunk_size emitted — no drain, no per-chunk deficit.
+    assert total == 3 * chunk_size
+    assert metrics.frame_restore_method == "lookahead"
+    assert metrics.frame_restore_enabled is True
+    assert metrics.input_tail_pad_frames == tail_pad
+    assert metrics.frame_restoration_count == 3
+    assert metrics.frame_restoration_shortfall_count == 0
+    assert metrics.frame_restoration_expected_frames_total == 3 * chunk_size
+    assert metrics.frame_restoration_emitted_frames_total == 3 * chunk_size
+    # actual render per chunk = chunk + tail - deficit = 4800 + 192 - 96.
+    assert metrics.frame_restoration_actual_frames_total == 3 * (chunk_size + tail_pad - deficit)
+    # trim_start = context_size = 0; trim_end = surplus = tail - deficit.
+    assert metrics.frame_restoration_trim_start_frames_total == 0
+    assert metrics.frame_restoration_trim_end_frames_total == 3 * (tail_pad - deficit)
+    # No output-side stretch was used at all.
+    assert metrics.output_stretch_used_count == 0
+    assert metrics.timeline_reconcile_enabled is False
+    assert metrics.timeline_reconcile_count == 0
+
+
+def test_rvc_worker_silence_restores_each_chunk_to_chunk_size():
+    """``silence`` synthesises a zero tail pad (no look-ahead latency) and
+    still emits exactly chunk_size per chunk via the exact slice."""
+    chunk_size = 4800
+    block_size = 480
+    deficit = 96
+    tail_pad = 192
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=128)
+    out_q: "queue.Queue" = queue.Queue(maxsize=128)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _DeficitEngine(deficit_samples=deficit)
+
+    # silence needs only chunk_size available per chunk (tail is synthetic).
     for _ in range(3 * (chunk_size // block_size)):
         in_q.put(np.full(block_size, 0.2, dtype=np.float32))
     in_q.put(SENTINEL)
@@ -779,28 +838,23 @@ def test_rvc_worker_reconciles_each_chunk_to_chunk_size_by_default():
         crossfade_size=0,
         poll_timeout_seconds=0.05,
         drop_stale_input=False,
-        # reconcile_timeline_method defaults to "polyphase"
+        frame_restore_method="silence",
+        tail_pad_size=tail_pad,
     )
 
+    assert engine.call_count == 3
     out_blocks = _drain(out_q)
     total = sum(b.size for b in out_blocks)
-    # 3 chunks * chunk_size samples each = no drain, no per-chunk deficit.
     assert total == 3 * chunk_size
-    assert metrics.timeline_reconcile_enabled is True
-    assert metrics.timeline_reconcile_method == "polyphase"
-    assert metrics.timeline_reconcile_count == 3
-    assert metrics.timeline_expected_output_frames_total == 3 * chunk_size
-    # actual = chunk_size - deficit, three chunks
-    assert metrics.timeline_actual_output_frames_total == 3 * (chunk_size - deficit)
-    assert metrics.timeline_reconciled_output_frames_total == 3 * chunk_size
-    # signed cumulative error = -3 * deficit
-    assert metrics.timeline_reconciliation_total_frame_error == -3 * deficit
-    assert metrics.timeline_max_reconciliation_frames_per_chunk == deficit
+    assert metrics.frame_restore_method == "silence"
+    assert metrics.frame_restoration_count == 3
+    assert metrics.frame_restoration_shortfall_count == 0
+    assert metrics.output_stretch_used_count == 0
 
 
-def test_rvc_worker_off_mode_preserves_legacy_drain_behavior():
-    """``--reconcile-timeline-method off`` must reproduce the Stage 4-D
-    drain: emit size matches what the model returned, NOT chunk_size."""
+def test_rvc_worker_stretch_mode_uses_output_side_polyphase():
+    """``stretch`` reproduces the Stage 4-E output-side reconciliation:
+    no tail pad, the model render is polyphase-stretched up to chunk_size."""
     chunk_size = 4800
     block_size = 480
     deficit = 96
@@ -823,25 +877,67 @@ def test_rvc_worker_off_mode_preserves_legacy_drain_behavior():
         crossfade_size=0,
         poll_timeout_seconds=0.05,
         drop_stale_input=False,
-        reconcile_timeline_method="off",
+        frame_restore_method="stretch",
     )
 
     out_blocks = _drain(out_q)
     total = sum(b.size for b in out_blocks)
-    # Without reconciliation, the worker emits chunk_size - deficit per
-    # chunk; over 3 chunks that's 3 * (chunk_size - deficit). The final
-    # block_size leftover bookkeeping rounds the count, so verify the
-    # drain is at least ``3 * deficit`` samples short of full timeline.
+    assert total == 3 * chunk_size
+    assert metrics.frame_restore_enabled is False
+    assert metrics.timeline_reconcile_enabled is True
+    assert metrics.timeline_reconcile_method == "polyphase"
+    assert metrics.timeline_reconcile_count == 3
+    assert metrics.timeline_actual_output_frames_total == 3 * (chunk_size - deficit)
+    assert metrics.timeline_reconciliation_total_frame_error == -3 * deficit
+    assert metrics.output_stretch_used_count == 3
+    # Input-side restoration did NOT run.
+    assert metrics.frame_restoration_count == 0
+
+
+def test_rvc_worker_off_mode_preserves_legacy_drain_behavior():
+    """``off`` must reproduce the Stage 4-D drain: emit size matches what
+    the model returned, NOT chunk_size."""
+    chunk_size = 4800
+    block_size = 480
+    deficit = 96
+
+    in_q: "queue.Queue" = queue.Queue(maxsize=64)
+    out_q: "queue.Queue" = queue.Queue(maxsize=64)
+    metrics = RuntimeMetrics()
+    stop = threading.Event()
+    engine = _DeficitEngine(deficit_samples=deficit)
+
+    for _ in range(3 * (chunk_size // block_size)):
+        in_q.put(np.full(block_size, 0.2, dtype=np.float32))
+    in_q.put(SENTINEL)
+
+    rvc_worker_loop(
+        engine, in_q, out_q, metrics, stop, SENTINEL,
+        sample_rate=48000,
+        chunk_size=chunk_size,
+        output_block_size=block_size,
+        crossfade_size=0,
+        poll_timeout_seconds=0.05,
+        drop_stale_input=False,
+        frame_restore_method="off",
+    )
+
+    out_blocks = _drain(out_q)
+    total = sum(b.size for b in out_blocks)
+    # Without restoration, the worker emits chunk_size - deficit per chunk;
+    # the final block_size leftover bookkeeping rounds the count.
     assert total <= 3 * chunk_size - (3 * deficit) + block_size
     assert total >= 3 * (chunk_size - deficit) - block_size
-    assert metrics.timeline_reconcile_enabled is False
+    assert metrics.frame_restore_enabled is False
+    assert metrics.frame_restoration_count == 0
+    assert metrics.output_stretch_used_count == 0
     assert metrics.timeline_reconcile_count == 0
 
 
-def test_rvc_worker_reconciliation_skipped_on_identity_fallback():
-    """Identity fallback path emits the chunk's own audio (already at
-    chunk_size). The reconciliation must NOT count that, otherwise the
-    error totals would falsely include fallback frames."""
+def test_rvc_worker_restoration_skipped_on_identity_fallback():
+    """Identity fallback emits the chunk's own audio (already chunk_size).
+    Frame restoration must NOT count that, otherwise the totals would
+    falsely include fallback frames."""
     chunk_size = 2400
     block_size = 480
 
@@ -862,16 +958,16 @@ def test_rvc_worker_reconciliation_skipped_on_identity_fallback():
         output_block_size=block_size,
         crossfade_size=0,
         poll_timeout_seconds=0.05,
+        tail_pad_size=192,
     )
 
     assert metrics.rvc_fallback_count == 1
     out_blocks = _drain(out_q)
     total = sum(b.size for b in out_blocks)
-    # Fallback emits chunk_size samples directly; reconciliation does NOT
-    # apply (the chain already matches the timeline by virtue of being
-    # the original chunk).
+    # Fallback emits chunk_size samples directly; restoration does NOT
+    # apply (the chain already matches the timeline).
     assert total == chunk_size
-    assert metrics.timeline_reconcile_count == 0
+    assert metrics.frame_restoration_count == 0
 
 
 def test_rvc_worker_context_preserved_across_stale_drop():

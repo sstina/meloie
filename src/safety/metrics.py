@@ -155,6 +155,34 @@ class RuntimeMetrics:
     # truncates).
     timeline_reconciliation_total_frame_error: int = 0
 
+    # Stage 4-E2: input-side frame restoration.
+    # The production path no longer stretches the model output. Instead it
+    # feeds [context][chunk][tail_pad] so the structural ~20 ms tail-frame
+    # loss falls inside the tail pad, resamples the whole model output to
+    # the stream SR, and takes a sample-accurate slice
+    # [context_size : context_size + chunk_size]. No stretch, no pitch
+    # shift. ``output_stretch_used_count`` is the honesty gauge: it stays 0
+    # in the input-side methods and only ticks under the diagnostic
+    # ``stretch`` method.
+    frame_restore_method: str = ""
+    frame_restore_enabled: bool = False
+    input_tail_pad_ms: float = 0.0
+    input_tail_pad_frames: int = 0
+    frame_restoration_count: int = 0
+    frame_restoration_shortfall_count: int = 0
+    frame_restoration_expected_frames_total: int = 0   # = sum(chunk_size)
+    frame_restoration_actual_frames_total: int = 0     # = sum(model render before trim)
+    frame_restoration_emitted_frames_total: int = 0    # = sum(chunk_size); drift gauge
+    frame_restoration_trim_start_frames_total: int = 0
+    frame_restoration_trim_end_frames_total: int = 0
+    # Largest |actual_before_trim - expected| over any one chunk. With a
+    # tail pad this is the trimmed surplus; a *shortfall* (model shorter
+    # than the slice) shows up in frame_restoration_shortfall_count.
+    frame_restoration_max_abs_per_chunk_frame_error: int = 0
+    # Counts chunks where the diagnostic output-side stretch actually ran.
+    # 0 for the input-side production methods (lookahead / silence).
+    output_stretch_used_count: int = 0
+
     # Startup vs steady-state output underruns. Bin is decided in the
     # output callback based on whether the worker has emitted any real
     # audio yet (``first_real_output_seen``).
@@ -298,6 +326,39 @@ class RuntimeMetrics:
         if abs(err) > self.timeline_max_reconciliation_frames_per_chunk:
             self.timeline_max_reconciliation_frames_per_chunk = abs(err)
         self.timeline_reconciliation_total_frame_error += err
+
+    def record_frame_restore(
+        self,
+        expected: int,
+        actual_before_trim: int,
+        emitted: int,
+        trim_start: int,
+        trim_end: int,
+        shortfall_frames: int,
+    ) -> None:
+        """Stage 4-E2: count one chunk's input-side frame restoration.
+
+        ``expected`` = chunk_size (the emit target at the stream SR).
+        ``actual_before_trim`` = the whole resampled model render length
+        (= context + chunk + tail_pad - structural deficit). ``emitted``
+        = what was pushed to the output queue AFTER the sample-accurate
+        slice (always chunk_size for the input-side methods).
+        ``trim_start`` = the dropped left-context region (= context_size).
+        ``trim_end`` = the dropped trailing surplus. ``shortfall_frames``
+        = trailing samples that had to be zero-padded because the model
+        render was shorter than the slice (0 in healthy operation).
+        """
+        self.frame_restoration_count += 1
+        self.frame_restoration_expected_frames_total += int(expected)
+        self.frame_restoration_actual_frames_total += int(actual_before_trim)
+        self.frame_restoration_emitted_frames_total += int(emitted)
+        self.frame_restoration_trim_start_frames_total += int(trim_start)
+        self.frame_restoration_trim_end_frames_total += int(trim_end)
+        if int(shortfall_frames) > 0:
+            self.frame_restoration_shortfall_count += 1
+        err = abs(int(actual_before_trim) - int(expected))
+        if err > self.frame_restoration_max_abs_per_chunk_frame_error:
+            self.frame_restoration_max_abs_per_chunk_frame_error = err
 
     @property
     def timeline_reconciliation_mean_ratio(self) -> float:
