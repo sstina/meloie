@@ -13,6 +13,15 @@ ApplicationWindow {
     title: "RVC Voice Changer"
     color: Theme.bgBase
 
+    // close (X) -> hide to the system tray (stream keeps running); the tray menu
+    // 退出 truly quits. When no tray exists, trayActive is false -> normal quit.
+    onClosing: function(close) {
+        if (backend.trayActive) {
+            close.accepted = false;
+            win.hide();
+        }
+    }
+
     // -------- helpers (unchanged logic) --------
     property var micList: {
         var arr = [{ "name": "🎙 系统默认 mic", "index": -1 }];

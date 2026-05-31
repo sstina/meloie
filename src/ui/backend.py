@@ -122,6 +122,7 @@ class Backend(QObject):
         self._loaded_key = None        # model_path of the loaded engine (f0 is live-swappable)
         self._numSpeakers = 1
         self._monitorOn = False        # desired headphone-monitor state (live + start init)
+        self._trayActive = False       # set once at startup (app.py); gates close-to-tray
         self._thread = None
         self._worker = None
         self._merge_thread = None
@@ -170,6 +171,17 @@ class Backend(QObject):
         return self._numSpeakers
 
     numSpeakers = Property(int, _get_numSpeakers, notify=numSpeakersChanged)
+
+    def _get_trayActive(self):
+        return self._trayActive
+
+    trayActive = Property(bool, _get_trayActive, constant=True)   # set once before QML load
+
+    def set_tray_active(self, value: bool) -> None:
+        """Called from app.py before QML loads; gates the window's close-to-tray
+        handler (True -> close hides to tray; False -> close quits, as a fallback
+        when no system tray is available)."""
+        self._trayActive = bool(value)
 
     # --------------------------------------------------- state plumbing (safe)
     def _on_state_change(self, old: SessionState, new: SessionState) -> None:
