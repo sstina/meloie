@@ -43,22 +43,36 @@ def test_parser_accepts_model_and_index_path():
 def test_parser_engineering_defaults():
     args = _build_parser().parse_args(["--config", CONFIG, "--model-path", "x.pth"])
     assert args.device == "auto"
-    assert args.precision == "fp32"    # FP32 is the validated default (faster, same timbre)
-    assert args.chunk_ms == 500.0
-    assert args.rvc_context_ms == 500.0
-    assert args.tail_pad_ms == 30.0
-    assert args.sola_search_ms == 10.0
     assert args.rvc_queue_ms == 6000.0
     assert args.rvc_prebuffer_ms is None
-    assert args.warmup_rvc_count == 2
     assert args.drop_stale_input is True
-    assert args.silence_threshold_dbfs is None    # SilenceFront off by default
-    assert args.silence_hangover_ms == 500.0
-    assert args.resample_sr is None
     assert args.input_device is None     # follow system default
     assert args.output_device is None
     assert args.allow_virtual_cable_input is False
     assert args.pitch is None            # transpose: default to the profile's value
+
+
+def test_parser_direct_engine_defaults():
+    """The direct (v2 Applio) engine knobs and their defaults."""
+    args = _build_parser().parse_args(["--config", CONFIG, "--model-path", "x.pth"])
+    assert args.direct_block_ms == 250.0
+    assert args.direct_context_ms == 2500.0
+    assert args.direct_crossfade_ms == 50.0
+    assert args.direct_embedder == "contentvec"
+    assert args.direct_f0 is None        # default to the profile's f0_method
+    assert args.direct_denoise is False  # input denoise opt-in
+
+
+def test_parser_has_no_engine_selector():
+    """v2-only build: there is a single realtime engine, so the --engine
+    selector was removed entirely. There is no args.engine, and passing any
+    --engine value (incl. the retired v1 'cache' path) is rejected."""
+    args = _build_parser().parse_args(["--config", CONFIG, "--model-path", "x.pth"])
+    assert not hasattr(args, "engine")
+    for value in ("direct", "cache"):
+        with pytest.raises(SystemExit):
+            _build_parser().parse_args(["--config", CONFIG, "--model-path", "x.pth",
+                                        "--engine", value])
 
 
 def test_parser_can_disable_stale_drop():
@@ -67,11 +81,11 @@ def test_parser_can_disable_stale_drop():
     assert args.drop_stale_input is False
 
 
-def test_parser_explicit_device_and_resample_sr():
+def test_parser_explicit_device_and_direct_f0():
     args = _build_parser().parse_args(["--config", CONFIG, "--model-path", "x.pth",
-                                       "--device", "cuda", "--resample-sr", "48000"])
+                                       "--device", "cuda", "--direct-f0", "fcpe"])
     assert args.device == "cuda"
-    assert args.resample_sr == 48000
+    assert args.direct_f0 == "fcpe"
 
 
 def test_parser_rejects_unknown_device():

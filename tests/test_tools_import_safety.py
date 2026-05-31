@@ -43,3 +43,7 @@ def test_importing_verify_cable_route_is_lazy(monkeypatch):
 
 def test_importing_offline_infer_is_lazy(monkeypatch):
     _import_under_trip_wire("tools.offline_infer", monkeypatch)
+
+
+def test_importing_merge_models_is_lazy(monkeypatch):
+    _import_under_trip_wire("tools.merge_models", monkeypatch)

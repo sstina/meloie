@@ -38,7 +38,7 @@ def dbfs_peak(audio: np.ndarray) -> float:
     peak = float(np.max(np.abs(a)))
     if peak <= 0.0 or not np.isfinite(peak):
         return DBFS_SILENCE_FLOOR
-    return 20.0 * np.log10(peak)
+    return float(20.0 * np.log10(peak))   # native float: np.log10 returns np.float64
 
 
 def dbfs_rms(audio: np.ndarray) -> float:
@@ -50,7 +50,7 @@ def dbfs_rms(audio: np.ndarray) -> float:
     if mean_sq <= 0.0 or not np.isfinite(mean_sq):
         return DBFS_SILENCE_FLOOR
     rms = np.sqrt(mean_sq)
-    return 20.0 * np.log10(rms)
+    return float(20.0 * np.log10(rms))    # native float: np.log10 returns np.float64
 
 
 @dataclass(frozen=True)

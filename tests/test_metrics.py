@@ -47,6 +47,25 @@ def test_dbfs_half_scale_is_minus_six_ish():
     assert dbfs_rms(half) == pytest.approx(-6.0206, abs=1e-3)
 
 
+def test_dbfs_returns_native_python_float_on_real_signal():
+    # np.log10 yields np.float64; the GUI crosses these into QML as a QVariantMap
+    # where a numpy scalar is an un-assignable PyObjectWrapper. The non-silence
+    # branch must hand back a *native* float. (regression: "Cannot assign
+    # PySide::PyObjectWrapper to double")
+    sig = np.full(512, 0.3, dtype=np.float32)
+    assert type(dbfs_peak(sig)) is float
+    assert type(dbfs_rms(sig)) is float
+
+
+def test_to_dict_has_no_numpy_scalars():
+    m = RuntimeMetrics()
+    m.input_peak_dbfs = np.float64(-12.5)        # simulate a stray numpy value
+    m.output_rms_dbfs = np.float32(-20.0)
+    d = m.to_dict()
+    assert type(d["input_peak_dbfs"]) is float and d["input_peak_dbfs"] == pytest.approx(-12.5)
+    assert all(type(v).__module__ != "numpy" for v in d.values())
+
+
 # ---------------------------------------------------------------------------
 # NaN / Inf scrub (the only safety transform the runtime applies)
 # ---------------------------------------------------------------------------
@@ -106,16 +125,3 @@ def test_record_inference_ms_updates_mean_max_last():
     assert m.rvc_inference_last_ms == pytest.approx(500.0)
     assert m.rvc_inference_max_ms == pytest.approx(500.0)
     assert m.rvc_inference_mean_ms == pytest.approx(300.0)
-
-
-def test_record_resample_ms_updates_mean():
-    m = RuntimeMetrics()
-    for ms in (2.0, 4.0, 6.0):
-        m.record_resample_ms(ms)
-    assert m.rvc_resample_count == 3
-    assert m.rvc_resample_mean_ms == pytest.approx(4.0)
-    assert m.rvc_resample_last_ms == pytest.approx(6.0)
-
-
-def test_resample_mean_zero_when_no_data():
-    assert RuntimeMetrics().rvc_resample_mean_ms == 0.0

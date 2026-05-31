@@ -37,11 +37,11 @@ def test_loads_minimum_required_fields(tmp_path):
 
 def test_loads_full_profile(tmp_path):
     payload = {
-        "name": "kiki",
-        "model_path": "models/kiki/kikiV1.pth",
-        "index_path": "models/kiki/kikiV1.index",
-        "hubert_path": "models/kiki/hubert_base.pt",
-        "rmvpe_path":  "models/kiki/rmvpe.pt",
+        "name": "A",
+        "model_path": "models/A.pth",
+        "index_path": "models/V2.index",
+        "hubert_path": "models/legacy/hubert_base.pt",
+        "rmvpe_path":  "models/legacy/rmvpe.pt",
         "f0_method": "rmvpe",
         "index_rate": 0.5,
         "protect": 0.33,
@@ -52,16 +52,16 @@ def test_loads_full_profile(tmp_path):
         "notes": "example",
     }
     profile = load_model_profile(str(_write(tmp_path / "full.json", payload)))
-    assert profile.name == "kiki"
-    assert profile.model_path == "models/kiki/kikiV1.pth"
+    assert profile.name == "A"
+    assert profile.model_path == "models/A.pth"
     assert profile.notes == "example"
 
 
 def test_relative_paths_pass_through_verbatim(tmp_path):
     """The loader does NOT resolve relative paths — callers do, against cwd."""
-    p = _write(tmp_path / "p.json", {"model_path": "models/kiki/kikiV1.pth"})
+    p = _write(tmp_path / "p.json", {"model_path": "models/A.pth"})
     profile = load_model_profile(str(p))
-    assert profile.model_path == "models/kiki/kikiV1.pth"
+    assert profile.model_path == "models/A.pth"
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ def test_relative_paths_pass_through_verbatim(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_missing_model_path_raises(tmp_path):
-    p = _write(tmp_path / "nomp.json", {"name": "kiki"})
+    p = _write(tmp_path / "nomp.json", {"name": "demo"})
     with pytest.raises(ModelProfileError) as exc:
         load_model_profile(str(p))
     assert "model_path" in str(exc.value)
@@ -107,14 +107,16 @@ def test_missing_file_raises(tmp_path):
 # Real on-disk example profile must remain loadable
 # ---------------------------------------------------------------------------
 
-def test_kiki_example_profile_loads_and_has_expected_shape():
-    """The committed example profile must always be a valid profile."""
+def test_A_example_profile_loads_and_has_expected_shape():
+    """The committed default profile (model A, v2) must always be valid."""
     repo_root = Path(__file__).resolve().parents[1]
-    p = repo_root / "config" / "model_profiles" / "kiki.example.json"
+    p = repo_root / "config" / "model_profiles" / "A.json"
     assert p.exists(), f"missing example profile at {p}"
     profile = load_model_profile(str(p))
-    assert profile.name == "kiki"
+    assert profile.name == "A"
     assert profile.model_path.endswith(".pth")
-    # Recommended params for the kiki model documented in the profile.
+    # Validated defaults for model A (v2): seller pitch +12, index off (raw
+    # features sounded best in the user A/B), faithful loudness.
     assert profile.f0_method == "rmvpe"
-    assert profile.resample_sr == 0
+    assert profile.pitch_shift == 12
+    assert profile.index_rate == 0.0

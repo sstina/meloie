@@ -1,0 +1,13 @@
+{
+  "name": "A",
+  "model_path": "models/A.pth",
+  "index_path": "models/V2.index",
+  "f0_method": "rmvpe",
+  "index_rate": 0.0,
+  "protect": 0.33,
+  "filter_radius": 3,
+  "rms_mix_rate": 1.0,
+  "pitch_shift": 12,
+  "resample_sr": 0,
+  "notes": "Profile for model 'A' (models/A.pth). Verified v2 / 768-dim / sr=40k / f0-conditioned via the Applio direct engine. pitch_shift=12 is the SELLER-recommended setting (range 10-14); A is a high/female-range model and at pitch 0 it collapsed to a neutral/metallic (电音) timbre -- +12 puts the input F0 in the model's trained range. Tune 10-14 per voice via --pitch. index_rate=0.0 (V2.index NOT loaded): user A/B test found raw features sound best; the index averaged identity away. Bump index_rate>0 (and the engine will load models/V2.index) only if you want retrieval. protect=0.33 and rms_mix_rate=1.0 are faithful defaults (the direct engine forces faithful loudness regardless of rms_mix_rate). f0_method here (rmvpe) is the profile fallback; run_A_direct bakes --direct-f0 fcpe (smoother + ~30% faster). Seller also recommends '性别因子' (formant shift) 0.25 -- a formant/gender control not yet wired in the realtime path (see notes). Paths are relative to the project root."
+}

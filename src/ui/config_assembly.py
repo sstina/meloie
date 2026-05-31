@@ -1,0 +1,187 @@
+"""Qt-free config assembly + enumeration for the GUI.
+
+Turns a selected model (``.pth`` discovered in ``models/``) + device choices into
+the dataclasses the engine and stream need (``StreamingEngineConfig`` /
+``AudioRuntimeConfig``), and lists the discovered models + audio devices for the
+QML dropdowns. A model's tuned recipe (pitch/index/...) comes from a matching
+``<stem>.json`` profile if one exists. Intentionally has NO Qt import so it stays
+cheap and unit-testable; the Qt ``Backend`` calls into it.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+from ..audio.devices import is_probable_cable_input, is_probable_cable_output
+from ..audio.streams import AudioRuntimeConfig, list_audio_devices
+from ..engine.model_profile import ModelProfileError, load_model_profile
+from ..engine.streaming_engine import StreamingEngineConfig
+
+_THIS = os.path.abspath(__file__)
+RVC_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))   # .../RVC
+PROFILES_DIR = os.path.join(RVC_ROOT, "config", "model_profiles")
+
+DEFAULT_F0 = "fcpe"            # launcher parity (run_A_direct bakes --direct-f0 fcpe)
+STREAM_SR = 48000
+
+
+# ---------------------------------------------------------------- devices
+def list_device_dicts() -> List[Dict[str, Any]]:
+    """Audio devices as plain dicts for QML ComboBoxes. Returns [] (not raise)
+    if sounddevice/enumeration fails — the Backend surfaces that separately."""
+    try:
+        infos = list_audio_devices()
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for d in infos:
+        out.append({
+            "index": int(d.index),
+            "name": d.name,
+            "maxIn": int(d.max_input_channels),
+            "maxOut": int(d.max_output_channels),
+            "isCableInput": is_probable_cable_input(d.name),
+            "isCableOutput": is_probable_cable_output(d.name),
+        })
+    return out
+
+
+# -------------------------------------------------- model discovery (models/ dir)
+def models_dir() -> str:
+    """The folder we discover ``.pth`` models in: a ``models`` subdir (matched
+    case-insensitively) next to ``run_gui.bat`` / the frozen ``.exe``. Defaults to
+    ``RVC_ROOT/models`` when no such folder is found."""
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else RVC_ROOT
+    try:
+        for entry in os.scandir(base):
+            if entry.is_dir() and entry.name.lower() == "models":
+                return entry.path
+    except OSError:
+        pass
+    return os.path.join(base, "models")
+
+
+def list_model_files() -> List[Dict[str, Any]]:
+    """All ``.pth`` model files under :func:`models_dir`, as ``{name, path}`` dicts
+    for a QML ComboBox (name = filename stem, sorted). ``[]`` if the folder is
+    missing. The filename IS the model name (no manual file picking)."""
+    d = models_dir()
+    out: List[Dict[str, Any]] = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for fn in names:
+        if fn.lower().endswith(".pth"):
+            out.append({"name": os.path.splitext(fn)[0], "path": os.path.join(d, fn)})
+    out.sort(key=lambda m: m["name"].lower())
+    return out
+
+
+def _profile_for_model(model_path: str):
+    """The matching ``<stem>.json`` profile for a discovered model, or ``None``.
+    A discovered model keeps its tuned recipe (e.g. A.pth <- A.json: pitch 12 +
+    V2.index); models without a profile load with neutral defaults."""
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    prof = os.path.join(PROFILES_DIR, f"{stem}.json")
+    if os.path.isfile(prof):
+        try:
+            return load_model_profile(prof)
+        except ModelProfileError:
+            return None
+    return None
+
+
+def model_default_params(model_path: str) -> Dict[str, Any]:
+    """Slider-init values for a discovered model: its ``<stem>.json`` recipe if
+    present, else neutral defaults (no index, pitch 0)."""
+    p = _profile_for_model(model_path)
+    if p is None:
+        return {
+            "pitch_shift": 0, "protect": 0.33, "index_rate": 0.0,
+            "formant_timbre": 1.0, "formant_on": False, "has_index": False,
+        }
+    # formant_on mirrors build_configs_for_model's derivation so the GUI checkbox
+    # reflects a saved gender shift (engine enables formant when timbre/qfrency != 1.0).
+    formant_on = (float(p.formant_timbre) != 1.0) or (float(p.formant_qfrency) != 1.0)
+    return {
+        "pitch_shift": int(p.pitch_shift),
+        "protect": float(p.protect),
+        "index_rate": float(p.index_rate),
+        "formant_timbre": float(p.formant_timbre),
+        "formant_on": formant_on,
+        "has_index": bool(p.index_path),
+    }
+
+
+def build_configs_for_model(
+    model_path: str,
+    input_substr: Optional[str],
+    output_substr: Optional[str],
+    f0: str = DEFAULT_F0,
+    monitor_substr: Optional[str] = None,
+) -> Tuple[StreamingEngineConfig, AudioRuntimeConfig]:
+    """Build the engine + audio configs from a discovered ``.pth`` model. The
+    model's ``<stem>.json`` profile (if any) supplies the recipe (pitch / index /
+    protect / formant); otherwise neutral defaults. ``model_path`` is ALWAYS the
+    discovered ``.pth`` (the profile only contributes the recipe). The index is
+    ALWAYS loaded when present so the GUI's index slider stays live
+    (``set_index_rate`` would otherwise raise with no index loaded)."""
+    p = _profile_for_model(model_path)
+    if p is not None:
+        index_path = p.index_path or ""
+        index_rate = float(p.index_rate)
+        protect = float(p.protect)
+        pitch_shift = int(p.pitch_shift)
+        formant_timbre = float(p.formant_timbre)
+        formant_qfrency = float(p.formant_qfrency)
+    else:
+        index_path, index_rate, protect, pitch_shift = "", 0.0, 0.33, 0
+        formant_timbre, formant_qfrency = 1.0, 1.0
+    formant_on = (formant_timbre != 1.0) or (formant_qfrency != 1.0)
+
+    scfg = StreamingEngineConfig(
+        model_path=model_path,
+        index_path=index_path,
+        f0_method=f0,
+        embedder="contentvec",
+        pitch_shift=pitch_shift,
+        index_rate=index_rate,
+        protect=protect,
+        sid=0,
+        stream_sr=STREAM_SR,
+        block_ms=250.0,
+        context_ms=2500.0,
+        crossfade_ms=50.0,
+        formant_shift=formant_on,
+        formant_qfrency=formant_qfrency,
+        formant_timbre=formant_timbre,
+        device="cuda",
+    )
+    acfg = build_audio_config(input_substr, output_substr, monitor_substr)
+    return scfg, acfg
+
+
+def build_audio_config(
+    input_substr: Optional[str] = None,
+    output_substr: Optional[str] = None,
+    monitor_substr: Optional[str] = None,
+) -> AudioRuntimeConfig:
+    """The single ``AudioRuntimeConfig`` builder, shared by the load path
+    (:func:`build_configs_for_model`) and the GUI's fast-path Start
+    (``Backend._build_audio``) so block size / queue depth / defaults live in one
+    place. Output defaults to ``CABLE Input``; ``monitor_substr`` None -> system
+    default output. Validated before return."""
+    acfg = AudioRuntimeConfig(
+        sample_rate=STREAM_SR,
+        block_size=480,
+        channels=1,
+        input_device_substring=(input_substr or None),
+        output_device_substring=(output_substr or "CABLE Input"),
+        queue_blocks=64,
+        monitor_device_substring=(monitor_substr or None),
+    )
+    acfg.validate()
+    return acfg

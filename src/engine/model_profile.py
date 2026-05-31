@@ -1,10 +1,12 @@
 """Model profile: the "voice identity" half of an RVC runtime config.
 
-A trained RVC model (``.pth``) plus its retrieval index (``.index``)
-plus supporting encoders (``hubert_base.pt``, ``rmvpe.pt``) together
-define the voice. They were trained as a unit and the model's intended
-inference parameters (``f0_method``, ``index_rate``, ``protect``, etc.)
-are properties of that unit — not user-facing sound design knobs.
+A trained RVC model (``.pth``) plus its retrieval index (``.index``),
+together with the inference parameters it was trained against
+(``f0_method``, ``index_rate``, ``protect``, etc.), define the voice.
+They are properties of that trained unit — not user-facing sound-design
+knobs. (The v2 direct engine embeds via contentvec + staged predictors;
+the optional ``hubert_path`` / ``rmvpe_path`` fields below are legacy and
+unused by it.)
 
 This module loads a JSON model profile that groups those paths and
 parameters into a single named bundle. The two CLIs (``src.main`` for
@@ -15,11 +17,9 @@ mention any of the voice-identity parameters at all.
 Schema (all fields optional except ``model_path``)::
 
     {
-      "name": "kiki",
-      "model_path":  "models/kiki/kikiV1.pth",
-      "index_path":  "models/kiki/kikiV1.index",
-      "hubert_path": "models/kiki/hubert_base.pt",
-      "rmvpe_path":  "models/kiki/rmvpe.pt",
+      "name": "A",
+      "model_path":  "models/A.pth",
+      "index_path":  "models/V2.index",
       "f0_method":   "rmvpe",
       "index_rate":  0.5,
       "protect":     0.33,
@@ -52,19 +52,28 @@ class ModelProfile:
     name: str = ""
     model_path: str = ""
     index_path: Optional[str] = None
-    hubert_path: Optional[str] = None
-    rmvpe_path: Optional[str] = None
     f0_method: str = "rmvpe"
     index_rate: float = 0.5
     protect: float = 0.33
-    filter_radius: int = 3
-    # 1.0 = faithful: keep the model's own loudness envelope. Values < 1.0
-    # impose the SOURCE mic's loudness onto the output (change_rms), which is
-    # runtime gain shaping and breaks the faithful-carrier contract.
-    rms_mix_rate: float = 1.0
     pitch_shift: int = 0
-    resample_sr: int = 0
+    # INPUT-side formant / gender shift (性别因子): timbre>1 = brighter/feminine,
+    # <1 = deeper/masculine, 1.0 = off. Engine enables formant when != 1.0.
+    formant_qfrency: float = 1.0
+    formant_timbre: float = 1.0
     notes: str = ""
+    # --- legacy fields, accepted for back-compat but IGNORED by the v2 direct
+    # engine (kept so older profile JSONs still load). hubert_path/rmvpe_path:
+    # v1-era encoder paths (the v2 engine uses contentvec + staged predictors).
+    # filter_radius: old F0 median window (the realtime F0 estimators set their
+    # own). rms_mix_rate: MUST stay 1.0 -- <1.0 would impose the source mic's
+    # loudness on the OUTPUT (change_rms), breaking the faithful contract, so the
+    # direct engine never honors it. resample_sr: output SR is structural (model
+    # SR -> stream SR). ---
+    hubert_path: Optional[str] = None
+    rmvpe_path: Optional[str] = None
+    filter_radius: int = 3
+    rms_mix_rate: float = 1.0
+    resample_sr: int = 0
 
 
 _PROFILE_FIELD_NAMES = {f.name for f in fields(ModelProfile)}

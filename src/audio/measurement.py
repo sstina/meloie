@@ -1,7 +1,8 @@
 """Pure measurement helpers for Stage 1 validation tools.
 
-Used by ``tools/click_test.py`` (identity-path latency) and
-``tools/verify_cable_route.py`` (non-silence check on the cable route).
+Used by ``tools/verify_cable_route.py`` (non-silence check on the cable
+route). The click-pulse + cross-correlation latency helpers are currently
+exercised only by the test suite (no in-repo CLI consumes them today).
 
 These helpers are deliberately free of any sounddevice / hardware
 dependency so they can be unit tested with synthetic numpy arrays.

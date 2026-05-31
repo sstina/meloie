@@ -7,7 +7,7 @@ __pycache__/
 .venv_applio310/
 venv/
 
-# redirected caches / temp (setup_env.ps1) — never commit
+# redirected caches / temp (setup_env_applio.ps1) — never commit
 .cache/
 .tmp/
 *.pyc
@@ -25,6 +25,9 @@ models/local/
 *.pt
 *.pth
 *.index
+*.bin
+*.onnx
+*.safetensors
 # audit / pseudo-stream report sidecars (see tools/pseudo_stream.py)
 audit_*.json
 

@@ -12,17 +12,22 @@ Usage::
     # validate a runtime config
     python -m src.main --check-config config/runtime.example.json
 
-    # run: system default mic -> kiki model -> CABLE Input
+    # run: system default mic -> model A (v2) -> CABLE Input
     python -m src.main --config config/runtime.example.json \\
-        --model-profile config/model_profiles/kiki.example.json \\
+        --model-profile config/model_profiles/A.json \\
         --device cuda
+    # (or just double-click run_A_direct.bat)
 
 Voice identity comes entirely from the model profile (the trained model
-defines the voice). The CLI only takes engineering knobs (device, chunk
+defines the voice). The CLI only takes engineering knobs (device, block
 size, queue/latency, which mic). There are no voice-shaping flags.
 
+This is a v2-only build: the sole realtime engine is the 'direct' Applio
+persistent-buffer engine (run in .venv-applio). A v1 / 256-dim model is
+rejected at load.
+
 Importing this module must NOT open audio devices and must NOT import
-sounddevice / torch / infer_rvc_python / rvc_engine. Those imports live
+sounddevice / torch / the vendored Applio stack. Those imports live
 inside the run handler.
 """
 
@@ -85,87 +90,118 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Path to RVC .pth (use instead of a profile for a "
                             "quick run; profile params then use defaults).")
     voice.add_argument("--index-path", default=None, help="Path to .index file.")
-    voice.add_argument("--hubert-path", default=None, help="Path to hubert_base.pt.")
-    voice.add_argument("--rmvpe-path", default=None, help="Path to rmvpe.pt.")
     voice.add_argument("--pitch", type=int, default=None, metavar="SEMITONES",
                        help="Transpose (变调) in semitones applied to the input "
                             "F0 before conversion -- THE main creative knob. A "
                             "female model typically needs about +12 for a male "
-                            "voice (e.g. kiki's intended setting is +12). This "
+                            "voice. This "
                             "conditions the model's input pitch (not an output "
                             "pitch-shift). Overrides the profile's pitch_shift; "
                             "default: the profile's value.")
+    voice.add_argument("--sid", type=int, default=0,
+                       help="Speaker id for multi-speaker models (selects which "
+                            "TRAINED voice the model uses -- the model defining the "
+                            "voice, not runtime reshaping). Default 0; validated "
+                            "against the model's speaker count.")
 
     eng = parser.add_argument_group("Engineering knobs (stability / latency)")
-    eng.add_argument("--backend", default="infer_rvc_python",
-                     help="RVC backend identifier.")
+    # No engine selector: this is a v2-only build with a single realtime engine
+    # (the 'direct' Applio persistent-buffer engine, run in .venv-applio). The
+    # voice flows mic -> StreamingRvcEngine -> CABLE Input unconditionally.
+    eng.add_argument("--direct-block-ms", type=float, default=250.0,
+                     help="[engine=direct] output block size (ms). Applio default "
+                          "250. Lower = lower latency, more seams.")
+    eng.add_argument("--direct-context-ms", type=float, default=2500.0,
+                     help="[engine=direct] REAL past audio fed to the encoders each "
+                          "block (w-okada '额外推理时长'). Free latency-wise (it is "
+                          "past); costs only compute + startup warm-up. Bigger = "
+                          "steadier timbre + F0. Default 2500.")
+    eng.add_argument("--direct-crossfade-ms", type=float, default=50.0,
+                     help="[engine=direct] sin² seam crossfade overlap (ms). The one "
+                          "sanctioned output blend; smooths block seams. Applio default 50.")
+    eng.add_argument("--direct-embedder", default="contentvec",
+                     choices=["contentvec"],
+                     help="Embedder model (HuBERT/ContentVec). Only 'contentvec' is "
+                          "staged + verified for v2/768-dim. Staged under "
+                          "RVC/rvc/models/embedders.")
+    eng.add_argument("--direct-f0", default=None,
+                     choices=["rmvpe", "fcpe"],
+                     help="Override the profile's F0 method. The realtime engine backs "
+                          "'rmvpe' and 'fcpe'; fcpe is smoother + ~30%% faster (the "
+                          "run_A_direct launcher bakes '--direct-f0 fcpe'). Default: "
+                          "the profile's value.")
+    eng.add_argument("--direct-denoise",
+                     action=argparse.BooleanOptionalAction, default=False,
+                     help="[engine=direct] INPUT-side noise reduction (Applio's "
+                          "noisereduce TorchGate) BEFORE conversion, so ambient "
+                          "noise is not converted into warbly voice. Input "
+                          "conditioning (like pitch transpose), not output reshaping "
+                          "-- the model still defines the voice. Default OFF (a clean "
+                          "mic / soft speech is never silently degraded).")
+    eng.add_argument("--direct-denoise-strength", type=float, default=0.5,
+                     help="[engine=direct] denoise prop_decrease 0..1 (1 = most "
+                          "aggressive). Higher cleans more but can muffle soft "
+                          "speech. Start ~0.5 and tune to your mic.")
+    eng.add_argument("--direct-denoise-nonstationary",
+                     action=argparse.BooleanOptionalAction, default=True,
+                     help="[engine=direct] adapt to time-varying noise (recommended). "
+                          "--no-direct-denoise-nonstationary = stationary gating.")
+    eng.add_argument("--direct-formant",
+                     action=argparse.BooleanOptionalAction, default=False,
+                     help="INPUT-side FORMANT / gender shift (性别因子) before "
+                          "conversion: moves the spectral envelope (vocal-tract / "
+                          "gender) WITHOUT changing pitch -- input conditioning like "
+                          "--pitch, not output reshaping. Auto-on if --direct-formant-"
+                          "timbre/qfrency != 1.0. Default off.")
+    eng.add_argument("--direct-formant-timbre", type=float, default=1.0,
+                     help="Formant gender knob: >1 = formants up (brighter/feminine), "
+                          "<1 = down (deeper/masculine), 1.0 = none. Tune by ear.")
+    eng.add_argument("--direct-formant-qfrency", type=float, default=1.0,
+                     help="Formant cepstral detail (Applio default 1.0).")
+    eng.add_argument("--direct-autotune",
+                     action=argparse.BooleanOptionalAction, default=False,
+                     help="INPUT-side F0 autotune: snap the detected pitch to the "
+                          "nearest semitone before conversion (creative/robotic "
+                          "stylization). Input conditioning, default off.")
+    eng.add_argument("--direct-autotune-strength", type=float, default=1.0,
+                     help="Autotune blend 0..1 (1 = full snap).")
+    eng.add_argument("--direct-auto-pitch",
+                     action=argparse.BooleanOptionalAction, default=False,
+                     help="INPUT-side auto pitch-shift: derive the transpose from the "
+                          "input's median F0 toward --direct-auto-pitch-threshold "
+                          "(a smart auto-version of --pitch, clamped ±12). Adds to "
+                          "--pitch. Default off.")
+    eng.add_argument("--direct-auto-pitch-threshold", type=float, default=155.0,
+                     help="Target F0 (Hz) for --direct-auto-pitch (~155 male / "
+                          "~255 female baseline).")
+    eng.add_argument("--direct-protect", type=float, default=None,
+                     help="Protect voiceless consonants / breath (0..0.5): higher "
+                          "preserves more of the source's unvoiced detail (less "
+                          "artifacting) at the cost of a touch less conversion. "
+                          "Default: the profile's value (A: 0.33).")
+    eng.add_argument("--direct-silence-dbfs", type=float, default=None,
+                     help="Silence gate (响应阈值 / w-okada silentThreshold): below "
+                          "this input level (dBFS) emit clean silence and skip GPU "
+                          "inference. Input-side (decides WHETHER to convert; never "
+                          "reshapes output). Default OFF; opt in with e.g. -50. Keep "
+                          "it well below your soft-speech level.")
+    eng.add_argument("--direct-silence-hangover-ms", type=float, default=250.0,
+                     help="Keep converting this long after the last loud block so "
+                          "soft trailing syllables are not clipped by the gate.")
     eng.add_argument("--device", default="auto",
                      choices=["auto", "cpu", "cuda"],
                      help="Inference device. 'auto' = cuda if available else cpu.")
-    eng.add_argument("--precision", default="fp32",
-                     choices=["auto", "fp32", "fp16"],
-                     help="Inference numeric precision. Default 'fp32' -- on this "
-                          "backend FP32 uses a 1 s reflect-pad instead of FP16's "
-                          "3 s, so it is ~25%% FASTER (lower inference floor) AND "
-                          "spectrally identical to FP16 (measured), and clearer on "
-                          "soft speech. 'auto' = backend default (FP16 on most "
-                          "NVIDIA GPUs); 'fp16' forces half. Pure precision -- does "
-                          "not reshape the voice.")
-    eng.add_argument("--chunk-ms", type=float, default=500.0,
-                     help="RVC chunk size in ms (accumulation latency). "
-                          "Default 500 — the conservative low-latency setting "
-                          "(steady-state underruns ~0 on an RTX 4080). Do NOT go "
-                          "below ~400: worst-case inference is a fixed ~350 ms "
-                          "(constant reflect-pad, not chunk-scaled), so a smaller "
-                          "budget risks dropouts. Larger = more model context, "
-                          "more latency.")
-    eng.add_argument("--rvc-context-ms", type=float, default=500.0,
-                     help="Input-side left-context fed to the model as warm-up, "
-                          "then sliced away. Continuity only; no voice change. "
-                          "Default 500 ms clears the RVC decoder's internal "
-                          "~240 ms (24-frame) lead-in margin with headroom; "
-                          "canonical realtime RVC uses up to 2500 ms. Larger = "
-                          "fewer chunk-boundary artifacts, more inference cost.")
-    eng.add_argument("--tail-pad-ms", type=float, default=30.0,
-                     help="Look-ahead tail pad that absorbs the model's ~20 ms "
-                          "tail-frame loss; sliced away. No stretch, no pitch.")
-    eng.add_argument("--sola-search-ms", type=float, default=10.0,
-                     help="SOLA seam-alignment search window (ms). Phase-matches "
-                          "each chunk's seam to the previous chunk's tail by "
-                          "choosing the cut offset (no crossfade, no blend, no "
-                          "sample edit) -- removes chunk-boundary comb-filter "
-                          "'电音'. 0 disables. Must be <= tail-pad-ms.")
     eng.add_argument("--rvc-queue-ms", type=float, default=6000.0,
                      help="Per-direction queue capacity in ms.")
     eng.add_argument("--rvc-prebuffer-ms", type=float, default=None,
                      help="Output silence prebuffer before first real audio = the "
-                          "standing output latency. Default: 800 ms (an absolute "
-                          "cushion sized to cover one ~350 ms inference spike plus "
-                          "one chunk's output burst; decoupled from chunk_ms on "
-                          "purpose). Lower = less latency but more underruns.")
-    eng.add_argument("--warmup-rvc-count", type=int, default=2,
-                     help="Dummy inferences before opening the stream (hides "
-                          "the cold-start stall). 0 to disable.")
+                          "standing output latency. Default 800 ms (an absolute "
+                          "cushion covering one inference spike + one output "
+                          "burst). Lower = less latency but more underruns.")
     eng.add_argument("--drop-stale-input",
                      action=argparse.BooleanOptionalAction, default=True,
-                     help="If inference falls behind, drop oldest chunks to "
+                     help="If inference falls behind, drop oldest blocks to "
                           "keep latency bounded. Default: on.")
-    eng.add_argument("--silence-threshold-dbfs", type=float, default=None,
-                     help="SilenceFront (w-okada borrow): skip RVC inference on "
-                          "chunks whose input RMS is below this level (dBFS) and "
-                          "emit silence -- saves GPU on silence, no voice change. "
-                          "Default: OFF (an over-high value would silence soft "
-                          "speech). Opt in with e.g. -60; watch the live in_rms "
-                          "vs your soft-speech level and keep it well below.")
-    eng.add_argument("--silence-hangover-ms", type=float, default=500.0,
-                     help="Keep processing this long after the last voiced chunk "
-                          "so soft/trailing syllables are never clipped by the "
-                          "silence skip. Only used when --silence-threshold-dbfs "
-                          "is set. Default 500.")
-    eng.add_argument("--resample-sr", type=int, default=None,
-                     help="Ask the backend to resample its output to this SR. "
-                          "Default: profile's value or 0 (model-native; the "
-                          "worker resamples to the stream SR).")
 
     return parser
 
@@ -243,7 +279,7 @@ def _require_config(args: argparse.Namespace) -> Optional[AudioRuntimeConfig]:
         print(
             "error: running requires --config PATH\n"
             "example: python -m src.main --config config/runtime.example.json "
-            "--model-profile config/model_profiles/kiki.example.json --device cuda",
+            "--model-profile config/model_profiles/A.json --device cuda",
             file=sys.stderr,
         )
         return None
@@ -287,84 +323,90 @@ def _cmd_run(args: argparse.Namespace) -> int:
     def pick(attr, default):
         return getattr(profile, attr) if profile is not None else default
 
-    if args.resample_sr is not None:
-        resample_sr = args.resample_sr
-    else:
-        resample_sr = profile.resample_sr if profile is not None else 0
+    # v2-only build: the direct (Applio persistent-buffer) engine is the sole path.
+    return _run_direct(args, config, model_path, profile, pick)
 
-    from .engine.rvc_engine import (
-        DependencyMissingError,
-        ModelLoadError,
-        RvcEngine,
-        RvcEngineConfig,
-        RvcInferenceError,
+
+def _run_direct(args, config, model_path, profile, pick) -> int:
+    """Path-A direct engine: build + run the stateful StreamingRvcEngine."""
+    from .engine.streaming_engine import (
+        StreamingEngineConfig,
+        StreamingEngineError,
+        StreamingRvcEngine,
     )
     from .audio.devices import FeedbackLoopRisk
-    from .audio.streams import run_rvc_stream
+    from .audio.streaming_stream import run_streaming_stream
 
-    rvc_config = RvcEngineConfig(
+    index_rate = float(pick("index_rate", 0.0))
+    # only load the index if it actually contributes (index_rate > 0)
+    index_path = (args.index_path or pick("index_path", "")) if index_rate > 0 else ""
+    pitch_shift = args.pitch if args.pitch is not None else int(pick("pitch_shift", 0))
+
+    # INPUT-side formant / gender: CLI overrides the profile; enable when either
+    # the bool is set OR a non-1.0 timbre/qfrency is given (profile or CLI).
+    f_timbre = (args.direct_formant_timbre if args.direct_formant_timbre != 1.0
+                else float(pick("formant_timbre", 1.0)))
+    f_qfrency = (args.direct_formant_qfrency if args.direct_formant_qfrency != 1.0
+                 else float(pick("formant_qfrency", 1.0)))
+    formant_on = bool(args.direct_formant) or f_timbre != 1.0 or f_qfrency != 1.0
+
+    scfg = StreamingEngineConfig(
         model_path=model_path,
-        index_path=args.index_path or pick("index_path", None),
-        backend=args.backend,
-        f0_method=pick("f0_method", "rmvpe"),
-        index_rate=pick("index_rate", 0.5),
-        protect=pick("protect", 0.33),
-        filter_radius=pick("filter_radius", 3),
-        rms_mix_rate=pick("rms_mix_rate", 1.0),
-        pitch_shift=(args.pitch if args.pitch is not None else pick("pitch_shift", 0)),
-        sample_rate=config.sample_rate,
-        resample_sr=resample_sr,
+        index_path=index_path or "",
+        f0_method=(args.direct_f0 or pick("f0_method", "rmvpe")),
+        embedder=args.direct_embedder,
+        pitch_shift=int(pitch_shift),
+        index_rate=index_rate,
+        protect=float(args.direct_protect if args.direct_protect is not None
+                      else pick("protect", 0.33)),
+        sid=int(args.sid),
+        stream_sr=int(config.sample_rate),
+        block_ms=float(args.direct_block_ms),
+        context_ms=float(args.direct_context_ms),
+        crossfade_ms=float(args.direct_crossfade_ms),
+        denoise=bool(args.direct_denoise),
+        denoise_strength=float(args.direct_denoise_strength),
+        denoise_nonstationary=bool(args.direct_denoise_nonstationary),
+        formant_shift=formant_on,
+        formant_qfrency=float(f_qfrency),
+        formant_timbre=float(f_timbre),
+        f0_autotune=bool(args.direct_autotune),
+        f0_autotune_strength=float(args.direct_autotune_strength),
+        proposed_pitch=bool(args.direct_auto_pitch),
+        proposed_pitch_threshold=float(args.direct_auto_pitch_threshold),
+        silence_threshold_dbfs=args.direct_silence_dbfs,
+        silence_hangover_ms=float(args.direct_silence_hangover_ms),
         device=args.device,
-        precision=args.precision,
-        hubert_path=args.hubert_path or pick("hubert_path", None),
-        rmvpe_path=args.rmvpe_path or pick("rmvpe_path", None),
     )
-
-    print(f"voice params: pitch={rvc_config.pitch_shift:+d} semitones  "
-          f"index_rate={rvc_config.index_rate}  f0={rvc_config.f0_method}  "
-          f"protect={rvc_config.protect}  rms_mix={rvc_config.rms_mix_rate}")
-    engine = RvcEngine(rvc_config)
-    print(f"loading RVC backend={rvc_config.backend} device={args.device} ...")
+    print(f"voice params (direct): pitch={scfg.pitch_shift:+d}  index_rate={scfg.index_rate}  "
+          f"f0={scfg.f0_method}  protect={scfg.protect}  embedder={scfg.embedder}  sid={scfg.sid}")
+    print(f"block_ms={scfg.block_ms:.0f}  context_ms={scfg.context_ms:.0f}  "
+          f"crossfade_ms={scfg.crossfade_ms:.0f}  "
+          f"denoise={('ON @ ' + format(scfg.denoise_strength, '.2f')) if scfg.denoise else 'OFF'}  "
+          f"formant={('ON timbre=' + format(scfg.formant_timbre, '.2f')) if scfg.formant_shift else 'OFF'}  "
+          f"autotune={'ON' if scfg.f0_autotune else 'OFF'}  "
+          f"auto_pitch={'ON' if scfg.proposed_pitch else 'OFF'}  "
+          f"silence_gate={(format(scfg.silence_threshold_dbfs, '.0f') + ' dBFS') if scfg.silence_threshold_dbfs is not None else 'OFF'}")
+    print(f"loading direct (Applio persistent-buffer) engine, device={args.device} ...")
+    engine = StreamingRvcEngine(scfg)
     try:
         engine.load()
-    except DependencyMissingError as exc:
-        print(f"error: dependency missing: {exc}", file=sys.stderr)
-        return 10
-    except ModelLoadError as exc:
-        print(f"error: model load failed: {exc}", file=sys.stderr)
+    except StreamingEngineError as exc:
+        print(f"error: direct engine load failed: {exc}", file=sys.stderr)
         return 11
-    print(f"RVC engine loaded. resolved_device={engine.resolved_device} "
-          f"cuda_device={engine.cuda_device_name or '(n/a)'} "
-          f"precision={engine.resolved_precision or '(unknown)'} "
-          f"resample_sr={resample_sr}")
-
-    if args.warmup_rvc_count > 0:
-        warmup_samples = max(1, int(round(args.chunk_ms / 1000.0 * config.sample_rate)))
-        print(f"warming up RVC ({args.warmup_rvc_count} calls, "
-              f"chunk_samples={warmup_samples} at {config.sample_rate} Hz)...")
-        try:
-            for i, ms in enumerate(
-                engine.warmup(warmup_samples, config.sample_rate, args.warmup_rvc_count)
-            ):
-                print(f"  warmup #{i + 1}: {ms:.0f} ms")
-        except (RvcInferenceError, ValueError) as exc:
-            print(f"warning: warmup failed (continuing): {exc}", file=sys.stderr)
+    print(f"direct engine loaded. device={engine.resolved_device} "
+          f"cuda={engine.cuda_device_name or '(n/a)'} precision={engine.resolved_precision} "
+          f"block_frame={engine.block_frame} tgt_sr={engine.tgt_sr}")
 
     try:
-        run_rvc_stream(
+        run_streaming_stream(
             config,
             engine=engine,
-            chunk_ms=args.chunk_ms,
             duration_seconds=args.duration_seconds,
             allow_virtual_cable_input=args.allow_virtual_cable_input,
             rvc_queue_ms=args.rvc_queue_ms,
             rvc_prebuffer_ms=args.rvc_prebuffer_ms,
             drop_stale_input=args.drop_stale_input,
-            context_ms=args.rvc_context_ms,
-            tail_pad_ms=args.tail_pad_ms,
-            sola_search_ms=args.sola_search_ms,
-            silence_threshold_dbfs=args.silence_threshold_dbfs,
-            silence_hangover_ms=args.silence_hangover_ms,
         )
     except FeedbackLoopRisk as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -375,9 +417,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 5
-    except RvcInferenceError as exc:
-        print(f"error: rvc inference fatal: {exc}", file=sys.stderr)
-        return 12
     return 0
 
 

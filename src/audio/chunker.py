@@ -7,9 +7,8 @@ small mono float32 blocks until a fixed chunk size is reached, then
 emits the chunk.
 
 Resampling is needed because some RVC models return audio at a
-different sample rate than the realtime stream uses (the kiki model
-returns 40 kHz natively; our stream is 48 kHz). Two implementations
-live here:
+different sample rate than the realtime stream uses (e.g. a 40 kHz
+model into a 48 kHz stream). Two implementations live here:
 
 * :func:`linear_resample` — pure ``np.interp``. Stable, no edge
   transients, but linear interpolation imprints a low-pass roll-off
@@ -20,7 +19,7 @@ live here:
   is importable, falling back to :func:`linear_resample` otherwise.
   The realtime worker uses this one; the audit (tools/pseudo_stream)
   measured a ~+11 dB output-vs-reference SNR upgrade vs linear interp
-  on the kiki 40 kHz -> 48 kHz path at negligible CPU cost.
+  on a 40 kHz -> 48 kHz path at negligible CPU cost.
 
 This module is intentionally free of realtime / threading complexity.
 It is just numpy buffers + interp, so it can be unit tested without

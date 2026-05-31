@@ -59,23 +59,13 @@ class RuntimeMetrics:
     rvc_stale_chunk_drops: int = 0
     rvc_output_blocks_enqueued: int = 0
     rvc_output_blocks_dropped: int = 0
-    frame_restoration_shortfall_count: int = 0
     # SilenceFront (w-okada borrow): chunks whose input RMS fell below the
-    # silence threshold and were emitted as zeros without running inference.
+    # silence threshold and were emitted as zeros without running inference
+    # (written by the worker from engine.last_silence_skipped).
     rvc_silence_skipped_count: int = 0
-
-    # SOLA seam alignment (faithful: chooses the cut offset, no sample edit).
-    rvc_sola_applied_count: int = 0
+    # SOLA seam alignment (faithful: chooses the cut offset, no sample edit;
+    # written by the worker from engine.last_sola_offset).
     rvc_sola_offset_last: int = 0
-
-    # worker-side resample (model native SR -> stream SR)
-    rvc_resample_count: int = 0
-    rvc_resample_total_ms: float = 0.0
-    rvc_resample_last_ms: float = 0.0
-
-    # input-side frame restoration (look-ahead tail pad)
-    input_tail_pad_ms: float = 0.0
-    input_tail_pad_frames: int = 0
 
     # session info (informational; populated at stream start)
     rvc_chunk_ms: float = 0.0
@@ -85,7 +75,19 @@ class RuntimeMetrics:
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Coerce any numpy scalar (e.g. np.float64 from a dBFS calc) to a native
+        # Python number: this dict becomes a QVariantMap in the GUI, and numpy
+        # scalars arrive in QML as opaque PyObjectWrapper (un-assignable to a
+        # `real`/`int` property). Numpy-agnostic — keys off the .item() method.
+        for k, v in d.items():
+            item = getattr(v, "item", None)
+            if callable(item) and not isinstance(v, (str, bytes, list, tuple, dict)):
+                try:
+                    d[k] = v.item()
+                except Exception:
+                    pass
+        return d
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
@@ -104,15 +106,3 @@ class RuntimeMetrics:
             self.rvc_inference_max_ms = ms
         n = self.rvc_inference_count
         self.rvc_inference_mean_ms = ((n - 1) * self.rvc_inference_mean_ms + ms) / n
-
-    def record_resample_ms(self, ms: float) -> None:
-        ms = float(ms)
-        self.rvc_resample_count += 1
-        self.rvc_resample_total_ms += ms
-        self.rvc_resample_last_ms = ms
-
-    @property
-    def rvc_resample_mean_ms(self) -> float:
-        if self.rvc_resample_count == 0:
-            return 0.0
-        return self.rvc_resample_total_ms / float(self.rvc_resample_count)
