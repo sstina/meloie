@@ -186,6 +186,12 @@ class RealtimeSession:
                 print_metrics=False, **runner_kwargs,
             )
         except BaseException as exc:  # noqa: BLE001 - report, never crash the thread silently
+            if self._stop_event is not None and self._stop_event.is_set():
+                # A stop was requested concurrently; an error raised while tearing
+                # the stream down is not a real failure -> settle back to LOADED,
+                # not ERROR (so the GUI doesn't see a bogus ERROR after a stop).
+                self._transition_if({SessionState.RUNNING, SessionState.STOPPING}, SessionState.LOADED)
+                return
             self._last_error = f"{type(exc).__name__}: {exc}"
             self._set_state(SessionState.ERROR)
             return

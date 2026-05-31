@@ -363,6 +363,12 @@ class Backend(QObject):
 
     # ----------------------------------------------- live INPUT-side setters
     def _guard(self, fn) -> None:
+        if self._busy:
+            # A load/reload/merge is tearing down/rebuilding the engine; skip the
+            # live setter rather than poke a half-built engine (which would raise a
+            # SessionError -> spurious error toast). Slider state is re-synced after
+            # the load completes via modelParamsChanged / sidReset.
+            return
         try:
             fn()
         except Exception as exc:

@@ -29,6 +29,8 @@ this module is cheap and safe elsewhere.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import threading
@@ -186,7 +188,6 @@ class StreamingRvcEngine:
         self._convert_buffer = None
         self._pitch_buffer = None
         self._pitchf_buffer = None
-        self._audio_buffer = None
         self._sola_buffer = None
         self._fade_in = None
         self._fade_out = None
@@ -227,10 +228,11 @@ class StreamingRvcEngine:
         self._F = F
         self._circular_write = circular_write
 
-        if self.cfg.device == "cpu" or not torch.cuda.is_available():
-            self._resolved_device = "cpu"
-        else:
-            self._resolved_device = "cuda"
+        # Best-effort GPU label for the status banner. `_resolved_device` is set
+        # authoritatively below from the pipeline's ACTUAL device -- the vendored
+        # Config picks cuda:0 whenever CUDA is available, independent of
+        # cfg.device -- so we report the real device, not the requested one.
+        if torch.cuda.is_available():
             try:
                 self._cuda_name = str(torch.cuda.get_device_name(0))
             except Exception:
@@ -284,6 +286,7 @@ class StreamingRvcEngine:
             )
 
         self._device = self._pipeline.device
+        self._resolved_device = "cuda" if str(self._device).startswith("cuda") else "cpu"
         self._dtype = self._pipeline.dtype          # torch.float32 (Applio realtime)
         self.tgt_sr = int(self._pipeline.tgt_sr)
         self._tat = tat
@@ -354,7 +357,6 @@ class StreamingRvcEngine:
         self._warmup = int(np.ceil(convert_size_16k / max(self.block_frame_16k, 1))) + 1
 
         dev, dt = self._device, self._dtype
-        self._audio_buffer = torch.zeros(self.block_frame_16k + crossfade_16k, dtype=dt, device=dev)
         self._convert_buffer = torch.zeros(convert_size_16k, dtype=dt, device=dev)
         # +1 frame headroom for the pitch estimator's extra output (Applio).
         self._pitch_buffer = torch.zeros(self._convert_feature_size_16k + 1, dtype=torch.int64, device=dev)
@@ -378,7 +380,6 @@ class StreamingRvcEngine:
         self._convert_buffer.zero_()
         self._pitch_buffer.zero_()
         self._pitchf_buffer.zero_()
-        self._audio_buffer.zero_()
         self._sola_buffer.zero_()
         if self._formant_hist is not None:
             self._formant_hist[:] = 0.0
@@ -651,8 +652,6 @@ class StreamingRvcEngine:
         # inside voice_conversion -- the worker never sees a half-applied change.
         # Uncontended ~100ns/block; a setter waits <= one inference (~45ms). The
         # audio callback runs on a separate thread and is unaffected.
-        import contextlib
-        import io
         # Also swallow stdout during the call: the vendored pipeline
         # (proposed_pitch's 'calculated pitch offset:') and torchfcpe (a benign
         # per-block mel range warning when a loud carrier overshoots ±1 after the
@@ -740,7 +739,6 @@ class StreamingRvcEngine:
                 # ambient noise is not faithfully converted into warbly voice.
                 x = self._denoiser(x.unsqueeze(0)).squeeze(0).to(torch.float32)
             a16 = self._fit16(self._resample_in(x).to(self._dtype), self.block_frame_16k)
-            self._circular_write(a16, self._audio_buffer)
 
             if self._warmup > 0:
                 self._warmup -= 1
