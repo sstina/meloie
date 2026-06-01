@@ -125,5 +125,20 @@ A 调 formant 后 A/B 试听更自然。
   即可（`formant_on` 由 timbre≠1.0 自动派生），无需改 schema。纯 INPUT 端、契约安全。
 - **下一步（需你的耳朵）**：GUI formant 滑块在模型 A 上设 ~1.20 实时 A/B 试听 → 满意则 bake 进 A.json。
 
+### A2 进度（2026-06-01）：引擎核心已实现 + 测试，接线待办
+`streaming_engine.py`：`set_auto_center(on,target_hz,tau_s)` + worker 线程 `_update_auto_center`（慢 EMA
+τ≈10–30s、清音冻结、同款 f0 predictor、小数 `_auto_offset`），`_convert` 用 `f0_up_key=pitch_shift+
+(_auto_offset if on else 0)`。**纯加法、默认 OFF、`_auto_offset` 唯一写者=worker 线程→无竞争、异常不断音频。**
+`tests/test_auto_center.py` 7 项绿，pytest 157 passed。**待办**：session.set_auto_center 委托 + backend @Slot +
+per-model `target_f0_median`(扩 ModelProfile，A 种子≈200Hz) + CLI/GUI 开关 → 用户才能实际开启/试听。
+
+### 辅音诊断（2026-06-01，与 A3/formant 强相关）
+点(diǎn)→扁(biǎn) 的 d→b：**~70–85% 是 RVC/ContentVec 固有地板**（塞音爆破+F2 locus 在 5–30ms，
+16kHz/~20ms 帧/说话人解耦丢细节→偏低位唇音；中文最小对立+送气更敏感；旋钮补不回）。**我们能动的 15–30%**：
+- **formant↑ 伤辅音**（StftPitchShift 抹爆破/F2）→ **A3 别一味加 formant，1.10–1.15 可能比 1.20 平衡**；
+- **protect 0.33→0.45**（清音帧多留原辅音，代价小）；
+- **宽带有线麦**（蓝牙 HFP 窄带是 d→b 灾难放大器）；
+- index_rate=0（A 未开）已排除。
+
 ---
 （变更日志：实现各 Phase 时在 `rvc.md` §10 追加条目。）

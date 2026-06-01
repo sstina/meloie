@@ -115,6 +115,18 @@ class StreamingEngineConfig:
     proposed_pitch: bool = False         # auto-derive a transpose from the median F0
     proposed_pitch_threshold: float = 155.0
 
+    # Input-side AUTO pitch-centering: track the user's running median F0 (slow EMA,
+    # voiced-only, frozen on silence) and ADD a decimal transpose that centers it on
+    # the model's target median Hz -- so any model lands the carrier in its comfort
+    # range without a hand-tuned per-model pitch_shift. Changes WHAT F0 drives the
+    # model (like --pitch), not the model's output. Default OFF. Unlike the vendored
+    # proposed_pitch (per-block median -> flattens sentence prosody), the slow EMA
+    # (tau >> sentence scale ~1-3s) preserves within-utterance intonation.
+    auto_center: bool = False
+    auto_center_target_hz: float = 0.0   # the model's target median F0 (per-model seed)
+    auto_center_tau_s: float = 20.0      # EMA time constant (>> sentence prosody)
+    auto_center_limit: float = 12.0      # clamp the auto offset to +-this many semitones
+
     def validate(self) -> None:
         if not self.model_path:
             raise ValueError("model_path is required")
@@ -146,6 +158,17 @@ class StreamingRvcEngine:
         self.proposed_pitch = bool(config.proposed_pitch)
         self.proposed_pitch_threshold = float(config.proposed_pitch_threshold)
         self.num_speakers = 1          # trained speaker count (set in load from emb_g)
+
+        # Auto pitch-centering (input-side; default OFF). The tracker (worker thread,
+        # in process_block) is the ONLY writer of _auto_offset; _convert reads it on
+        # the same thread, gated by the _auto_center_on flag -> no cross-thread race.
+        self._auto_center_on = bool(config.auto_center)
+        self._auto_offset = 0.0        # decimal semitones added to f0_up_key
+        self._user_f0_ema = None       # running EMA of the user's median F0 (Hz)
+        self._track_buf = None         # rolling 16k input window for the F0 tracker
+        self._track_fill = 0
+        self._track_counter = 0
+        self._track_interval_blocks = 1
 
         # Serialises live set_* calls (control thread) against each other; the
         # audio worker reads the gated state lock-free (flag flipped LAST after
@@ -373,6 +396,13 @@ class StreamingRvcEngine:
         self._resample_in = tat.Resample(orig_freq=asr, new_freq=SR16, dtype=torch.float32).to(dev)
         self._resample_out = tat.Resample(orig_freq=self.tgt_sr, new_freq=asr, dtype=torch.float32).to(dev)
 
+        # auto-center F0 tracker: ~1s ring of 16k input + a cadence (the EMA is slow,
+        # so we only re-estimate every ~1s -> negligible amortized F0 cost).
+        self._track_buf = np.zeros(max(SR16, self.block_frame_16k * 2), dtype=np.float32)
+        self._track_fill = 0
+        self._track_counter = 0
+        self._track_interval_blocks = max(1, int(round(1.0 / max(self.cfg.block_ms / 1000.0, 1e-3))))
+
     def reset(self) -> None:
         """Clear streaming state (e.g. after a silence skip or fallback)."""
         if not self._loaded:
@@ -386,6 +416,12 @@ class StreamingRvcEngine:
         self._silence_hangover_left = 0
         self.last_sola_offset = 0
         self.last_silence_skipped = False
+        self._auto_offset = 0.0
+        self._user_f0_ema = None
+        if self._track_buf is not None:
+            self._track_buf[:] = 0.0
+        self._track_fill = 0
+        self._track_counter = 0
         self._warmup = int(np.ceil(self._convert_size_16k / max(self.block_frame_16k, 1))) + 1
 
     # --------------------------------------------------------- live control
@@ -511,6 +547,83 @@ class StreamingRvcEngine:
             if threshold is not None:
                 self.proposed_pitch_threshold = threshold
 
+    def set_auto_center(self, on, target_hz=None, tau_s=None) -> None:
+        """Input-side AUTO pitch-centering: track the user's median F0 (slow EMA,
+        voiced-only) and ADD a decimal transpose that centers it on ``target_hz``.
+        Live. When OFF the auto offset is ignored (gated in ``_convert``)."""
+        if target_hz is not None:
+            target_hz = float(target_hz)
+            if target_hz <= 0.0:
+                raise ValueError(f"auto-center target_hz must be > 0, got {target_hz}")
+        if tau_s is not None:
+            tau_s = float(tau_s)
+            if tau_s <= 0.0:
+                raise ValueError(f"auto-center tau_s must be > 0, got {tau_s}")
+        with self._lock:
+            if target_hz is not None:
+                self.cfg.auto_center_target_hz = target_hz
+            if tau_s is not None:
+                self.cfg.auto_center_tau_s = tau_s
+            if not on:
+                self._user_f0_ema = None
+            self._auto_center_on = bool(on)
+
+    def _update_auto_center(self, a16) -> None:
+        """Slow-EMA tracker (worker thread): every ``_track_interval_blocks`` blocks,
+        re-estimate the user's median F0 on a rolling ~1s window (same predictor the
+        model uses), update a tau-smoothed EMA (FROZEN when the window is unvoiced),
+        and set the decimal ``_auto_offset`` that centers it on the target median Hz.
+        Best-effort: any hiccup just skips the update -- it never breaks the audio."""
+        try:
+            x = a16.detach().to("cpu").numpy().astype(np.float32).reshape(-1)
+        except Exception:
+            return
+        buf = self._track_buf
+        if buf is None:
+            return
+        n = min(x.shape[0], buf.shape[0])
+        if n <= 0:
+            return
+        buf[:-n] = buf[n:]
+        buf[-n:] = x[-n:]
+        self._track_fill = min(self._track_fill + n, buf.shape[0])
+        self._track_counter += 1
+        if self._track_counter < self._track_interval_blocks:
+            return
+        self._track_counter = 0
+        if self._track_fill < self.block_frame_16k * 2:
+            return
+        seg = buf[-self._track_fill:].copy()
+        with self._lock:                       # snapshot the coupled (model, method) pair
+            f0_model = getattr(self._pipeline, "f0_model", None)
+            f0_method = getattr(self._pipeline, "f0_method", "rmvpe")
+            target = float(self.cfg.auto_center_target_hz)
+            tau = max(float(self.cfg.auto_center_tau_s), 1e-3)
+            limit = float(self.cfg.auto_center_limit)
+        if f0_model is None or target <= 0.0:
+            return
+        try:                                   # estimate OFF the lock (slow); swallow noise
+            with contextlib.redirect_stdout(io.StringIO()):
+                if f0_method == "fcpe":
+                    f0 = f0_model.get_f0(seg, seg.shape[0] // 160, filter_radius=0.006)
+                else:
+                    f0 = f0_model.get_f0(seg, filter_radius=0.03)
+        except Exception:
+            return
+        f0 = np.asarray(f0, dtype=np.float64).reshape(-1)
+        voiced = f0[f0 > 0]
+        if voiced.shape[0] < 8:                # mostly unvoiced -> FREEZE the EMA
+            return
+        med = float(np.median(voiced))
+        if not np.isfinite(med) or med <= 0:
+            return
+        dt = self._track_interval_blocks * (self.cfg.block_ms / 1000.0)
+        alpha = 1.0 - float(np.exp(-dt / tau))
+        ema = self._user_f0_ema                # snapshot (single read; race-safe)
+        ema = med if ema is None else ema + alpha * (med - ema)
+        self._user_f0_ema = ema
+        self._auto_offset = max(-limit, min(limit, 12.0 * float(np.log2(target / ema))))
+
     def set_formant(self, on, timbre=None, qfrency=None) -> None:
         """Input-side formant / gender shift (性别因子). timbre>1 brighter, <1
         deeper, 1.0 neutral. Builds the shifter lazily on first enable. Live."""
@@ -635,7 +748,8 @@ class StreamingRvcEngine:
         def _call():
             return self._pipeline.voice_conversion(
                 self._convert_buffer, self._pitch_buffer, self._pitchf_buffer,
-                f0_up_key=self.pitch_shift, index_rate=self.index_rate,
+                f0_up_key=self.pitch_shift + (self._auto_offset if self._auto_center_on else 0.0),
+                index_rate=self.index_rate,
                 p_len=self._convert_feature_size_16k, silence_front=0,
                 skip_head=self._skip_head, return_length=self._return_length,
                 protect=self.protect, volume_envelope=1,        # 1 => no change_rms
@@ -739,6 +853,8 @@ class StreamingRvcEngine:
                 # ambient noise is not faithfully converted into warbly voice.
                 x = self._denoiser(x.unsqueeze(0)).squeeze(0).to(torch.float32)
             a16 = self._fit16(self._resample_in(x).to(self._dtype), self.block_frame_16k)
+            if self._auto_center_on:
+                self._update_auto_center(a16)
 
             if self._warmup > 0:
                 self._warmup -= 1
