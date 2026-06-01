@@ -254,6 +254,9 @@ class RealtimeSession:
     def set_auto_pitch(self, on, threshold=None) -> None:
         self._require_active(); self._engine.set_auto_pitch(on, threshold)
 
+    def set_auto_center(self, on, target_hz=None, tau_s=None) -> None:
+        self._require_active(); self._engine.set_auto_center(on, target_hz, tau_s)
+
     def set_formant(self, on, timbre=None, qfrency=None) -> None:
         self._require_active(); self._engine.set_formant(on, timbre, qfrency)
 

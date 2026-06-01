@@ -748,14 +748,17 @@ class StreamingRvcEngine:
         def _call():
             return self._pipeline.voice_conversion(
                 self._convert_buffer, self._pitch_buffer, self._pitchf_buffer,
-                f0_up_key=self.pitch_shift + (self._auto_offset if self._auto_center_on else 0.0),
+                # auto-center REPLACES the manual transpose (it IS the centering;
+                # adding pitch_shift on top would double-shift). Manual pitch applies
+                # only when auto-center is off.
+                f0_up_key=(self._auto_offset if self._auto_center_on else self.pitch_shift),
                 index_rate=self.index_rate,
                 p_len=self._convert_feature_size_16k, silence_front=0,
                 skip_head=self._skip_head, return_length=self._return_length,
                 protect=self.protect, volume_envelope=1,        # 1 => no change_rms
                 f0_autotune=self.f0_autotune,
                 f0_autotune_strength=self.f0_autotune_strength,
-                proposed_pitch=self.proposed_pitch,
+                proposed_pitch=self.proposed_pitch and not self._auto_center_on,
                 proposed_pitch_threshold=self.proposed_pitch_threshold,
                 reduced_noise=None, board=None,                 # no FX / noise-reduce
                 block_size_16k=self.block_frame_16k,

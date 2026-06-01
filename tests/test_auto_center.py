@@ -108,11 +108,15 @@ def test_tracker_subsamples_by_interval():
     _feed(e); assert abs(e._auto_offset - 12.0) < 1e-6   # block 3 -> fires
 
 
-def test_off_gate_ignores_stale_offset():
-    # an offset computed while ON must not leak once turned OFF (gated in _convert).
+def test_auto_center_replaces_manual_pitch():
+    # REPLACE semantics: when ON, the effective transpose is auto_offset alone (the
+    # manual pitch_shift is inactive -> no double-shift). When OFF, manual applies.
     e = _tracker_engine(np.full(50, 100.0))
+    e.pitch_shift = 12
     _feed(e)
-    assert e._auto_offset != 0.0
+    assert abs(e._auto_offset - 12.0) < 1e-6
+    eff_on = e._auto_offset if e._auto_center_on else e.pitch_shift
+    assert eff_on == e._auto_offset              # manual 12 NOT added (would be 24)
     e.set_auto_center(False)
-    eff = e.pitch_shift + (e._auto_offset if e._auto_center_on else 0.0)
-    assert eff == e.pitch_shift                  # auto contribution gated out
+    eff_off = e._auto_offset if e._auto_center_on else e.pitch_shift
+    assert eff_off == 12                          # manual pitch applies again

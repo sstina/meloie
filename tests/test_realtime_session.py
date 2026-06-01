@@ -151,10 +151,12 @@ def test_set_delegates_to_engine_while_running():
     s.start(AUDIO)
     s.set_pitch_shift(5)
     s.set_formant(True, timbre=0.25)
+    s.set_auto_center(True)
     s.stop()
     names = [c[0] for c in created[0].calls]
     assert ("set_pitch_shift", (5,), {}) in created[0].calls
     assert "set_formant" in names
+    assert ("set_auto_center", (True, None, None), {}) in created[0].calls
 
 
 def test_set_before_load_raises():

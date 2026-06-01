@@ -74,6 +74,7 @@ def run() -> int:
     backend.setSid(0)
     backend.setF0Method("rmvpe")
     backend.setMonitor(True)
+    backend.setAutoCenter(True)
 
     result = {}
 
@@ -84,6 +85,7 @@ def run() -> int:
         result["silence_delegated"] = any(c[0] == "set_silence_gate" for c in eng.calls)
         result["sid_delegated"] = any(c[0] == "set_sid" for c in eng.calls)
         result["f0_delegated"] = any(c[0] == "set_f0_method" for c in eng.calls)
+        result["auto_center_delegated"] = any(c[0] == "set_auto_center" for c in eng.calls)
         result["monitor_delegated"] = (session.monitor_enabled is True)
         result["model_api"] = (hasattr(backend, "models") and hasattr(backend, "mergeModels")
                                and hasattr(backend, "selectModel"))

@@ -102,6 +102,7 @@ def model_default_params(model_path: str) -> Dict[str, Any]:
         return {
             "pitch_shift": 0, "protect": 0.33, "index_rate": 0.0,
             "formant_timbre": 1.0, "formant_on": False, "has_index": False,
+            "target_f0_median": 0.0,
         }
     # formant_on mirrors build_configs_for_model's derivation so the GUI checkbox
     # reflects a saved gender shift (engine enables formant when timbre/qfrency != 1.0).
@@ -113,6 +114,8 @@ def model_default_params(model_path: str) -> Dict[str, Any]:
         "formant_timbre": float(p.formant_timbre),
         "formant_on": formant_on,
         "has_index": bool(p.index_path),
+        # >0 means auto-center has a target to aim at -> the GUI can offer the toggle.
+        "target_f0_median": float(p.target_f0_median) if p.target_f0_median else 0.0,
     }
 
 
@@ -137,9 +140,11 @@ def build_configs_for_model(
         pitch_shift = int(p.pitch_shift)
         formant_timbre = float(p.formant_timbre)
         formant_qfrency = float(p.formant_qfrency)
+        target_f0_median = float(p.target_f0_median) if p.target_f0_median else 0.0
     else:
         index_path, index_rate, protect, pitch_shift = "", 0.0, 0.33, 0
         formant_timbre, formant_qfrency = 1.0, 1.0
+        target_f0_median = 0.0
     formant_on = (formant_timbre != 1.0) or (formant_qfrency != 1.0)
 
     scfg = StreamingEngineConfig(
@@ -158,6 +163,7 @@ def build_configs_for_model(
         formant_shift=formant_on,
         formant_qfrency=formant_qfrency,
         formant_timbre=formant_timbre,
+        auto_center_target_hz=target_f0_median,   # seed; auto_center stays OFF (GUI opt-in)
         device="cuda",
     )
     acfg = build_audio_config(input_substr, output_substr, monitor_substr)

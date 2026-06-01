@@ -125,12 +125,16 @@ A 调 formant 后 A/B 试听更自然。
   即可（`formant_on` 由 timbre≠1.0 自动派生），无需改 schema。纯 INPUT 端、契约安全。
 - **下一步（需你的耳朵）**：GUI formant 滑块在模型 A 上设 ~1.20 实时 A/B 试听 → 满意则 bake 进 A.json。
 
-### A2 进度（2026-06-01）：引擎核心已实现 + 测试，接线待办
-`streaming_engine.py`：`set_auto_center(on,target_hz,tau_s)` + worker 线程 `_update_auto_center`（慢 EMA
-τ≈10–30s、清音冻结、同款 f0 predictor、小数 `_auto_offset`），`_convert` 用 `f0_up_key=pitch_shift+
-(_auto_offset if on else 0)`。**纯加法、默认 OFF、`_auto_offset` 唯一写者=worker 线程→无竞争、异常不断音频。**
-`tests/test_auto_center.py` 7 项绿，pytest 157 passed。**待办**：session.set_auto_center 委托 + backend @Slot +
-per-model `target_f0_median`(扩 ModelProfile，A 种子≈200Hz) + CLI/GUI 开关 → 用户才能实际开启/试听。
+### A2 进度（2026-06-01）：**全接线完成**，可在 GUI 开关试听
+- 引擎(`streaming_engine.py`)：`set_auto_center(on,target_hz,tau_s)` + worker 线程 `_update_auto_center`（慢 EMA
+  τ≈10–30s、清音冻结、同款 f0 predictor、小数 `_auto_offset`）；`_convert` 用 `f0_up_key=(_auto_offset if on
+  else pitch_shift)`——**REPLACE 语义**（auto 取代手动 pitch 防二次移调；auto on 时也压掉 vendored `proposed_pitch`）。
+  默认 OFF、`_auto_offset` 唯一写者=worker 线程→无竞争、异常不断音频。
+- 接线：`ModelProfile.target_f0_median`（A 种子=200）→ `config_assembly` load 时种进 cfg → `session.set_auto_center`
+  → `backend.setAutoCenter(bool)` → QML「自动音高居中」开关（target>0 才显示；开时灰掉手动 pitch 滑块）。CLI 暂无旗标。
+- 验证：`test_auto_center.py` 7 项 + session/backend 委托链；pytest 157、check_qml 0 warning、smoke_ui_backend PASS。
+- **试听**：GUI 选 A → 开「自动音高居中」（→200Hz）→ 不同音高的人说话都应被自动搬进 A 的音域（替代手调 +12）。
+  τ≈20s 默认；若觉得跟不上音高漂移可调小 τ，若觉得压平语调可调大。
 
 ### 辅音诊断（2026-06-01，与 A3/formant 强相关）
 点(diǎn)→扁(biǎn) 的 d→b：**~70–85% 是 RVC/ContentVec 固有地板**（塞音爆破+F2 locus 在 5–30ms，

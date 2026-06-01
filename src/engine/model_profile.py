@@ -60,6 +60,12 @@ class ModelProfile:
     # <1 = deeper/masculine, 1.0 = off. Engine enables formant when != 1.0.
     formant_qfrency: float = 1.0
     formant_timbre: float = 1.0
+    # A2 auto pitch-centering target: the model's typical median F0 (Hz). When the
+    # GUI enables auto-center, the engine transposes the carrier so the user's median
+    # lands here -- replacing the hand-tuned pitch_shift. None = no seed (auto-center
+    # has nothing to aim at and stays inert). Hand-seeded (e.g. A ~= 200) since the
+    # emb_pitch weight-probe could not derive it (see docs/f0_remap_plan.md).
+    target_f0_median: Optional[float] = None
     notes: str = ""
     # --- legacy fields, accepted for back-compat but IGNORED by the v2 direct
     # engine (kept so older profile JSONs still load). hubert_path/rmvpe_path:

@@ -407,6 +407,12 @@ class Backend(QObject):
     def setAutoPitch(self, on, threshold):
         self._guard(lambda: self._session.set_auto_pitch(bool(on), threshold=float(threshold)))
 
+    @Slot(bool)
+    def setAutoCenter(self, on):
+        # A2 auto pitch-centering: just flip the flag; the per-model target_hz was
+        # seeded into the engine cfg at load (from the profile's target_f0_median).
+        self._guard(lambda: self._session.set_auto_center(bool(on)))
+
     @Slot(int)
     def setSid(self, v):
         self._guard(lambda: self._session.set_sid(int(v)))

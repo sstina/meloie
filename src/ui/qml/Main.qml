@@ -97,6 +97,10 @@ ApplicationWindow {
         win.mergePick = m;              // reassign so bindings (button enabled) react
     }
 
+    // A2 auto pitch-centering availability (per-model target_f0_median seed)
+    property real autoCenterTarget: 0
+    property bool autoCenterAvail: false
+
     function initSliders() {
         var p = backend.modelParams;
         if (!p) return;
@@ -106,6 +110,9 @@ ApplicationWindow {
         formantSlider.value = p.formant_timbre !== undefined ? p.formant_timbre : 1.0;
         formantOn.checked   = (p.formant_on === true);   // reflect a saved gender shift
         indexSlider.enabled = (p.has_index === true);
+        win.autoCenterTarget = p.target_f0_median !== undefined ? p.target_f0_median : 0;
+        win.autoCenterAvail  = win.autoCenterTarget > 0;
+        autoCenterOn.checked = false;        // fresh model load -> auto-center off (engine default)
     }
 
     // compound-control pushers (checkbox + slider(s) -> one setter call)
@@ -355,7 +362,27 @@ ApplicationWindow {
                 }
                 LabeledSlider {
                     id: pitchSlider; label: "变调 pitch"; from: -24; to: 24; stepSize: 1; decimals: 0; suffix: " st"
+                    enabled: !autoCenterOn.checked       // auto-center REPLACES manual transpose
                     onMoved: backend.setPitch(value)
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s3
+                    AppCheckBox {
+                        id: autoCenterOn
+                        text: "自动音高居中"
+                        enabled: win.autoCenterAvail
+                        onToggled: backend.setAutoCenter(checked)
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        color: Theme.textMuted
+                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                        text: win.autoCenterAvail
+                              ? ("→ " + Math.round(win.autoCenterTarget) + " Hz（替代手动变调）")
+                              : "（此模型未设目标音高）"
+                    }
                 }
                 RowLayout {
                     Layout.fillWidth: true
