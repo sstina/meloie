@@ -18,6 +18,43 @@ _QML_DIR = os.path.join(_UI_DIR, "qml")
 RVC_ROOT = os.path.dirname(os.path.dirname(_UI_DIR))   # .../RVC
 
 
+def _apply_dark_titlebar(window) -> None:
+    """Recolor the native Windows title bar to match the dark theme via DWM.
+
+    Per-window and cosmetic only — keeps every native behaviour (minimise /
+    maximise / close, drag, snap, double-click-maximise); it just makes the
+    caption, its text, and the thin frame dark so the bar blends into the app
+    instead of a light-grey native strip. Colors mirror Theme.qml (bgBase /
+    textPrimary / bgElevated). Best-effort: a no-op on non-Windows or pre-Win11
+    builds where the attributes are unsupported (DwmSetWindowAttribute then just
+    returns an error HRESULT — never raises), so it can never break startup."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        dwm = ctypes.windll.dwmapi
+        hwnd = ctypes.c_void_p(int(window.winId()))      # forces native handle creation
+
+        def _set(attr: int, value: int) -> None:
+            v = ctypes.c_int(value)
+            dwm.DwmSetWindowAttribute(hwnd, ctypes.c_uint(attr),
+                                      ctypes.byref(v), ctypes.sizeof(v))
+
+        def _colorref(r: int, g: int, b: int) -> int:
+            return (b << 16) | (g << 8) | r              # DWM COLORREF = 0x00BBGGRR
+
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_BORDER_COLOR = 34
+        DWMWA_CAPTION_COLOR = 35
+        DWMWA_TEXT_COLOR = 36
+        _set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1)                   # light glyphs on a dark bar
+        _set(DWMWA_CAPTION_COLOR, _colorref(0x0E, 0x14, 0x1B))   # Theme.bgBase
+        _set(DWMWA_TEXT_COLOR,    _colorref(0xF1, 0xF5, 0xF9))   # Theme.textPrimary
+        _set(DWMWA_BORDER_COLOR,  _colorref(0x23, 0x2D, 0x38))   # Theme.bgElevated (faint edge)
+    except Exception:
+        pass     # unsupported build / API absent -> keep the default native bar
+
+
 def main() -> int:
     # Resolve model/profile/index relative paths against the project root.
     if os.path.abspath(os.getcwd()) != os.path.abspath(RVC_ROOT):
@@ -55,6 +92,9 @@ def main() -> int:
     if not engine.rootObjects():
         print("ERROR: failed to load Main.qml", file=sys.stderr)
         return 1
+
+    # Recolor the native Windows title bar to match the dark theme (best-effort).
+    _apply_dark_titlebar(engine.rootObjects()[0])
 
     tray = None
     if tray_available:
