@@ -27,6 +27,25 @@ def test_list_model_files_empty_when_missing(tmp_path, monkeypatch):
     assert ca.list_model_files() == []
 
 
+def test_list_model_files_recurses_subfolders(tmp_path, monkeypatch):
+    # .pth at any depth must be found; nested ones get a forward-slashed subpath
+    # name so same-filename models in different folders stay distinguishable.
+    (tmp_path / "A.pth").write_bytes(b"x")
+    (tmp_path / "voices").mkdir()
+    (tmp_path / "voices" / "C.pth").write_bytes(b"x")
+    deep = tmp_path / "voices" / "deep"
+    deep.mkdir()
+    (deep / "Nested.pth").write_bytes(b"x")
+    (deep / "skip.bin").write_bytes(b"x")          # non-.pth ignored at any depth
+    monkeypatch.setattr(ca, "models_dir", lambda: str(tmp_path))
+
+    ms = ca.list_model_files()
+    names = [m["name"] for m in ms]
+    assert names == ["A", "voices/C", "voices/deep/Nested"]   # sorted, recursive
+    by_name = {m["name"]: m["path"] for m in ms}
+    assert by_name["voices/deep/Nested"].endswith("Nested.pth")
+
+
 def _write_profile(tmp_path, stem, **fields):
     payload = {"name": stem, "model_path": f"models/{stem}.pth", **fields}
     (tmp_path / f"{stem}.json").write_text(json.dumps(payload), encoding="utf-8")

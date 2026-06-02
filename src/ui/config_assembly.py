@@ -64,18 +64,23 @@ def models_dir() -> str:
 
 
 def list_model_files() -> List[Dict[str, Any]]:
-    """All ``.pth`` model files under :func:`models_dir`, as ``{name, path}`` dicts
-    for a QML ComboBox (name = filename stem, sorted). ``[]`` if the folder is
-    missing. The filename IS the model name (no manual file picking)."""
+    """Every ``.pth`` model found RECURSIVELY under :func:`models_dir` (any depth of
+    subfolder), as ``{name, path}`` dicts for a QML ComboBox. ``name`` is the path
+    relative to ``models_dir`` without the ``.pth`` extension, forward-slashed — the
+    bare stem for a top-level model, or ``subdir/stem`` when nested, so two models
+    with the same filename in different folders stay distinguishable. Sorted by
+    name; ``[]`` if the folder is missing (``os.walk`` of a missing dir yields
+    nothing). The path IS the identity (the engine loads ``path``); ``name`` is
+    display-only and the ``<stem>.json`` profile lookup keys off the file's
+    basename, so nesting never changes which recipe a model loads."""
     d = models_dir()
     out: List[Dict[str, Any]] = []
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return out
-    for fn in names:
-        if fn.lower().endswith(".pth"):
-            out.append({"name": os.path.splitext(fn)[0], "path": os.path.join(d, fn)})
+    for root, _dirs, files in os.walk(d):
+        for fn in files:
+            if fn.lower().endswith(".pth"):
+                full = os.path.join(root, fn)
+                name = os.path.splitext(os.path.relpath(full, d))[0].replace(os.sep, "/")
+                out.append({"name": name, "path": full})
     out.sort(key=lambda m: m["name"].lower())
     return out
 
