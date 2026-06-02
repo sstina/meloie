@@ -122,32 +122,6 @@ ApplicationWindow {
     function pushAutotune()  { backend.setAutotune(atOn.checked, atStr.value); }
     function pushAutoPitch() { backend.setAutoPitch(apOn.checked, apThr.value); }
 
-    // apply a 捏脸 preset: set the relevant sliders, and push live if the engine
-    // is active (index only when an index is loaded). Pitch is model-dependent
-    // -> presets never touch it (the main slider + the per-model save own it).
-    function applyPreset(p) {
-        if (!p) return;
-        var active = (backend.state === "running" || backend.state === "loaded");
-        if (p.formant_timbre !== undefined || p.formant_on !== undefined) {
-            formantOn.checked = (p.formant_on === true);
-            if (p.formant_timbre !== undefined) formantSlider.value = p.formant_timbre;
-            if (active) win.pushFormant();
-        }
-        if (p.index_rate !== undefined && indexSlider.enabled) {
-            indexSlider.value = p.index_rate;
-            if (active) backend.setIndexRate(p.index_rate);
-        }
-        if (p.protect !== undefined) {
-            protectSlider.value = p.protect;
-            if (active) backend.setProtect(p.protect);
-        }
-        if (p.autotune_on !== undefined) {
-            atOn.checked = (p.autotune_on === true);
-            if (p.autotune_strength !== undefined) atStr.value = p.autotune_strength;
-            if (active) win.pushAutotune();
-        }
-    }
-
     Component.onCompleted: {
         win.initSliders();
         outCombo.currentIndex = win.cableInputIndex(win.outList);
@@ -399,21 +373,12 @@ ApplicationWindow {
                     onMoved: backend.setIndexRate(value)
                 }
 
-                // ---- 🎭 预设 / presets: one-click carrier recipe + per-model save ----
+                // ---- 💾 per-model save: remember the current carrier knobs as this model's default ----
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: Theme.s3
-                    Label { text: "🎭 预设"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody; Layout.preferredWidth: 96 }
-                    AppComboBox {
-                        id: presetCombo
-                        Layout.fillWidth: true
-                        model: backend.presets
-                        textRole: "name"
-                    }
-                    AppButton {
-                        text: "应用"; flat: true
-                        onClicked: win.applyPreset(backend.presets[presetCombo.currentIndex])
-                    }
+                    Label { text: "模型默认"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody; Layout.preferredWidth: 96 }
+                    Item { Layout.fillWidth: true }
                     AppButton {
                         text: "💾 记住当前"; flat: true
                         onClicked: {

@@ -89,9 +89,10 @@ def run() -> int:
         result["monitor_delegated"] = (session.monitor_enabled is True)
         result["model_api"] = (hasattr(backend, "models") and hasattr(backend, "mergeModels")
                                and hasattr(backend, "selectModel"))
-        result["presets_api"] = (len(backend.presets) > 0 and hasattr(backend, "saveModelDefaults"))
+        result["save_defaults_api"] = hasattr(backend, "saveModelDefaults")
         result["sid_reset_signal"] = hasattr(backend, "sidReset")
-        result["dead_signal_removed"] = not hasattr(backend, "presetsChanged")
+        result["presets_removed"] = (not hasattr(backend, "presetsChanged")
+                                     and not hasattr(backend, "presets"))
         result["running_state_seen"] = SessionState.RUNNING.value in states
         result["metrics_growing"] = bool(metrics_seen) and metrics_seen[-1].get("input_frames", 0) > 0
         result["no_errors"] = (errors == [])

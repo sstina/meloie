@@ -109,10 +109,9 @@ override per run with **`--pitch SEMITONES`** to find what suits your voice (it
 conditions the model's input pitch — not an output pitch-shift).
 
 **In the GUI**, the model dropdown lists the `.pth` files in `models/`. Tune the
-carrier knobs live, pick a one-click **🎭 预设** starter (更亮·女声 / 更沉·男声 /
-锁音色 / …), and click **💾 记住当前** to save the current knobs as that model's
-defaults (written to this profile) so it loads that way next time — set a model's
-pitch once and it sticks.
+carrier knobs live, then click **💾 记住当前** to save the current knobs as that
+model's defaults (written to this profile) so it loads that way next time — set a
+model's pitch once and it sticks.
 
 ## 融合音色 / Merge voices (捏脸 voice-morphing)
 

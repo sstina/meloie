@@ -1,9 +1,9 @@
-"""Pure tests for the 捏脸 presets module (no Qt, no torch).
+"""Pure tests for the 捏脸 per-model save (no Qt, no torch).
 
-Covers the built-in starter shape and the per-model save (writes a profile that
-the strict ModelProfile loader accepts, updates an existing one preserving its
-index_path / legacy fields, folds formant on/off into formant_timbre, and never
-leaks non-profile keys).
+Covers ``save_model_profile``: writes a profile that the strict ModelProfile
+loader accepts, updates an existing one preserving its index_path / legacy
+fields, folds formant on/off into formant_timbre, clamps out-of-range values,
+and never leaks non-profile keys.
 """
 
 from __future__ import annotations
@@ -12,12 +12,6 @@ import json
 
 from src.engine.model_profile import load_model_profile
 from src.ui import presets as pr
-
-
-def test_builtin_presets_shape():
-    assert len(pr.BUILTIN_PRESETS) >= 3
-    for p in pr.BUILTIN_PRESETS:
-        assert isinstance(p.get("name"), str) and p["name"]
 
 
 def test_save_creates_loadable_profile(tmp_path):

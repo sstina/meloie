@@ -162,11 +162,6 @@ class Backend(QObject):
 
     modelParams = Property("QVariantMap", _get_modelParams, notify=modelParamsChanged)
 
-    def _get_presets(self):
-        return pr.BUILTIN_PRESETS
-
-    presets = Property("QVariantList", _get_presets, constant=True)
-
     def _get_numSpeakers(self):
         return self._numSpeakers
 

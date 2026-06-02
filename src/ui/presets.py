@@ -1,17 +1,13 @@
-"""捏脸 presets: built-in starter recipes + per-model save (Qt-free, pure).
+"""捏脸 per-model save: persist the current carrier knobs as a model's default (Qt-free, pure).
 
-A preset is a named set of INPUT-side carrier knobs (formant / index / protect /
-autotune). Applying one is contract-safe — it conditions *what speech* the model
-converts, never the model's output. Built-in presets are global timbre starters
-and deliberately do NOT touch pitch (pitch is model-dependent; the main slider +
-the per-model save own it).
-
-``save_model_profile`` writes the current carrier knobs back to the model's
-``<stem>.json`` profile, which the GUI auto-loads on select / first load
-(``config_assembly.model_default_params`` / ``build_configs_for_model``). So each
-model remembers its own knobs — this also removes the pitch=0 footgun (set pitch
-once, save, and the model loads with it next time). Only valid ``ModelProfile``
-keys are written so ``load_model_profile`` (which rejects unknown keys) accepts it.
+``save_model_profile`` writes the current INPUT-side carrier knobs (formant /
+index / protect / pitch) back to the model's ``<stem>.json`` profile, which the
+GUI auto-loads on select / first load (``config_assembly.model_default_params`` /
+``build_configs_for_model``). So each model remembers its own knobs — this also
+removes the pitch=0 footgun (set pitch once, save, and the model loads with it
+next time). Saving is contract-safe — it conditions *what speech* the model
+converts, never the model's output. Only valid ``ModelProfile`` keys are written
+so ``load_model_profile`` (which rejects unknown keys) accepts it.
 """
 
 from __future__ import annotations
@@ -20,18 +16,6 @@ import json
 import math
 import os
 from typing import Any, Dict
-
-# Built-in starter presets. Each touches only the timbre knobs it names; a missing
-# field is left untouched on apply. NO pitch (model-dependent; set per-model).
-BUILTIN_PRESETS = [
-    {"name": "原始 / Neutral", "formant_on": False, "index_rate": 0.0,
-     "protect": 0.33, "autotune_on": False},
-    {"name": "更亮 · 女声", "formant_on": True, "formant_timbre": 1.25, "index_rate": 0.25},
-    {"name": "更沉 · 男声", "formant_on": True, "formant_timbre": 0.80, "index_rate": 0.25},
-    {"name": "锁音色 · 强检索", "index_rate": 0.60, "protect": 0.33},
-    {"name": "电音 · Autotune", "autotune_on": True, "autotune_strength": 1.0},
-]
-
 
 def _clamp_finite(v: Any, lo: float, hi: float, default: float) -> float:
     """Clamp ``v`` to ``[lo, hi]``; fall back to ``default`` for non-finite input
