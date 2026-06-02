@@ -230,12 +230,16 @@ ApplicationWindow {
         rowSpacing: Theme.s3
 
         // ---------------- LEFT: controls (scrollable; capped so sliders stay precise) ----------------
-        ScrollView {
-            id: leftScroll
+        Item {
+            id: leftCol
             Layout.fillWidth: true
             Layout.fillHeight: true
             Layout.horizontalStretchFactor: 3
             Layout.maximumWidth: win.narrow ? 1000000 : 880
+
+            ScrollView {
+            id: leftScroll
+            anchors.fill: parent
             contentWidth: availableWidth
             clip: true
 
@@ -575,6 +579,33 @@ ApplicationWindow {
                             }
                         }
                     }
+                }
+            }
+            }
+
+            // top / bottom scroll-edge fade: cards melt into the base color at the
+            // clip line instead of a hard cut. Plain gradient rects (no layer / mask
+            // / effect) so they render identically offscreen and live. Each shows
+            // only when there's hidden content that way (so the top card title isn't
+            // permanently dimmed); the gradient direction points "into" the content.
+            Rectangle {
+                anchors { top: parent.top; left: parent.left; right: parent.right }
+                height: Theme.s6
+                opacity: leftScroll.contentItem.atYBeginning ? 0.0 : 1.0
+                Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Theme.bgBase }
+                    GradientStop { position: 1.0; color: "transparent" }
+                }
+            }
+            Rectangle {
+                anchors { bottom: parent.bottom; left: parent.left; right: parent.right }
+                height: Theme.s6
+                opacity: leftScroll.contentItem.atYEnd ? 0.0 : 1.0
+                Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: "transparent" }
+                    GradientStop { position: 1.0; color: Theme.bgBase }
                 }
             }
         }
