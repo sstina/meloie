@@ -18,6 +18,7 @@ Item {
     id: panelRoot
     default property alias content: inner.data
     property string title: ""
+    property bool thin: false        // monitor side-panel: thinner glass so it recedes
     Layout.fillWidth: true
     implicitHeight: col.implicitHeight + 2 * Theme.s4
 
@@ -38,7 +39,8 @@ Item {
         radius: Theme.glassRadius
         antialiasing: true
         visible: !Theme.glassEnabled
-        color: Theme.glassEnabled ? Theme.glassTint : Theme.bgSurface
+        color: Theme.glassEnabled ? (panelRoot.thin ? Theme.glassPanelBg : Theme.glassCard)
+                                  : Theme.bgSurface
         border.width: 1
         border.color: Theme.glassEnabled ? Theme.glassBorder : Theme.hairline
 
@@ -50,7 +52,7 @@ Item {
             height: parent.radius * 1.8
             radius: parent.radius - 1
             gradient: Gradient {
-                GradientStop { position: 0.0;  color: Theme.glassTopGlow }
+                GradientStop { position: 0.0;  color: Theme.glassSheen }
                 GradientStop { position: 0.45; color: Qt.rgba(1, 1, 1, 0.02) }
                 GradientStop { position: 1.0;  color: "transparent" }
             }

@@ -10,6 +10,7 @@ RowLayout {
     property string label: ""
     property real dbfs: -200
     property real floorDb: -60
+    property color baseColor: Theme.accent    // channel identity (IN=coral, OUT=mint); hot -> warning/error
 
     spacing: Theme.s2
     Layout.fillWidth: true
@@ -26,7 +27,7 @@ RowLayout {
         Layout.fillWidth: true
         height: 12
         radius: 6
-        color: Theme.bgElevated
+        color: Theme.groove
         border.width: 1
         border.color: Theme.hairline
 
@@ -38,7 +39,7 @@ RowLayout {
             radius: height / 2
             width: Math.max(0, Math.min(1, (root.dbfs - root.floorDb) / (0 - root.floorDb)))
                    * (parent.width - 4)
-            color: root.dbfs > -3 ? Theme.error : (root.dbfs > -12 ? Theme.warning : Theme.success)
+            color: root.dbfs > -3 ? Theme.error : (root.dbfs > -12 ? Theme.warning : root.baseColor)
             Behavior on width { NumberAnimation { duration: 60; easing.type: Easing.OutCubic } }
         }
     }

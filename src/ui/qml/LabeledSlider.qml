@@ -12,6 +12,7 @@ RowLayout {
     property real stepSize: 0.01
     property int decimals: 2
     property string suffix: ""
+    property color accentColor: Theme.accent     // semantic hue (pitch=sky, formant=lilac, ...)
     property alias value: slider.value
     signal moved(real value)
 
@@ -42,12 +43,12 @@ RowLayout {
             width: slider.availableWidth
             height: 4
             radius: 2
-            color: Theme.bgElevated
+            color: Theme.groove
             Rectangle {
                 width: slider.visualPosition * parent.width
                 height: parent.height
                 radius: 2
-                color: slider.enabled ? Theme.accent : Theme.textMuted
+                color: slider.enabled ? root.accentColor : Theme.textMuted
             }
         }
 
@@ -57,7 +58,7 @@ RowLayout {
             implicitWidth: 16
             implicitHeight: 16
             radius: 8
-            color: slider.pressed ? Theme.accentPressed : Theme.accent
+            color: slider.pressed ? Qt.darker(root.accentColor, 1.2) : root.accentColor
             border.width: slider.enabled ? 1 : 0
             border.color: Qt.rgba(1, 1, 1, 0.25)
             opacity: slider.enabled ? 1.0 : 0.4
@@ -71,7 +72,7 @@ RowLayout {
                 width: parent.width + 12; height: width; radius: width / 2
                 color: "transparent"
                 border.width: 2
-                border.color: Theme.accent
+                border.color: root.accentColor
                 opacity: slider.pressed ? 0.35 : 0.0
                 Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
             }

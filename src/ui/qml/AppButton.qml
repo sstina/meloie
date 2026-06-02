@@ -6,6 +6,7 @@ import App
 Button {
     id: control
     property bool accent: true
+    property color accentColor: Theme.accent     // filled-button hue (Start=mint, Stop=coral, ...)
 
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fsBody
@@ -44,8 +45,8 @@ Button {
             if (control.flat)
                 return control.hovered ? Theme.bgElevated : "transparent";
             if (!control.enabled) return Theme.bgElevated;
-            if (control.pressed)  return Theme.accentPressed;
-            return control.hovered ? Theme.accentHover : Theme.accent;
+            if (control.pressed)  return Qt.darker(control.accentColor, 1.2);
+            return control.hovered ? Qt.lighter(control.accentColor, 1.15) : control.accentColor;
         }
         // snap the colour on press, ease it on hover/release
         Behavior on color { ColorAnimation { duration: control.down ? Theme.durPress : Theme.durFast } }

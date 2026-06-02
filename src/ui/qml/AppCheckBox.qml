@@ -5,6 +5,7 @@ import App
 // Accent checkbox with a check glyph.
 CheckBox {
     id: control
+    property color accentColor: Theme.accent     // checked hue (formant/merge=lilac, else mint)
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fsBody
     spacing: Theme.s2
@@ -15,9 +16,9 @@ CheckBox {
         x: control.leftPadding
         y: control.height / 2 - height / 2
         radius: Theme.radiusSm
-        color: control.checked ? Theme.accent : "transparent"
+        color: control.checked ? control.accentColor : "transparent"
         border.width: 1.5
-        border.color: control.checked ? Theme.accent
+        border.color: control.checked ? control.accentColor
                      : (control.hovered ? Theme.textSecond : Theme.textMuted)
         scale: control.down ? 0.88 : 1.0          // squish on press
         Behavior on color { ColorAnimation { duration: Theme.durFast } }

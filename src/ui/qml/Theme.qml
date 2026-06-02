@@ -4,18 +4,40 @@ import QtQuick
 // Design tokens + the (writable) glass enhancement switches.
 // Registered from app.py via qmlRegisterSingletonType(uri="App", name="Theme").
 // Pure presentation: no backend, no audio, no contract surface.
+//
+// Palette = "Morning Bloom" (see DESIGN_BRIEF.md): a cold-base + warm-accent set
+// where every functional dimension owns one hue (颜色=信息). The six source colors
+// below are the single source of truth; the semantic aliases under them are what
+// the rest of the UI references, so a re-map happens in exactly one place.
 QtObject {
     id: theme
 
-    // ---- backgrounds (60% : deep, low-saturation) ----
-    readonly property color bgBase:     "#0F1419"
+    // ---- backgrounds (60% : deep, low-saturation; brief base #0E141B) ----
+    readonly property color bgBase:     "#0E141B"
     readonly property color bgSurface:  "#1A2129"
     readonly property color bgElevated: "#232D38"
 
-    // ---- accent (10% : interaction / active / status only) ----
-    readonly property color accent:        "#2DD4BF"
-    readonly property color accentHover:   "#5EEAD4"
-    readonly property color accentPressed: "#14B8A6"
+    // ---- Morning Bloom source palette (six accents; the single truth source) ----
+    readonly property color mint:    "#34C7A9"   // 平衡/新生 -> 运行/前进/正向
+    readonly property color sky:     "#3EA9EE"   // 通透/信任 -> 变调 pitch
+    readonly property color lilac:   "#B295E6"   // 温柔/创意 -> 声线/共振/融合
+    readonly property color peach:   "#FF9DB0"   // 亲和/安抚 -> 预留(轻提示)
+    readonly property color coral:   "#FF7A66"   // 活力/友好 -> 输入能量 IN / 停止 Stop
+    readonly property color sunbeam: "#FFC24A"   // 乐观/愉悦 -> 告警 warning
+    // brighter variants for small numerals on the dark glass (pure color reads muddy small)
+    readonly property color mintSoft:  "#7DEBD3"
+    readonly property color skySoft:   "#8CCBF4"
+    readonly property color lilacSoft: "#CFBDF2"
+    readonly property color coralSoft: "#FF9E8C"
+
+    // ---- semantic aliases (颜色=信息; remap here, never at the call site) ----
+    readonly property color accent:        mint        // active / forward / OUT / routing-OK
+    readonly property color accentHover:   "#54D9BE"   // mint, lifted
+    readonly property color accentPressed: "#26A98E"   // mint, pushed
+    readonly property color pitch:     sky             // 变调维度
+    readonly property color resonance: lilac           // 性别/共振 + 融合
+    readonly property color input:     coral           // IN 电平 / Stop
+    readonly property color ok:        mintSoft         // 正向小字 (deep-bg numerals)
 
     // ---- text (WCAG verified on dark; see plan) ----
     readonly property color textPrimary: "#F1F5F9"   // 16.9:1 on bgBase
@@ -23,9 +45,9 @@ QtObject {
     readonly property color textMuted:   "#64748B"   // 3.9:1  -> non-essential labels only
 
     // ---- status ----
-    readonly property color success: "#34D399"
-    readonly property color warning: "#FBBF24"
-    readonly property color error:   "#F87171"
+    readonly property color success: mint            // 运行/正向 (shares the mint hue)
+    readonly property color warning: sunbeam         // 需注意但非错误
+    readonly property color error:   "#F87171"       // critical alert (brief omits a red; kept distinct from coral=IN/Stop)
 
     // ---- radius ----
     readonly property int radiusSm:   6
@@ -71,13 +93,23 @@ QtObject {
     // ---- glass (the toggleable enhancement layer) ----
     property bool glassEnabled: true
     property string glassQuality: "high"            // "high" | "medium" | "low"
-    // High-transparency frosted glass. 0.62 lets more of the blurred backdrop show
-    // through (the "高透" look) while staying dark enough for text >=4.5:1 — the
-    // exact value is tuned against .tmp/check_qml.py's composited-pixel probe.
-    readonly property real glassTintAlpha: 0.62
-    readonly property color glassTint: Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, glassTintAlpha)
-    readonly property color glassBorder: Qt.rgba(1, 1, 1, 0.09)   // soft hairline (no hard outline)
-    readonly property color glassTopGlow: Qt.rgba(1, 1, 1, 0.13)  // soft top inner glow (gradient, never a line)
+
+    // Morning Bloom glass (brief §2.3 intent): frosted card that lets the drifting
+    // flowing-light show through, with a white sheen highlight on the top edge.
+    // Implementation note: the brief's literal "white-alpha" fill is rendered here
+    // as a SMOKED-glass tint (semi-transparent dark) + the white `glassSheen` line.
+    // On a dark theme this composites identically to "translucent white over the
+    // faint backdrop", but a semi-opaque fill (a) casts a real drop shadow and
+    // (b) occludes its own shadow (no bleed-through), and (c) keeps light text
+    // >=4.5:1 even when a bright blob drifts behind it. Verified via check_qml.
+    readonly property color glassCard:   Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.50)   // normal card
+    readonly property color glassPanelBg:Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.38)   // monitor side panel (thinner -> recedes)
+    readonly property color glassField:  Qt.rgba(bgElevated.r, bgElevated.g, bgElevated.b, 0.55) // input / combo / small container
+    readonly property color glassSheen:  Qt.rgba(1, 1, 1, 0.14)   // top inner highlight line (glass reflection)
+    readonly property color groove:      Qt.rgba(1, 1, 1, 0.12)   // slider/meter trough
+    readonly property color hoverFill:   Qt.rgba(1, 1, 1, 0.10)   // hover/press wash
+
+    readonly property color glassBorder: Qt.rgba(1, 1, 1, 0.10)   // soft hairline (no hard outline)
     readonly property color glassUnderShadow: Qt.rgba(0, 0, 0, 0.16)  // gentle bottom depth fade
     readonly property color glassShadow: Qt.rgba(0, 0, 0, 0.55)   // elevation shadow (× translucent source alpha)
     readonly property int glassRadius: 18                         // larger, Apple-smooth corners

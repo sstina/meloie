@@ -13,6 +13,9 @@ ApplicationWindow {
     title: "RVC Voice Changer"
     color: Theme.bgBase
 
+    // responsive breakpoint: below this the two columns stack (brief §3 §136).
+    readonly property bool narrow: width < 980
+
     // close (X) -> hide to the system tray (stream keeps running); the tray menu
     // 退出 truly quits. When no tray exists, trayActive is false -> normal quit.
     onClosing: function(close) {
@@ -145,6 +148,7 @@ ApplicationWindow {
         function onErrorOccurred(msg) { errorLabel.text = msg; }
         function onMetricsChanged(m) {
             latencyLabel.text = fmt(m.rvc_inference_mean_ms) + " ms";
+            monLatency.text   = fmt(m.rvc_inference_mean_ms) + " ms";
             inMeter.dbfs  = m.input_peak_dbfs  !== undefined ? m.input_peak_dbfs  : -200;
             outMeter.dbfs = m.output_peak_dbfs !== undefined ? m.output_peak_dbfs : -200;
             inferLabel.text = "infer " + fmt(m.rvc_inference_last_ms) + "/" + fmt(m.rvc_inference_mean_ms)
@@ -158,10 +162,10 @@ ApplicationWindow {
         }
     }
 
-    // ===================== background (static, blurred once) =====================
+    // ===================== flowing-light background =====================
     AppBackground { anchors.fill: parent }
 
-    // ===================== fixed glass header (chrome) =====================
+    // ===================== fixed glass command bar (chrome) =====================
     GlassPanel {
         id: header
         anchors.top: parent.top
@@ -203,6 +207,8 @@ ApplicationWindow {
             AppButton {
                 id: startBtn
                 text: backend.state === "running" ? "⏹ Stop" : "▶ Start"
+                // semantic: Start = mint (forward/positive), Stop = coral (stop/input energy)
+                accentColor: backend.state === "running" ? Theme.input : Theme.accent
                 enabled: !backend.busy && modelCombo.count > 0
                 onClicked: {
                     errorLabel.text = "";
@@ -220,379 +226,434 @@ ApplicationWindow {
         }
     }
 
-    // ===================== scrolling content =====================
-    ScrollView {
-        id: scroll
+    // ===================== two-column body: controls | monitor =====================
+    GridLayout {
+        id: body
         anchors.top: header.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.bottom: parent.bottom
+        anchors.bottom: errorLabel.top
         anchors.leftMargin: Theme.s4
         anchors.rightMargin: Theme.s4
         anchors.topMargin: Theme.s3
-        anchors.bottomMargin: Theme.s4
-        contentWidth: availableWidth
-        clip: true
+        anchors.bottomMargin: Theme.s2
+        columns: win.narrow ? 1 : 2
+        columnSpacing: Theme.s3
+        rowSpacing: Theme.s3
 
-        ColumnLayout {
-            width: scroll.availableWidth
-            spacing: Theme.s3
+        // ---------------- LEFT: controls (scrollable; capped so sliders stay precise) ----------------
+        ScrollView {
+            id: leftScroll
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.horizontalStretchFactor: 3
+            Layout.maximumWidth: win.narrow ? 1000000 : 880
+            contentWidth: availableWidth
+            clip: true
 
-            // ---------------- devices ----------------
-            GlassPanel {
-                title: "设备 / Devices"
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.s3
-                    Label { text: "麦克风"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
-                    AppComboBox {
-                        id: micCombo
-                        Layout.fillWidth: true
-                        model: win.micList
-                        textRole: "name"
-                        property string selName: ""
-                        onActivated: selName = win.micList[currentIndex] ? win.micList[currentIndex].name : ""
-                        onModelChanged: currentIndex = win.indexByName(win.micList, selName, 0)
-                    }
-                    Label { text: "输出"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
-                    AppComboBox {
-                        id: outCombo
-                        Layout.fillWidth: true
-                        model: win.outList
-                        textRole: "name"
-                        property string selName: ""
-                        onActivated: selName = win.outList[currentIndex] ? win.outList[currentIndex].name : ""
-                        onModelChanged: currentIndex = win.indexByName(win.outList, selName, win.cableInputIndex(win.outList))
-                    }
-                    AppButton { text: "↻"; flat: true; onClicked: backend.refreshDevices() }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fsBody
-                    property string outName: win.outSubstr()
-                    property bool routingOk: outName.toLowerCase().indexOf("cable input") >= 0
-                    color: routingOk ? Theme.success : Theme.warning
-                    text: routingOk
-                          ? "✓ 路由正常：输出→CABLE Input（下游选 CABLE Output）"
-                          : "⚠ 输出应为 CABLE Input 才能让下游听到"
-                }
+            ColumnLayout {
+                width: leftScroll.availableWidth
+                spacing: Theme.s3
 
-                // hairline divider
-                Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
-
-                // ---- monitor (听变声后的声音；纯路由复制，契约安全) ----
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.s3
-                    AppSwitch {
-                        id: monitorSw
-                        text: "监听"
-                        onToggled: backend.setMonitor(checked)
-                    }
-                    AppComboBox {
-                        id: monitorCombo
-                        Layout.fillWidth: true
-                        model: win.monitorList
-                        textRole: "name"
-                        property string selName: ""
-                        onActivated: selName = win.monitorList[currentIndex] ? win.monitorList[currentIndex].name : ""
-                        onModelChanged: currentIndex = win.indexByName(win.monitorList, selName, 0)
-                    }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    color: Theme.textMuted
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fsCaption
-                    text: "🎧 监听=把变声后的声音同时送到耳机（~250–400ms 延迟侧音，确认效果用）。开关实时；切换监听设备需重启 Start 生效。"
-                }
-            }
-
-            // ---------------- creative (live) ----------------
-            GlassPanel {
-                title: "创意 / Creative（实时）"
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.s3
-                    Label { text: "声线 sid"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody; Layout.preferredWidth: 96 }
-                    AppSpinBox {
-                        id: sidSpin
-                        from: 0
-                        to: Math.max(0, backend.numSpeakers - 1)
-                        value: 0
-                        editable: true
-                        enabled: backend.numSpeakers > 1
-                        onValueModified: backend.setSid(value)
-                    }
-                    Label {
-                        color: Theme.textMuted
-                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
-                        text: backend.numSpeakers > 1 ? ("共 " + backend.numSpeakers + " 个声线") : "单声线模型"
-                    }
-                    Item { Layout.fillWidth: true }
-                }
-                LabeledSlider {
-                    id: pitchSlider; label: "变调 pitch"; from: -24; to: 24; stepSize: 1; decimals: 0; suffix: " st"
-                    enabled: !autoCenterOn.checked       // auto-center REPLACES manual transpose
-                    onMoved: backend.setPitch(value)
-                }
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.s3
-                    AppCheckBox {
-                        id: autoCenterOn
-                        text: "自动音高居中"
-                        enabled: win.autoCenterAvail
-                        onToggled: backend.setAutoCenter(checked)
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        elide: Text.ElideRight
-                        color: Theme.textMuted
-                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
-                        text: win.autoCenterAvail
-                              ? ("→ " + Math.round(win.autoCenterTarget) + " Hz（替代手动变调）")
-                              : "（此模型未设目标音高）"
-                    }
-                }
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.s3
-                    AppCheckBox { id: formantOn; text: "性别/共振"; onToggled: win.pushFormant() }
-                    LabeledSlider {
-                        id: formantSlider; label: ""; from: 0.5; to: 2.0; stepSize: 0.01; decimals: 2; value: 1.0
-                        enabled: formantOn.checked
-                        onMoved: win.pushFormant()
-                    }
-                }
-                LabeledSlider {
-                    id: indexSlider; label: "检索 index"; from: 0.0; to: 1.0; stepSize: 0.01; decimals: 2
-                    onMoved: backend.setIndexRate(value)
-                }
-
-                // ---- 💾 per-model save: remember the current carrier knobs as this model's default ----
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.s3
-                    Label { text: "模型默认"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody; Layout.preferredWidth: 96 }
-                    Item { Layout.fillWidth: true }
-                    AppButton {
-                        text: "💾 记住当前"; flat: true
-                        onClicked: {
-                            var params = {
-                                "pitch_shift": pitchSlider.value,
-                                "index_rate": indexSlider.value,
-                                "protect": protectSlider.value,
-                                "formant_timbre": formantSlider.value,
-                                "formant_on": formantOn.checked
-                            };
-                            if (backend.saveModelDefaults(win.modelPath(), params))
-                                errorLabel.text = "已记住 " + modelCombo.currentText + " 的设置";
-                        }
-                    }
-                }
-
-                // ---- 融合模式 / merge: blend other models into the base (offline) ----
-                Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
-                RowLayout {
-                    Layout.fillWidth: true
-                    Label {
-                        text: "🧬 融合模式"; color: Theme.textSecond
-                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsLabel
-                        font.weight: Theme.fwSemibold; font.letterSpacing: 0.5
-                    }
-                    Item { Layout.fillWidth: true }
-                    AppSwitch { id: mergeToggle; checked: false }
-                }
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    visible: mergeToggle.checked
-                    spacing: Theme.s2
-
+                // ---------------- devices ----------------
+                GlassPanel {
+                    title: "设备 / Devices"
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Theme.s3
-                        Label {
-                            text: "基础：" + (modelCombo.currentText || "—")
-                            color: Theme.textPrimary
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
-                            Layout.preferredWidth: 140
-                        }
-                        LabeledSlider {
-                            id: baseWeight; label: "权重"; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 1.0
-                        }
-                    }
-                    Repeater {
-                        model: win.mergeCandidates
-                        delegate: RowLayout {
-                            required property var modelData
+                        Label { text: "麦克风"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
+                        AppComboBox {
+                            id: micCombo
                             Layout.fillWidth: true
-                            spacing: Theme.s3
-                            AppCheckBox {
-                                id: mcb
-                                text: modelData.name
-                                Layout.preferredWidth: 140
-                                onToggled: win.setMergePick(modelData.path, checked, mwSlider.value)
-                            }
-                            LabeledSlider {
-                                id: mwSlider; label: ""; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 1.0
-                                enabled: mcb.checked
-                                onMoved: if (mcb.checked) win.setMergePick(modelData.path, true, value)
-                            }
+                            model: win.micList
+                            textRole: "name"
+                            property string selName: ""
+                            onActivated: selName = win.micList[currentIndex] ? win.micList[currentIndex].name : ""
+                            onModelChanged: currentIndex = win.indexByName(win.micList, selName, 0)
                         }
+                        Label { text: "输出"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
+                        AppComboBox {
+                            id: outCombo
+                            Layout.fillWidth: true
+                            model: win.outList
+                            textRole: "name"
+                            property string selName: ""
+                            onActivated: selName = win.outList[currentIndex] ? win.outList[currentIndex].name : ""
+                            onModelChanged: currentIndex = win.indexByName(win.outList, selName, win.cableInputIndex(win.outList))
+                        }
+                        AppButton { text: "↻"; flat: true; onClicked: backend.refreshDevices() }
                     }
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fsBody
+                        property string outName: win.outSubstr()
+                        property bool routingOk: outName.toLowerCase().indexOf("cable input") >= 0
+                        color: routingOk ? Theme.success : Theme.warning
+                        text: routingOk
+                              ? "✓ 路由正常：输出→CABLE Input（下游选 CABLE Output）"
+                              : "⚠ 输出应为 CABLE Input 才能让下游听到"
+                    }
+
+                    // hairline divider
+                    Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
+
+                    // ---- monitor (听变声后的声音；纯路由复制，契约安全) ----
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Theme.s3
-                        Label { text: "新名字"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
-                        TextField {
-                            id: mergeName
-                            Layout.fillWidth: true
-                            placeholderText: "例如 A+C"
-                            color: Theme.textPrimary
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                        AppSwitch {
+                            id: monitorSw
+                            text: "监听"
+                            onToggled: backend.setMonitor(checked)
                         }
-                        AppButton {
-                            text: "🧬 融合并加载"
-                            enabled: !backend.busy && Object.keys(win.mergePick).length > 0
-                            onClicked: {
-                                errorLabel.text = "";
-                                var base = win.modelPath();
-                                var others = [];
-                                var keys = Object.keys(win.mergePick);
-                                for (var i = 0; i < keys.length; i++)
-                                    if (keys[i] !== base) others.push({ "path": keys[i], "weight": win.mergePick[keys[i]] });
-                                var nm = (mergeName.text && mergeName.text.length > 0)
-                                         ? mergeName.text : (modelCombo.currentText + "+merge");
-                                backend.mergeModels(base, baseWeight.value, others, nm,
-                                                    pitchSlider.value, f0Combo.currentText);
-                            }
+                        AppComboBox {
+                            id: monitorCombo
+                            Layout.fillWidth: true
+                            model: win.monitorList
+                            textRole: "name"
+                            property string selName: ""
+                            onActivated: selName = win.monitorList[currentIndex] ? win.monitorList[currentIndex].name : ""
+                            onModelChanged: currentIndex = win.indexByName(win.monitorList, selName, 0)
                         }
                     }
                     Label {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
                         color: Theme.textMuted
-                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption
-                        text: "只能融合同采样率/架构的模型；融合需几秒，完成后新音色出现在顶部下拉并自动选中。"
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fsCaption
+                        text: "🎧 监听=把变声后的声音同时送到耳机（~250–400ms 延迟侧音，确认效果用）。开关实时；切换监听设备需重启 Start 生效。"
                     }
                 }
-            }
 
-            // ---------------- advanced (collapsible, live) ----------------
-            GlassPanel {
-                RowLayout {
-                    Layout.fillWidth: true
-                    Label {
-                        text: "高级 / Advanced"; color: Theme.textSecond
-                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsLabel; font.weight: Theme.fwSemibold; font.letterSpacing: 0.5
-                    }
-                    Item { Layout.fillWidth: true }
-                    AppSwitch { id: advToggle; checked: false }
-                }
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    visible: advToggle.checked
-                    spacing: Theme.s2
-
-                    LabeledSlider {
-                        id: protectSlider; label: "protect"; from: 0.0; to: 0.5; stepSize: 0.01; decimals: 2
-                        onMoved: backend.setProtect(value)
-                    }
+                // ---------------- creative (live) ----------------
+                GlassPanel {
+                    title: "创意 / Creative（实时）"
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Theme.s3
-                        AppCheckBox { id: denoiseOn; text: "输入降噪"; onToggled: win.pushDenoise() }
-                        LabeledSlider {
-                            id: denoiseStr; label: "strength"; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 0.5
-                            enabled: denoiseOn.checked; onMoved: win.pushDenoise()
+                        Label { text: "声线 sid"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody; Layout.preferredWidth: 96 }
+                        AppSpinBox {
+                            id: sidSpin
+                            from: 0
+                            to: Math.max(0, backend.numSpeakers - 1)
+                            value: 0
+                            editable: true
+                            enabled: backend.numSpeakers > 1
+                            onValueModified: backend.setSid(value)
                         }
-                        AppCheckBox { id: nonstat; text: "nonstat"; checked: true; enabled: denoiseOn.checked; onToggled: win.pushDenoise() }
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: Theme.s3
-                        AppCheckBox { id: silOn; text: "静音门限"; onToggled: win.pushSilence() }
-                        LabeledSlider {
-                            id: silDb; label: "dBFS"; from: -80; to: -20; stepSize: 1; decimals: 0; value: -50
-                            enabled: silOn.checked; onMoved: win.pushSilence()
-                        }
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: Theme.s3
-                        AppCheckBox { id: atOn; text: "autotune"; onToggled: win.pushAutotune() }
-                        LabeledSlider {
-                            id: atStr; label: "strength"; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 1.0
-                            enabled: atOn.checked; onMoved: win.pushAutotune()
-                        }
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: Theme.s3
-                        AppCheckBox { id: apOn; text: "auto-pitch"; onToggled: win.pushAutoPitch() }
-                        LabeledSlider {
-                            id: apThr; label: "Hz"; from: 80; to: 300; stepSize: 1; decimals: 0; value: 155
-                            enabled: apOn.checked; onMoved: win.pushAutoPitch()
-                        }
-                    }
-
-                    // hairline divider
-                    Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
-
-                    // ---- appearance: glass enhancement (pure UI, no backend) ----
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: Theme.s3
-                        AppSwitch {
-                            id: glassSw
-                            text: "玻璃质感"
-                            checked: Theme.glassEnabled
-                            onToggled: Theme.glassEnabled = checked
+                        Label {
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                            text: backend.numSpeakers > 1 ? ("共 " + backend.numSpeakers + " 个声线") : "单声线模型"
                         }
                         Item { Layout.fillWidth: true }
-                        Label { text: "质量"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
-                        AppComboBox {
-                            Layout.preferredWidth: 110
-                            model: ["high", "medium", "low"]
-                            enabled: Theme.glassEnabled
-                            currentIndex: 0
-                            onActivated: Theme.glassQuality = currentText
+                    }
+                    LabeledSlider {
+                        id: pitchSlider; label: "变调 pitch"; from: -24; to: 24; stepSize: 1; decimals: 0; suffix: " st"
+                        accentColor: Theme.pitch             // pitch dimension = sky blue
+                        enabled: !autoCenterOn.checked       // auto-center REPLACES manual transpose
+                        onMoved: backend.setPitch(value)
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.s3
+                        AppCheckBox {
+                            id: autoCenterOn
+                            text: "自动音高居中"
+                            accentColor: Theme.pitch          // also the pitch dimension
+                            enabled: win.autoCenterAvail
+                            onToggled: backend.setAutoCenter(checked)
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                            text: win.autoCenterAvail
+                                  ? ("→ " + Math.round(win.autoCenterTarget) + " Hz（替代手动变调）")
+                                  : "（此模型未设目标音高）"
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.s3
+                        AppCheckBox { id: formantOn; text: "性别/共振"; accentColor: Theme.resonance; onToggled: win.pushFormant() }
+                        LabeledSlider {
+                            id: formantSlider; label: ""; from: 0.5; to: 2.0; stepSize: 0.01; decimals: 2; value: 1.0
+                            accentColor: Theme.resonance      // 性别/共振 = lilac
+                            enabled: formantOn.checked
+                            onMoved: win.pushFormant()
+                        }
+                    }
+                    LabeledSlider {
+                        id: indexSlider; label: "检索 index"; from: 0.0; to: 1.0; stepSize: 0.01; decimals: 2
+                        onMoved: backend.setIndexRate(value)
+                    }
+
+                    // ---- 💾 per-model save: remember the current carrier knobs as this model's default ----
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.s3
+                        Label { text: "模型默认"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody; Layout.preferredWidth: 96 }
+                        Item { Layout.fillWidth: true }
+                        AppButton {
+                            text: "💾 记住当前"; flat: true
+                            onClicked: {
+                                var params = {
+                                    "pitch_shift": pitchSlider.value,
+                                    "index_rate": indexSlider.value,
+                                    "protect": protectSlider.value,
+                                    "formant_timbre": formantSlider.value,
+                                    "formant_on": formantOn.checked
+                                };
+                                if (backend.saveModelDefaults(win.modelPath(), params))
+                                    errorLabel.text = "已记住 " + modelCombo.currentText + " 的设置";
+                            }
+                        }
+                    }
+
+                    // ---- 融合模式 / merge: blend other models into the base (offline) ----
+                    Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            text: "🧬 融合模式"; color: Theme.resonance      // creative timbre morph = lilac
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fsLabel
+                            font.weight: Theme.fwSemibold; font.letterSpacing: 0.5
+                        }
+                        Item { Layout.fillWidth: true }
+                        AppSwitch { id: mergeToggle; checked: false }
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        visible: mergeToggle.checked
+                        spacing: Theme.s2
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.s3
+                            Label {
+                                text: "基础：" + (modelCombo.currentText || "—")
+                                color: Theme.textPrimary
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                                Layout.preferredWidth: 140
+                            }
+                            LabeledSlider {
+                                id: baseWeight; label: "权重"; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 1.0
+                                accentColor: Theme.resonance
+                            }
+                        }
+                        Repeater {
+                            model: win.mergeCandidates
+                            delegate: RowLayout {
+                                required property var modelData
+                                Layout.fillWidth: true
+                                spacing: Theme.s3
+                                AppCheckBox {
+                                    id: mcb
+                                    text: modelData.name
+                                    accentColor: Theme.resonance
+                                    Layout.preferredWidth: 140
+                                    onToggled: win.setMergePick(modelData.path, checked, mwSlider.value)
+                                }
+                                LabeledSlider {
+                                    id: mwSlider; label: ""; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 1.0
+                                    accentColor: Theme.resonance
+                                    enabled: mcb.checked
+                                    onMoved: if (mcb.checked) win.setMergePick(modelData.path, true, value)
+                                }
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.s3
+                            Label { text: "新名字"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
+                            TextField {
+                                id: mergeName
+                                Layout.fillWidth: true
+                                placeholderText: "例如 A+C"
+                                color: Theme.textPrimary
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                            }
+                            AppButton {
+                                text: "🧬 融合并加载"
+                                accentColor: Theme.resonance
+                                enabled: !backend.busy && Object.keys(win.mergePick).length > 0
+                                onClicked: {
+                                    errorLabel.text = "";
+                                    var base = win.modelPath();
+                                    var others = [];
+                                    var keys = Object.keys(win.mergePick);
+                                    for (var i = 0; i < keys.length; i++)
+                                        if (keys[i] !== base) others.push({ "path": keys[i], "weight": win.mergePick[keys[i]] });
+                                    var nm = (mergeName.text && mergeName.text.length > 0)
+                                             ? mergeName.text : (modelCombo.currentText + "+merge");
+                                    backend.mergeModels(base, baseWeight.value, others, nm,
+                                                        pitchSlider.value, f0Combo.currentText);
+                                }
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption
+                            text: "只能融合同采样率/架构的模型；融合需几秒，完成后新音色出现在顶部下拉并自动选中。"
+                        }
+                    }
+                }
+
+                // ---------------- advanced (collapsible, live) ----------------
+                GlassPanel {
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            text: "高级 / Advanced"; color: Theme.textSecond
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fsLabel; font.weight: Theme.fwSemibold; font.letterSpacing: 0.5
+                        }
+                        Item { Layout.fillWidth: true }
+                        AppSwitch { id: advToggle; checked: false }
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        visible: advToggle.checked
+                        spacing: Theme.s2
+
+                        LabeledSlider {
+                            id: protectSlider; label: "protect"; from: 0.0; to: 0.5; stepSize: 0.01; decimals: 2
+                            onMoved: backend.setProtect(value)
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.s3
+                            AppCheckBox { id: denoiseOn; text: "输入降噪"; onToggled: win.pushDenoise() }
+                            LabeledSlider {
+                                id: denoiseStr; label: "strength"; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 0.5
+                                enabled: denoiseOn.checked; onMoved: win.pushDenoise()
+                            }
+                            AppCheckBox { id: nonstat; text: "nonstat"; checked: true; enabled: denoiseOn.checked; onToggled: win.pushDenoise() }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.s3
+                            AppCheckBox { id: silOn; text: "静音门限"; onToggled: win.pushSilence() }
+                            LabeledSlider {
+                                id: silDb; label: "dBFS"; from: -80; to: -20; stepSize: 1; decimals: 0; value: -50
+                                enabled: silOn.checked; onMoved: win.pushSilence()
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.s3
+                            AppCheckBox { id: atOn; text: "autotune"; onToggled: win.pushAutotune() }
+                            LabeledSlider {
+                                id: atStr; label: "strength"; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 1.0
+                                enabled: atOn.checked; onMoved: win.pushAutotune()
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.s3
+                            AppCheckBox { id: apOn; text: "auto-pitch"; onToggled: win.pushAutoPitch() }
+                            LabeledSlider {
+                                id: apThr; label: "Hz"; from: 80; to: 300; stepSize: 1; decimals: 0; value: 155
+                                enabled: apOn.checked; onMoved: win.pushAutoPitch()
+                            }
+                        }
+
+                        // hairline divider
+                        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
+
+                        // ---- appearance: glass enhancement (pure UI, no backend) ----
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.s3
+                            AppSwitch {
+                                id: glassSw
+                                text: "玻璃质感"
+                                checked: Theme.glassEnabled
+                                onToggled: Theme.glassEnabled = checked
+                            }
+                            Item { Layout.fillWidth: true }
+                            Label { text: "质量"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
+                            AppComboBox {
+                                Layout.preferredWidth: 110
+                                model: ["high", "medium", "low"]
+                                enabled: Theme.glassEnabled
+                                currentIndex: 0
+                                onActivated: Theme.glassQuality = currentText
+                            }
                         }
                     }
                 }
             }
+        }
 
-            // ---------------- telemetry (read-only) ----------------
-            GlassPanel {
-                title: "遥测 / Telemetry"
-                LevelMeter { id: inMeter;  label: "IN";  dbfs: -200 }
-                LevelMeter { id: outMeter; label: "OUT"; dbfs: -200 }
-                Flow {
-                    Layout.fillWidth: true
-                    spacing: Theme.s4
-                    Label { id: inferLabel; text: "infer —/—/— ms"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                    Label { id: underLabel; text: "underrun 0／0";    color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                    Label { id: fbLabel;    text: "fallback 0";       color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                    Label { id: queueLabel; text: "queue 0";          color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                    Label { id: solaLabel;  text: "sola 0";           color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                    Label { id: silLabel;   text: "sil-skip 0";       color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                }
-            }
+        // ---------------- RIGHT: live monitor (always visible, never scrolled) ----------------
+        GlassPanel {
+            id: monitorPanel
+            thin: true
+            title: "实时监控 / Monitor"
+            Layout.fillWidth: true
+            Layout.fillHeight: false          // compact card, pinned top -> reveals 流光 below it
+            Layout.alignment: Qt.AlignTop
+            Layout.horizontalStretchFactor: 2
+            Layout.minimumWidth: win.narrow ? 0 : 280
 
-            Label {
-                id: errorLabel
+            // hero metric: live inference latency (the monitor's headline reading)
+            RowLayout {
                 Layout.fillWidth: true
-                Layout.leftMargin: 4
-                wrapMode: Text.WordWrap
-                color: Theme.error
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.fsBody
-                text: ""
+                spacing: Theme.s2
+                Label {
+                    id: monLatency; text: "— ms"
+                    color: Theme.accent; font.family: Theme.fontFamily
+                    font.pixelSize: 30; font.weight: Theme.fwSemibold
+                }
+                Label {
+                    text: "推理延迟 / latency"; color: Theme.textMuted
+                    font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption
+                    Layout.alignment: Qt.AlignBottom; Layout.bottomMargin: Theme.s1
+                }
+                Item { Layout.fillWidth: true }
+            }
+            Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline; Layout.bottomMargin: Theme.s1 }
+
+            LevelMeter { id: inMeter;  label: "IN";  dbfs: -200; baseColor: Theme.input }   // 输入能量 = 珊瑚
+            LevelMeter { id: outMeter; label: "OUT"; dbfs: -200; baseColor: Theme.accent }  // 输出/正向 = 青
+
+            Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline; Layout.topMargin: Theme.s1 }
+
+            Flow {
+                Layout.fillWidth: true
+                spacing: Theme.s4
+                Label { id: inferLabel; text: "infer —/—/— ms"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                Label { id: underLabel; text: "underrun 0／0";    color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                Label { id: fbLabel;    text: "fallback 0";       color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                Label { id: queueLabel; text: "queue 0";          color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                Label { id: solaLabel;  text: "sola 0";           color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                Label { id: silLabel;   text: "sil-skip 0";       color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
             }
         }
+    }
+
+    // ===================== footer: error / status message (full width) =====================
+    Label {
+        id: errorLabel
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: Theme.s4
+        anchors.rightMargin: Theme.s4
+        anchors.bottomMargin: Theme.s3
+        height: text.length > 0 ? implicitHeight : 0
+        visible: text.length > 0
+        wrapMode: Text.WordWrap
+        color: Theme.error
+        font.family: Theme.fontFamily
+        font.pixelSize: Theme.fsBody
+        text: ""
     }
 }
