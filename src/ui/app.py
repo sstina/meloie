@@ -48,7 +48,7 @@ def _apply_dark_titlebar(window) -> None:
         DWMWA_CAPTION_COLOR = 35
         DWMWA_TEXT_COLOR = 36
         _set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1)                   # light glyphs on a dark bar
-        _set(DWMWA_CAPTION_COLOR, _colorref(0x0E, 0x14, 0x1B))   # Theme.bgBase
+        _set(DWMWA_CAPTION_COLOR, _colorref(0x1A, 0x21, 0x29))   # Theme.bgSurface (a touch lighter than bgBase)
         _set(DWMWA_TEXT_COLOR,    _colorref(0xF1, 0xF5, 0xF9))   # Theme.textPrimary
         _set(DWMWA_BORDER_COLOR,  _colorref(0x23, 0x2D, 0x38))   # Theme.bgElevated (faint edge)
     except Exception:
@@ -65,7 +65,7 @@ def main() -> int:
     QQuickStyle.setStyle("Basic")
 
     app = QApplication(sys.argv)
-    app.setApplicationName("RVC Voice Changer")
+    app.setApplicationName("Meloie")
 
     # App / taskbar / tray icon (rendered from icon.svg; multi-size for crispness).
     icon = load_app_icon(os.path.join(RVC_ROOT, "icon.svg"))

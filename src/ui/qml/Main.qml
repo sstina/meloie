@@ -10,7 +10,7 @@ ApplicationWindow {
     height: 720
     minimumWidth: 960
     minimumHeight: 600
-    title: "RVC Voice Changer"
+    title: "Meloie"
     color: Theme.bgBase
 
     // responsive breakpoint: below this the two columns stack (brief §3 §136).

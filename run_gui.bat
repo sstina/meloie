@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title RVC Voice Changer GUI
+title Meloie GUI
 cd /d "%~dp0"
 powershell -ExecutionPolicy Bypass -NoProfile -File ".\run_gui.ps1" %*
 echo.

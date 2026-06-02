@@ -1,10 +1,10 @@
-# run_gui.ps1 — launch the RVC Voice Changer GUI (PySide6 + QML) in .venv-applio.
+# run_gui.ps1 — launch the Meloie GUI (PySide6 + QML, RVC engine) in .venv-applio.
 $ErrorActionPreference = "Stop"
 $env:PYTHONIOENCODING = "utf-8"
 Set-Location -LiteralPath $PSScriptRoot
 
 Write-Host "========================================"
-Write-Host " RVC Voice Changer GUI (PySide6 + QML)"
+Write-Host " Meloie GUI (PySide6 + QML)"
 Write-Host " Model -> realtime RVC -> CABLE Input"
 Write-Host "========================================"
 

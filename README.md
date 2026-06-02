@@ -1,4 +1,4 @@
-# Tvoice / RVC — Realtime Voice Changer (v2)
+# Meloie — a realtime RVC voice changer (v2)
 
 Turn the voice you speak into a trained target voice (RVC) in real time and
 send it to Discord / OBS / a recorder. There is exactly one route:

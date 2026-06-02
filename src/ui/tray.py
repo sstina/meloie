@@ -17,7 +17,7 @@ from PySide6.QtCore import QObject, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-APP_NAME = "RVC Voice Changer"
+APP_NAME = "Meloie"
 
 # tray + taskbar + alt-tab want different raster sizes; pre-render all of them.
 _ICON_SIZES = (16, 20, 24, 32, 48, 64, 128, 256)
