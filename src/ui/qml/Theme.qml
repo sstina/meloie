@@ -108,14 +108,8 @@ QtObject {
     readonly property color hoverFill:   Qt.rgba(1, 1, 1, 0.10)   // hover/press wash
 
     readonly property color glassBorder: Qt.rgba(1, 1, 1, 0.10)   // soft hairline (no hard outline)
-    readonly property color glassUnderShadow: Qt.rgba(0, 0, 0, 0.16)  // gentle bottom depth fade
-    readonly property color glassShadow: Qt.rgba(0, 0, 0, 0.55)   // elevation shadow (× translucent source alpha)
     readonly property int glassRadius: 18                         // larger, Apple-smooth corners
+    // background flowing-light blur strength (quality-stepped)
     readonly property int glassBlurMax:
         glassQuality === "high" ? 72 : (glassQuality === "medium" ? 48 : 28)
-    readonly property real glassDownsample:
-        glassQuality === "high" ? 0.6 : (glassQuality === "medium" ? 0.45 : 0.33)
-    // shadow blur — generous so the elevation reads as soft/氤氲, not a boxy edge
-    readonly property int glassShadowBlurMax:
-        glassQuality === "high" ? 64 : (glassQuality === "medium" ? 44 : 24)
 }

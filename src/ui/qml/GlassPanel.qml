@@ -1,19 +1,17 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import QtQuick.Effects
 import App
 
-// Refined 3D high-transparency glass card (Apple-ish): no hard lines — light
-// diffuses in from the top edge as a soft gradient, the hairline is barely there,
-// corners are large & smooth, and the card floats on a SOFT diffuse shadow.
+// Flat frosted-glass card: a translucent (smoked) fill + a soft 1px border, over
+// the flowing-light backdrop. No drop shadow and no top sheen (per user).
 //
-// The shadow is done with ShaderEffectSource + a standalone MultiEffect (NOT
-// layer.effect): layer.effect clips the blur to the card's own bounds, which made
-// the shadow look like a boxy black rectangle. A standalone MultiEffect with
-// autoPadding can spread the blur well beyond the card, so it reads as 氤氲/diffuse.
-// The shadow is captured once (live:false) and only re-grabbed on resize / glass
-// changes — the real-time content is a separate SHARP sibling, never in here.
+// Deliberately a plain Rectangle -- NO ShaderEffectSource / MultiEffect. The old
+// shadow used a live:false capture re-grabbed only on resize, so a COLLAPSIBLE
+// panel (高级 / 融合) painted its card from a stale, stretched snapshot while the
+// text was live -> the expand/collapse distortion + card/text misalignment. A
+// plain Rectangle anchored to the panel resizes in lockstep with its content, so
+// that class of bug cannot occur.
 Item {
     id: panelRoot
     default property alias content: inner.data
@@ -22,61 +20,15 @@ Item {
     Layout.fillWidth: true
     implicitHeight: col.implicitHeight + 2 * Theme.s4
 
-    Component.onCompleted: shapeTex.scheduleUpdate()
-    onWidthChanged: shapeTex.scheduleUpdate()
-    onHeightChanged: shapeTex.scheduleUpdate()
-    Connections {
-        target: Theme
-        function onGlassEnabledChanged() { shapeTex.scheduleUpdate() }
-        function onGlassQualityChanged() { shapeTex.scheduleUpdate() }
-    }
-
-    // The glass shape. Glass ON -> drawn via the SES+MultiEffect below (with shadow);
-    // glass OFF -> shown directly as a flat opaque panel.
     Rectangle {
         id: shape
         anchors.fill: parent
         radius: Theme.glassRadius
         antialiasing: true
-        visible: !Theme.glassEnabled
         color: Theme.glassEnabled ? (panelRoot.thin ? Theme.glassPanelBg : Theme.glassCard)
                                   : Theme.bgSurface
         border.width: 1
         border.color: Theme.glassEnabled ? Theme.glassBorder : Theme.hairline
-
-        // (top sheen highlight removed per user request)
-
-        // soft bottom depth — a gentle dark fade up from the bottom (no hard line)
-        Rectangle {
-            visible: Theme.glassEnabled
-            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 1 }
-            height: parent.radius * 1.4
-            radius: parent.radius - 1
-            gradient: Gradient {
-                GradientStop { position: 0.0; color: "transparent" }
-                GradientStop { position: 1.0; color: Theme.glassUnderShadow }
-            }
-        }
-    }
-
-    ShaderEffectSource {
-        id: shapeTex
-        anchors.fill: shape
-        sourceItem: shape
-        live: false            // shape is static; recaptured via scheduleUpdate() above
-        visible: false
-    }
-    MultiEffect {
-        anchors.fill: shape
-        source: shapeTex
-        visible: Theme.glassEnabled
-        autoPaddingEnabled: true          // let the shadow spread beyond the card
-        shadowEnabled: true
-        shadowColor: Theme.glassShadow
-        shadowBlur: 1.0
-        blurMax: Theme.glassShadowBlurMax
-        shadowVerticalOffset: 16
-        shadowHorizontalOffset: 0
     }
 
     ColumnLayout {
