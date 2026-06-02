@@ -459,12 +459,11 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             spacing: Theme.s3
                             Label { text: "新名字"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
-                            TextField {
+                            AppTextField {
                                 id: mergeName
                                 Layout.fillWidth: true
                                 placeholderText: "例如 A+C"
-                                color: Theme.textPrimary
-                                font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                                // mint focus scheme (Theme.accent default): border + glow ring + caret
                             }
                             AppButton {
                                 text: "🧬 融合并加载"
