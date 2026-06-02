@@ -204,18 +204,6 @@ ApplicationWindow {
                                             win.monitorSubstr(), monitorSw.checked);
                 }
             }
-            AppButton {
-                id: startBtn
-                text: backend.state === "running" ? "⏹ Stop" : "▶ Start"
-                // semantic: Start = mint (forward/positive), Stop = coral (stop/input energy)
-                accentColor: backend.state === "running" ? Theme.input : Theme.accent
-                enabled: !backend.busy && modelCombo.count > 0
-                onClicked: {
-                    errorLabel.text = "";
-                    backend.startOrStop(win.modelPath(), win.micSubstr(), win.outSubstr(), f0Combo.currentText,
-                                        win.monitorSubstr(), monitorSw.checked);
-                }
-            }
             BusyIndicator { running: backend.busy; visible: backend.busy; implicitWidth: 22; implicitHeight: 22 }
             StatusPill { statusText: backend.state }
             Item { Layout.fillWidth: true }
@@ -592,49 +580,74 @@ ApplicationWindow {
             }
         }
 
-        // ---------------- RIGHT: live monitor (always visible, never scrolled) ----------------
-        GlassPanel {
-            id: monitorPanel
-            thin: true
-            title: "实时监控 / Monitor"
+        // ---------------- RIGHT: live monitor (always visible) + Start/Stop CTA at the bottom ----------------
+        ColumnLayout {
+            id: rightCol
             Layout.fillWidth: true
-            Layout.fillHeight: false          // compact card, pinned top -> reveals 流光 below it
+            Layout.fillHeight: !win.narrow      // wide: fill so the CTA pins to the bottom; narrow: compact
             Layout.alignment: Qt.AlignTop
             Layout.horizontalStretchFactor: 2
             Layout.minimumWidth: win.narrow ? 0 : 280
+            spacing: Theme.s3
 
-            // hero metric: live inference latency (the monitor's headline reading)
-            RowLayout {
+            GlassPanel {
+                id: monitorPanel
+                thin: true
+                title: "实时监控 / Monitor"
                 Layout.fillWidth: true
-                spacing: Theme.s2
-                Label {
-                    id: monLatency; text: "— ms"
-                    color: Theme.accent; font.family: Theme.fontFamily
-                    font.pixelSize: 30; font.weight: Theme.fwSemibold
+
+                // hero metric: live inference latency (the monitor's headline reading)
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s2
+                    Label {
+                        id: monLatency; text: "— ms"
+                        color: Theme.accent; font.family: Theme.fontFamily
+                        font.pixelSize: 30; font.weight: Theme.fwSemibold
+                    }
+                    Label {
+                        text: "推理延迟 / latency"; color: Theme.textMuted
+                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption
+                        Layout.alignment: Qt.AlignBottom; Layout.bottomMargin: Theme.s1
+                    }
+                    Item { Layout.fillWidth: true }
                 }
-                Label {
-                    text: "推理延迟 / latency"; color: Theme.textMuted
-                    font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption
-                    Layout.alignment: Qt.AlignBottom; Layout.bottomMargin: Theme.s1
+                Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline; Layout.bottomMargin: Theme.s1 }
+
+                LevelMeter { id: inMeter;  label: "IN";  dbfs: -200; baseColor: Theme.input }   // 输入能量 = 珊瑚
+                LevelMeter { id: outMeter; label: "OUT"; dbfs: -200; baseColor: Theme.accent }  // 输出/正向 = 青
+
+                Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline; Layout.topMargin: Theme.s1 }
+
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: Theme.s4
+                    Label { id: inferLabel; text: "infer —/—/— ms"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                    Label { id: underLabel; text: "underrun 0／0";    color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                    Label { id: fbLabel;    text: "fallback 0";       color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                    Label { id: queueLabel; text: "queue 0";          color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                    Label { id: solaLabel;  text: "sola 0";           color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                    Label { id: silLabel;   text: "sil-skip 0";       color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
                 }
-                Item { Layout.fillWidth: true }
             }
-            Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline; Layout.bottomMargin: Theme.s1 }
 
-            LevelMeter { id: inMeter;  label: "IN";  dbfs: -200; baseColor: Theme.input }   // 输入能量 = 珊瑚
-            LevelMeter { id: outMeter; label: "OUT"; dbfs: -200; baseColor: Theme.accent }  // 输出/正向 = 青
+            // spacer pushes the transport CTA to the bottom of the monitor column
+            Item { Layout.fillWidth: true; Layout.fillHeight: true }
 
-            Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline; Layout.topMargin: Theme.s1 }
-
-            Flow {
+            // primary transport: Start/Stop, full column width (same as the monitor card above)
+            AppButton {
+                id: startBtn
+                text: backend.state === "running" ? "⏹ Stop" : "▶ Start"
+                // semantic: Start = mint (forward/positive), Stop = coral (stop/input energy)
+                accentColor: backend.state === "running" ? Theme.input : Theme.accent
+                enabled: !backend.busy && modelCombo.count > 0
                 Layout.fillWidth: true
-                spacing: Theme.s4
-                Label { id: inferLabel; text: "infer —/—/— ms"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                Label { id: underLabel; text: "underrun 0／0";    color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                Label { id: fbLabel;    text: "fallback 0";       color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                Label { id: queueLabel; text: "queue 0";          color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                Label { id: solaLabel;  text: "sola 0";           color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
-                Label { id: silLabel;   text: "sil-skip 0";       color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                Layout.preferredHeight: 46
+                onClicked: {
+                    errorLabel.text = "";
+                    backend.startOrStop(win.modelPath(), win.micSubstr(), win.outSubstr(), f0Combo.currentText,
+                                        win.monitorSubstr(), monitorSw.checked);
+                }
             }
         }
     }
