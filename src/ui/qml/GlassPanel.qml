@@ -44,19 +44,8 @@ Item {
         border.width: 1
         border.color: Theme.glassEnabled ? Theme.glassBorder : Theme.hairline
 
-        // soft top glow — light diffusing in from the top edge as a smooth gradient
-        // (replaces the old hard 1px white rim line that looked pasted-on).
-        Rectangle {
-            visible: Theme.glassEnabled
-            anchors { left: parent.left; right: parent.right; top: parent.top; margins: 1 }
-            height: parent.radius * 1.8
-            radius: parent.radius - 1
-            gradient: Gradient {
-                GradientStop { position: 0.0;  color: Theme.glassSheen }
-                GradientStop { position: 0.45; color: Qt.rgba(1, 1, 1, 0.02) }
-                GradientStop { position: 1.0;  color: "transparent" }
-            }
-        }
+        // (top sheen highlight removed per user request)
+
         // soft bottom depth — a gentle dark fade up from the bottom (no hard line)
         Rectangle {
             visible: Theme.glassEnabled

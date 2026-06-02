@@ -95,17 +95,15 @@ QtObject {
     property string glassQuality: "high"            // "high" | "medium" | "low"
 
     // Morning Bloom glass (brief §2.3 intent): frosted card that lets the drifting
-    // flowing-light show through, with a white sheen highlight on the top edge.
-    // Implementation note: the brief's literal "white-alpha" fill is rendered here
-    // as a SMOKED-glass tint (semi-transparent dark) + the white `glassSheen` line.
-    // On a dark theme this composites identically to "translucent white over the
+    // flowing-light show through. Implementation note: the brief's literal
+    // "white-alpha" fill is rendered here as a SMOKED-glass tint (semi-transparent
+    // dark). On a dark theme this composites identically to "translucent white over the
     // faint backdrop", but a semi-opaque fill (a) casts a real drop shadow and
     // (b) occludes its own shadow (no bleed-through), and (c) keeps light text
     // >=4.5:1 even when a bright blob drifts behind it. Verified via check_qml.
     readonly property color glassCard:   Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.50)   // normal card
     readonly property color glassPanelBg:Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.38)   // monitor side panel (thinner -> recedes)
     readonly property color glassField:  Qt.rgba(bgElevated.r, bgElevated.g, bgElevated.b, 0.55) // input / combo / small container
-    readonly property color glassSheen:  Qt.rgba(1, 1, 1, 0.14)   // top inner highlight line (glass reflection)
     readonly property color groove:      Qt.rgba(1, 1, 1, 0.12)   // slider/meter trough
     readonly property color hoverFill:   Qt.rgba(1, 1, 1, 0.10)   // hover/press wash
 
