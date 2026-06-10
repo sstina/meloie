@@ -54,13 +54,13 @@ denoise**, default off). Or, by hand:
 . .\setup_env_applio.ps1
 
 # 2. see your devices — the system default mic is marked "I", outputs "O"
-python -m src.main --list-devices
+python -m meloie.main --list-devices
 
 # 3. (optional) confirm the cable carries audio: tone -> CABLE Input -> CABLE Output
 python -m tools.verify_cable_route --duration-seconds 2
 
 # 4. run: system default mic -> model A (v2) -> CABLE Input
-python -m src.main `
+python -m meloie.main `
     --config config/runtime.example.json `
     --model-profile config/model_profiles/A.json `
     --device cuda --direct-f0 fcpe --direct-denoise
@@ -231,7 +231,7 @@ numpy + pytest. The runtime itself (the direct engine) needs `.venv-applio`.
 ## Dependencies
 
 `requirements.txt` lists only `numpy`, `sounddevice`, `pytest`. The v2 RVC stack
-(the vendored **Applio** inference core under `src/vendor/applio/`, `torch`+CUDA,
+(the vendored **Applio** inference core under `meloie/vendor/applio/`, `torch`+CUDA,
 `torchaudio`, `transformers`, `faiss-cpu`, `torchfcpe`, `noisereduce`, `librosa`,
 `scipy`) is installed once into `.venv-applio` (the runtime venv). All caches/temp
 are redirected into `RVC\.cache` and `RVC\.tmp` by `setup_env_applio.ps1` —

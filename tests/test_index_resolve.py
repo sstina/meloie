@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from src.engine.model_profile import find_default_index, models_root_for
+from meloie.engine.model_profile import find_default_index, models_root_for
 
 
 def _touch(p):

@@ -20,7 +20,7 @@ import os
 import sys
 
 _THIS = os.path.abspath(__file__)
-_SOURCE_ROOT = os.path.dirname(os.path.dirname(_THIS))   # src/app_paths.py -> src -> RVC
+_SOURCE_ROOT = os.path.dirname(os.path.dirname(_THIS))   # meloie/app_paths.py -> src -> RVC
 
 
 def is_frozen() -> bool:

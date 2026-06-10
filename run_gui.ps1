@@ -21,7 +21,7 @@ if (-not (Test-Path ".\setup_env_applio.ps1")) {
 # cache/temp redirection (keep C: untouched) + activate .venv-applio
 . .\setup_env_applio.ps1
 
-& $py -m src.ui @args
+& $py -m meloie.ui @args
 $code = $LASTEXITCODE
 Write-Host ""
 if ($code -ne 0) {

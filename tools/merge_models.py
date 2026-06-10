@@ -101,7 +101,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as exc:
         print(f"error: torch unavailable (run in .venv-applio): {exc}", file=sys.stderr)
         return 5
-    from src.engine.model_merge import MergeError, merge_checkpoints, weight_dict
+    from meloie.engine.model_merge import MergeError, merge_checkpoints, weight_dict
 
     for m in args.models:
         if not os.path.isfile(m):
@@ -148,7 +148,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.verify_load:
         try:
-            from src.engine.streaming_engine import (
+            from meloie.engine.streaming_engine import (
                 StreamingEngineConfig, StreamingRvcEngine,
             )
             eng = StreamingRvcEngine(StreamingEngineConfig(

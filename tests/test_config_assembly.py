@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 
-from src.engine.streaming_engine import StreamingEngineConfig
-from src.ui import config_assembly as ca
+from meloie.engine.streaming_engine import StreamingEngineConfig
+from meloie.ui import config_assembly as ca
 
 
 def test_list_model_files_lists_pth_by_stem(tmp_path, monkeypatch):

@@ -8,13 +8,13 @@ import math
 import numpy as np
 import pytest
 
-from src.safety.guard import (
+from meloie.safety.guard import (
     DBFS_SILENCE_FLOOR,
     dbfs_peak,
     dbfs_rms,
     scrub_nan_inf,
 )
-from src.safety.metrics import RuntimeMetrics
+from meloie.safety.metrics import RuntimeMetrics
 
 
 # ---------------------------------------------------------------------------

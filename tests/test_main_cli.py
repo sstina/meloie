@@ -1,4 +1,4 @@
-"""Tests for the src.main CLI parser + pure config helpers.
+"""Tests for the meloie.main CLI parser + pure config helpers.
 
 No audio stream is started — only argument parsing, config loading, and
 device-override merging are exercised.
@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.main import _apply_device_overrides, _build_parser, _load_config
-from src.audio.streams import AudioRuntimeConfig
+from meloie.main import _apply_device_overrides, _build_parser, _load_config
+from meloie.audio.streams import AudioRuntimeConfig
 
 
 CONFIG = "config/runtime.example.json"

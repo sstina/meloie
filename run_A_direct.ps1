@@ -67,7 +67,7 @@ Read-Host "Press Enter to start"
 #   run_A_direct.bat --direct-denoise-strength 0.8  (if ON: clean harder)
 #   run_A_direct.bat --pitch 14                     (one-off transpose +14)
 #   run_A_direct.bat --direct-silence-dbfs -50      (silence gate / 响应阈值)
-& $py -m src.main `
+& $py -m meloie.main `
     --config config/runtime.example.json `
     --model-profile config/model_profiles/A.json `
     --device cuda --direct-f0 fcpe @denoiseArg @args

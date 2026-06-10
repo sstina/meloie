@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from src.control import RealtimeSession, SessionError, SessionState
+from meloie.control import RealtimeSession, SessionError, SessionState
 
 
 # --------------------------------------------------------------------------

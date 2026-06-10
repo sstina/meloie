@@ -43,7 +43,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 
-# Absolute roots derived from this file: .../RVC/src/engine/streaming_engine.py
+# Absolute roots derived from this file: .../RVC/meloie/engine/streaming_engine.py
 _THIS = os.path.abspath(__file__)
 _SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))   # .../RVC (source tree)
 # External data (rvc/models, rvc/configs) lives next to the .exe when frozen, else at
@@ -52,7 +52,7 @@ _SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))   # .../
 # meloie.spec so it imports without VENDOR_DIR on sys.path.
 from ..app_paths import app_base_dir, is_frozen
 RVC_ROOT = app_base_dir()
-VENDOR_DIR = os.path.join(_SOURCE_ROOT, "src", "vendor", "applio")        # holds the `rvc` pkg
+VENDOR_DIR = os.path.join(_SOURCE_ROOT, "meloie", "vendor", "applio")        # holds the `rvc` pkg
 
 STREAM_SR_DEFAULT = 48000
 SR16 = 16000

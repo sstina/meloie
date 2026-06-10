@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.audio.wav_io import read_wav_mono_float32, write_wav_float32
+from meloie.audio.wav_io import read_wav_mono_float32, write_wav_float32
 
 
 def test_roundtrip_mono_pcm16(tmp_path):

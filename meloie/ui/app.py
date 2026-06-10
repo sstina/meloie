@@ -14,12 +14,12 @@ from ..app_paths import app_base_dir, setup_frozen_cache_env
 from .backend import Backend
 from .tray import TrayController, load_app_icon
 
-# QML is bundled INSIDE the build. Frozen: it sits at <_MEIPASS>/src/ui/qml (see
+# QML is bundled INSIDE the build. Frozen: it sits at <_MEIPASS>/meloie/ui/qml (see
 # meloie.spec datas) — resolve via _MEIPASS, not __file__ (which points into the PYZ).
 # Source: resolve next to this module.
 _UI_DIR = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, "frozen", False):
-    _QML_DIR = os.path.join(getattr(sys, "_MEIPASS", _UI_DIR), "src", "ui", "qml")
+    _QML_DIR = os.path.join(getattr(sys, "_MEIPASS", _UI_DIR), "meloie", "ui", "qml")
 else:
     _QML_DIR = os.path.join(_UI_DIR, "qml")
 # External data (icon.svg, models/, rvc/, config/) + the CWD the vendored loaders

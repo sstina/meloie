@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.engine.streaming_engine import StreamingEngineConfig, StreamingRvcEngine
+from meloie.engine.streaming_engine import StreamingEngineConfig, StreamingRvcEngine
 
 
 class _FakeTensor:

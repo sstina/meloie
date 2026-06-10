@@ -7,7 +7,7 @@ route is alive: the captured buffer must be non-silent.
 
 This is the through-cable transport check from the legacy validation
 ladder. It does NOT exercise the realtime identity worker — that is
-what ``python -m src.main --mode identity`` is for. It exercises the
+what ``python -m meloie.main --mode identity`` is for. It exercises the
 VB-CABLE pipe itself so that, when the identity worker is also alive,
 we know both halves are good.
 
@@ -31,12 +31,12 @@ from typing import List, Optional
 
 import numpy as np
 
-from src.audio.measurement import (
+from meloie.audio.measurement import (
     DEFAULT_NON_SILENCE_THRESHOLD_DBFS,
     generate_sine_tone,
     summarize_capture,
 )
-from src.audio.streams import resolve_input_device, resolve_output_device
+from meloie.audio.streams import resolve_input_device, resolve_output_device
 
 
 def _build_parser() -> argparse.ArgumentParser:

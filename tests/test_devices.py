@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.audio.devices import (
+from meloie.audio.devices import (
     FeedbackLoopRisk,
     is_probable_cable_input,
     is_probable_cable_output,

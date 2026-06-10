@@ -1,6 +1,6 @@
 """Pure tests for the precise F0 mapping math (CDF / quantile histogram match).
 
-No torch, no Qt — exercises src/engine/f0_map.py with synthetic F0-in-Hz arrays.
+No torch, no Qt — exercises meloie/engine/f0_map.py with synthetic F0-in-Hz arrays.
 Pins: identity, octave shift, range compression + endpoint clamp, monotonicity,
 unvoiced passthrough + shape/dtype, out-of-band rejection, min-frame guard, and a
 flat-pitched source (tied quantiles) staying well-defined.
@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.engine.f0_map import (
+from meloie.engine.f0_map import (
     MIN_VOICED_FRAMES,
     build_quantiles,
     make_remap,

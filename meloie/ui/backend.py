@@ -48,7 +48,7 @@ class LoadWorker(QObject):
 
 class MergeWorker(QObject):
     """Runs the (blocking) offline model merge + save off the GUI thread (lives in
-    a QThread, mirrors LoadWorker). Reuses src.engine.model_merge; torch is lazy."""
+    a QThread, mirrors LoadWorker). Reuses meloie.engine.model_merge; torch is lazy."""
 
     finished = Signal(bool, str, str)   # (ok, merged_model_path, error_message)
 

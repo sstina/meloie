@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import json
 
-from src.engine.model_profile import load_model_profile
-from src.ui import presets as pr
+from meloie.engine.model_profile import load_model_profile
+from meloie.ui import presets as pr
 
 
 def test_save_creates_loadable_profile(tmp_path):

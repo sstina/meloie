@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.audio.measurement import (
+from meloie.audio.measurement import (
     DEFAULT_NON_SILENCE_THRESHOLD_DBFS,
     estimate_latency_samples,
     generate_click_pulse,

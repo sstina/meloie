@@ -1,6 +1,6 @@
 """Backend-logic smoke for the GUI bridge (NOT a pytest test).
 
-Drives ``src.ui.backend.Backend`` with a FAKE RealtimeSession (fake engine +
+Drives ``meloie.ui.backend.Backend`` with a FAKE RealtimeSession (fake engine +
 fake stream runner) under a ``QCoreApplication`` event loop — no QML window, no
 audio devices, no torch. Proves: setters delegate to the engine, the metrics
 QTimer poll emits a growing QVariantMap, and cross-thread state transitions reach
@@ -21,8 +21,8 @@ os.chdir(RVC)
 
 from PySide6.QtCore import QCoreApplication, QTimer   # noqa: E402
 
-from src.control import RealtimeSession, SessionState  # noqa: E402
-from src.ui.backend import Backend                      # noqa: E402
+from meloie.control import RealtimeSession, SessionState  # noqa: E402
+from meloie.ui.backend import Backend                      # noqa: E402
 
 
 class FakeEngine:

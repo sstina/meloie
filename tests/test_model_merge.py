@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.engine.model_merge import (
+from meloie.engine.model_merge import (
     MergeError,
     blend_weights,
     build_merged_checkpoint,

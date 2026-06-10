@@ -7,13 +7,13 @@ its microphone hears your voice converted to the model's voice.
 Usage::
 
     # list devices (which mic is the system default, where CABLE Input is)
-    python -m src.main --list-devices
+    python -m meloie.main --list-devices
 
     # validate a runtime config
-    python -m src.main --check-config config/runtime.example.json
+    python -m meloie.main --check-config config/runtime.example.json
 
     # run: system default mic -> model A (v2) -> CABLE Input
-    python -m src.main --config config/runtime.example.json \\
+    python -m meloie.main --config config/runtime.example.json \\
         --model-profile config/model_profiles/A.json \\
         --device cuda
     # (or just double-click run_A_direct.bat)
@@ -278,7 +278,7 @@ def _require_config(args: argparse.Namespace) -> Optional[AudioRuntimeConfig]:
     if not args.config:
         print(
             "error: running requires --config PATH\n"
-            "example: python -m src.main --config config/runtime.example.json "
+            "example: python -m meloie.main --config config/runtime.example.json "
             "--model-profile config/model_profiles/A.json --device cuda",
             file=sys.stderr,
         )

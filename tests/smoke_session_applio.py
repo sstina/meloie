@@ -28,8 +28,8 @@ def _sine(n, sr, f=150.0, a=0.2):
 
 
 def run_smoke() -> int:
-    from src.engine.streaming_engine import StreamingEngineConfig, StreamingRvcEngine
-    from src.control import RealtimeSession, SessionState
+    from meloie.engine.streaming_engine import StreamingEngineConfig, StreamingRvcEngine
+    from meloie.control import RealtimeSession, SessionState
 
     if not os.path.exists(os.path.join(RVC, "models", "A.pth")):
         print("SKIP: models/A.pth not present — smoke needs the real model.")

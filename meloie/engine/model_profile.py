@@ -9,7 +9,7 @@ the optional ``hubert_path`` / ``rmvpe_path`` fields below are legacy and
 unused by it.)
 
 This module loads a JSON model profile that groups those paths and
-parameters into a single named bundle. The two CLIs (``src.main`` for
+parameters into a single named bundle. The two CLIs (``meloie.main`` for
 realtime, ``tools.offline_infer`` for offline) consume profiles via
 ``--model-profile`` so a normal "play this model" command does not
 mention any of the voice-identity parameters at all.

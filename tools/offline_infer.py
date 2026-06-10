@@ -120,14 +120,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Lazy imports — the heavy v2 / Applio stack is only touched here.
     import numpy as np
     import librosa
-    from src.audio.wav_io import read_wav_mono_float32, write_wav_float32
-    from src.engine.model_profile import ModelProfileError, load_model_profile
-    from src.engine.streaming_engine import (
+    from meloie.audio.wav_io import read_wav_mono_float32, write_wav_float32
+    from meloie.engine.model_profile import ModelProfileError, load_model_profile
+    from meloie.engine.streaming_engine import (
         StreamingEngineConfig,
         StreamingEngineError,
         StreamingRvcEngine,
     )
-    from src.safety.guard import dbfs_peak, dbfs_rms, scrub_nan_inf
+    from meloie.safety.guard import dbfs_peak, dbfs_rms, scrub_nan_inf
 
     profile = None
     if args.model_profile:

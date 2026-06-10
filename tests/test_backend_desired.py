@@ -17,9 +17,9 @@ from __future__ import annotations
 import pytest
 from PySide6.QtCore import QCoreApplication
 
-from src.control import RealtimeSession
-from src.ui import backend as backend_mod
-from src.ui.backend import Backend
+from meloie.control import RealtimeSession
+from meloie.ui import backend as backend_mod
+from meloie.ui.backend import Backend
 
 
 # --------------------------------------------------------------------------- fakes

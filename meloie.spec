@@ -26,7 +26,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 # Make the vendored `rvc` package importable at SPEC-EVAL time so collect_submodules
 # can walk it, and add it to pathex so Analysis compiles those modules into the bundle.
-VENDOR = os.path.abspath(os.path.join("src", "vendor", "applio"))
+VENDOR = os.path.abspath(os.path.join("meloie", "vendor", "applio"))
 if VENDOR not in sys.path:
     sys.path.insert(0, VENDOR)
 
@@ -35,8 +35,8 @@ binaries = []
 hiddenimports = []
 
 # QML graph (15 .qml) — not Python, so bundle as data at the package-relative path the
-# frozen _QML_DIR (= <_MEIPASS>/src/ui/qml) expects.
-datas += [(os.path.join("src", "ui", "qml"), os.path.join("src", "ui", "qml"))]
+# frozen _QML_DIR (= <_MEIPASS>/meloie/ui/qml) expects.
+datas += [(os.path.join("meloie", "ui", "qml"), os.path.join("meloie", "ui", "qml"))]
 
 # Vendored Applio `rvc` package: imported lazily at runtime (sys.path trick), so the
 # static graph never sees it — force-collect every submodule.
@@ -44,7 +44,7 @@ hiddenimports += collect_submodules("rvc")
 # AND ship the rvc .py SOURCE on disk: the synthesizer uses @torch.jit.script
 # (fused_add_tanh_sigmoid_multiply), and TorchScript does inspect.getsource at import
 # -> it needs the original .py, not just the PYZ bytecode. 0.6 MB of code.
-datas += [(os.path.join("src", "vendor", "applio", "rvc"), "rvc")]
+datas += [(os.path.join("meloie", "vendor", "applio", "rvc"), "rvc")]
 
 # Heavy native stacks (lazy and/or data-dependent). collect_all grabs py + dlls + data
 # (e.g. torch/lib CUDA dlls, faiss.dll, libportaudio, llvmlite, torchfcpe/torchcrepe

@@ -1,4 +1,4 @@
-"""Pure tests for the saved precise-mapping store (src/ui/precise_store.py).
+"""Pure tests for the saved precise-mapping store (meloie/ui/precise_store.py).
 
 No Qt — json + numpy round-trips in a tmp dir. Pins: save/list/load round-trip,
 filename sanitization (no path traversal, display name kept), tolerant listing
@@ -13,7 +13,7 @@ import os
 import numpy as np
 import pytest
 
-from src.ui import precise_store as ps
+from meloie.ui import precise_store as ps
 
 
 def _q():

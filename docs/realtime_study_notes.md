@@ -105,9 +105,9 @@ the join point — so it is faithful-carrier compatible. We adopt part 1 and
 **never** part 2.
 
 **Our implementation (clean-room, our own style — not a port):**
-`find_sola_offset(haystack, needle)` in `src/audio/chunker.py` is a pure,
+`find_sola_offset(haystack, needle)` in `meloie/audio/chunker.py` is a pure,
 unit-tested normalised cross-correlation that returns the best alignment index.
-The worker (`src/engine/worker.py`, `_seam_aligned_start`) exploits the overlap
+The worker (`meloie/engine/worker.py`, `_seam_aligned_start`) exploits the overlap
 we *already* render: because each chunk is fed `[context][chunk][tail_pad]`,
 consecutive renders cover the same input audio around the seam. So we keep the
 previous chunk's emitted tail (`sola_link`, ~20 ms), search ±`sola_search_size`

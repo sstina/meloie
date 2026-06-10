@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.engine.model_profile import (
+from meloie.engine.model_profile import (
     ModelProfile,
     ModelProfileError,
     load_model_profile,

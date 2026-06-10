@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-from src.engine.streaming_engine import (
+from meloie.engine.streaming_engine import (
     StreamingEngineConfig,
     StreamingEngineError,
     StreamingRvcEngine,

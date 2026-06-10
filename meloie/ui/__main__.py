@@ -1,4 +1,4 @@
-"""``python -m src.ui`` entry point."""
+"""``python -m meloie.ui`` entry point."""
 
 import sys
 

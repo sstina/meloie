@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.audio.devices import FeedbackLoopRisk, select_default_input_device
-from src.audio.streams import (
+from meloie.audio.devices import FeedbackLoopRisk, select_default_input_device
+from meloie.audio.streams import (
     AudioRuntimeConfig,
     queue_blocks_from_ms,
     resolve_input_device,
