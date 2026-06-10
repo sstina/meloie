@@ -24,6 +24,13 @@ $env:TEMP                   = "$RVC\.tmp"
 # UTF-8 console so non-GBK device names print instead of crashing.
 $env:PYTHONIOENCODING       = "utf-8"
 
+# Zero C: writes: Qt caches to QStandardPaths (%LOCALAPPDATA%\<App>\cache), ignoring the
+# redirects above. Two caches land there — the QML disk cache AND the RHI pipeline cache.
+# Disable BOTH for every python launched in this shell (GUI + check_qml/real_shoot/smoke).
+# app.main() also sets these for the frozen exe.
+$env:QML_DISABLE_DISK_CACHE = "1"
+$env:QSG_RHI_DISABLE_DISK_CACHE = "1"
+
 # --- make sure the redirect targets exist ---------------------------------
 foreach ($d in @("$RVC\.cache\pip", "$RVC\.cache\hf", "$RVC\.cache\torch",
                  "$RVC\.cache\numba", "$RVC\.tmp")) {

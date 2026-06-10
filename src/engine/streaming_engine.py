@@ -16,6 +16,9 @@ Faithful-carrier contract — this engine carries the model's samples and does O
   * SOLA seam alignment + a short sin² crossfade at the block seam. The crossfade
     is a *seam-only* blend of two renders of the same audio — explicitly sanctioned
     by the user as the one allowed relaxation; it never alters pitch/timbre.
+  * a hard clip to [-1, 1] inside the vendored ``inference()`` — a DAC sample-validity
+    guard (out-of-range samples would wrap/clip downstream anyway), NOT tonal shaping:
+    it is identity for every in-range sample and adds no EQ/limiter/gain/normalize.
 OUTPUT-side colouring is stripped: the output×input-RMS scaling (``change_rms`` /
 volume_envelope), the Pedalboard FX rack, and output-side noise reduction are all
 disabled / never invoked. INPUT-side conditioning (pitch transpose, optional denoise,
@@ -42,11 +45,22 @@ import numpy as np
 
 # Absolute roots derived from this file: .../RVC/src/engine/streaming_engine.py
 _THIS = os.path.abspath(__file__)
-RVC_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))   # .../RVC
-VENDOR_DIR = os.path.join(RVC_ROOT, "src", "vendor", "applio")        # holds the `rvc` pkg
+_SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))   # .../RVC (source tree)
+# External data (rvc/models, rvc/configs) lives next to the .exe when frozen, else at
+# the source root -> app_base_dir(). CODE (the vendored `rvc` package) always lives in
+# the source tree (VENDOR_DIR) and, when frozen, is collected into the bundle by
+# meloie.spec so it imports without VENDOR_DIR on sys.path.
+from ..app_paths import app_base_dir, is_frozen
+RVC_ROOT = app_base_dir()
+VENDOR_DIR = os.path.join(_SOURCE_ROOT, "src", "vendor", "applio")        # holds the `rvc` pkg
 
 STREAM_SR_DEFAULT = 48000
 SR16 = 16000
+
+# torch intra-op thread count is process-wide. The CPU game mode pins it to a few
+# cores; switching back to the GPU path must restore torch's original default, so we
+# capture it once on the first load() and reuse it for every later restore.
+_DEFAULT_TORCH_THREADS: Optional[int] = None
 
 
 class StreamingEngineError(Exception):
@@ -127,6 +141,22 @@ class StreamingEngineConfig:
     auto_center_tau_s: float = 20.0      # EMA time constant (>> sentence prosody)
     auto_center_limit: float = 12.0      # clamp the auto offset to +-this many semitones
 
+    # Cap faiss's OpenMP thread pool for the per-block index retrieval. faiss defaults
+    # to ALL logical cores, so at index_rate>0 the tiny realtime search fans out across
+    # every core -- measured ~10x more CPU than the work needs (~2.9 CPU-seconds/block
+    # across 24 cores vs ~0.3 with 1 thread), wall-time unchanged (the index is small).
+    # On a few-core PC the unbounded fan-out can starve the audio threads -> underruns.
+    # 1 keeps latency ~identical while cutting that CPU ~10x; raise only for a very large
+    # index. Applied process-wide in load() (faiss has no per-handle thread setting).
+    faiss_threads: int = 1
+
+    # Game-mode CPU thread budget. When device == "cpu" and this is > 0, load() pins
+    # torch intra-op parallelism to this many threads so realtime inference uses only a
+    # few cores (leaving the rest -- and the whole dGPU -- for the game). Measured: CPU
+    # inference barely scales past ~8 threads, so ~8 is enough for realtime at block_ms
+    # >= 500. 0 = leave torch's default (the normal GPU path).
+    cpu_threads: int = 0
+
     def validate(self) -> None:
         if not self.model_path:
             raise ValueError("model_path is required")
@@ -169,6 +199,15 @@ class StreamingRvcEngine:
         self._track_fill = 0
         self._track_counter = 0
         self._track_interval_blocks = 1
+
+        # Precise F0 mapping (input-side; default OFF). When on, a CDF/quantile map of
+        # the carrier's estimated F0 onto a target voice's F0 distribution is attached
+        # to the pipeline (pipeline.f0_remap) and REPLACES the scalar transpose/autotune
+        # (see _convert). The quantile anchors are precomputed by build_precise_map.
+        self._precise_on = False
+        self._precise_src_q = None     # log2-Hz source quantiles (np.float64)
+        self._precise_tgt_q = None     # log2-Hz target quantiles (np.float64)
+        self._precise_method = None    # f0_method the map was built under (rmvpe/fcpe)
 
         # Serialises live set_* calls (control thread) against each other; the
         # audio worker reads the gated state lock-free (flag flipped LAST after
@@ -233,7 +272,10 @@ class StreamingRvcEngine:
         # the vendored stack so those relative paths point at RVC/rvc/models/.
         if os.path.abspath(os.getcwd()) != RVC_ROOT:
             os.chdir(RVC_ROOT)
-        if VENDOR_DIR not in sys.path:
+        # Source run: put the vendored `rvc` pkg on sys.path. Frozen: it is already a
+        # bundled importable package (meloie.spec collects it), and VENDOR_DIR points
+        # inside the bundle's source mirror which must NOT shadow it -> skip the insert.
+        if not is_frozen() and VENDOR_DIR not in sys.path:
             sys.path.insert(0, VENDOR_DIR)
 
         try:
@@ -252,14 +294,51 @@ class StreamingRvcEngine:
         self._circular_write = circular_write
 
         # Best-effort GPU label for the status banner. `_resolved_device` is set
-        # authoritatively below from the pipeline's ACTUAL device -- the vendored
-        # Config picks cuda:0 whenever CUDA is available, independent of
-        # cfg.device -- so we report the real device, not the requested one.
+        # authoritatively below from the pipeline's ACTUAL device, so we always
+        # report the real device, not the requested one.
         if torch.cuda.is_available():
             try:
                 self._cuda_name = str(torch.cuda.get_device_name(0))
             except Exception:
                 self._cuda_name = None
+
+        # --- Game-mode device + thread override (zero vendored edit) ----------
+        # The vendored realtime stack reads its device EXCLUSIVELY from the
+        # Config() singleton (pipeline.py: VC.config.device drives net_g, hubert,
+        # BOTH f0 predictors via setup_f0, every tensor/resampler). Config is a
+        # @singleton -> its __init__ runs once per process, so an env var read on a
+        # later reload would be ignored; we mutate the live singleton's .device
+        # directly. This single point switches the whole stack consistently (the
+        # cpu_zero game mode forces CPU; the normal path forces cuda:0 when CUDA is
+        # present) with NO edit to the vendored source. Falls back to CPU when CUDA
+        # is unavailable so a forced "cuda:0" can never break a no-GPU host.
+        want_cpu = str(self.cfg.device).lower().startswith("cpu")
+        target_dev = "cpu" if (want_cpu or not torch.cuda.is_available()) else "cuda:0"
+        try:
+            from rvc.configs.config import Config as _VConfig
+            _VConfig().device = target_dev
+        except Exception:
+            pass
+
+        # torch intra-op threads are process-wide. On the CPU game path pin them to
+        # cpu_threads (a few cores -> the rest of the CPU AND the whole dGPU stay
+        # free for the game); on the GPU path restore torch's captured default so a
+        # prior CPU-mode reload can't leave the GPU path throttled to few threads.
+        global _DEFAULT_TORCH_THREADS
+        if _DEFAULT_TORCH_THREADS is None:
+            try:
+                _DEFAULT_TORCH_THREADS = int(torch.get_num_threads())
+            except Exception:
+                # fall back to the core count (not 0) so the GPU-path restore branch
+                # below can still fire after a cpu_zero reload pinned threads low.
+                _DEFAULT_TORCH_THREADS = os.cpu_count() or 1
+        try:
+            if target_dev == "cpu" and int(self.cfg.cpu_threads) > 0:
+                torch.set_num_threads(int(self.cfg.cpu_threads))
+            elif _DEFAULT_TORCH_THREADS and _DEFAULT_TORCH_THREADS > 0:
+                torch.set_num_threads(_DEFAULT_TORCH_THREADS)
+        except Exception:
+            pass
 
         # Preflight: only allow an embedder that is actually staged under
         # rvc/models/embedders, so an unknown/unstaged name fails with a clear
@@ -317,6 +396,15 @@ class StreamingRvcEngine:
         # Seed the f0-predictor cache with the one the pipeline built at load, so
         # a later set_f0_method() can swap rmvpe<->fcpe without rebuilding it.
         self._f0_models = {self.cfg.f0_method: self._pipeline.f0_model}
+
+        # Cap faiss OpenMP so the per-block index search can't fan out across every
+        # core (see StreamingEngineConfig.faiss_threads). Process-wide, best-effort:
+        # faiss is already imported by create_pipeline's load_faiss_index.
+        try:
+            import faiss
+            faiss.omp_set_num_threads(max(1, int(self.cfg.faiss_threads)))
+        except Exception:
+            pass
 
         # Optional input-side machinery. Each object is built only when its
         # feature starts enabled; the set_* methods build it lazily on first
@@ -735,6 +823,84 @@ class StreamingRvcEngine:
             self._pipeline.f0_method = method
             self.cfg.f0_method = method
 
+    # ------------------------------------------------- precise F0 mapping (input-side)
+    def set_precise_mapping(self, on, src_q=None, tgt_q=None, method=None) -> None:
+        """Attach (or drop) a precise CDF F0 map. INPUT-side: it remaps the carrier's
+        ESTIMATED F0 distribution onto a target voice's distribution before the model's
+        pitch guidance; the model's OUTPUT samples are never touched (faithful-carrier).
+        When ON it REPLACES the scalar transpose / autotune / auto-center (gated in
+        _convert: f0_up_key=0, autotune/proposed off).
+
+        Live: ``pipeline.f0_remap`` is published under ``self._lock`` against the audio
+        worker's _convert read; the closure captures immutable numpy arrays, so a block
+        never sees a half-built map. The F0 cache is intentionally NOT cleared (same as
+        set_f0_method / set_auto_center): the rolling ring refreshes within a few blocks
+        and the SOLA crossfade absorbs the sub-block seam, so no pop on toggle."""
+        if not self._loaded or self._pipeline is None:
+            raise StreamingEngineError("engine not loaded; call load() first")
+        on = bool(on)
+        remap = None
+        if on:
+            if src_q is None or tgt_q is None:           # reuse last-built anchors
+                src_q, tgt_q = self._precise_src_q, self._precise_tgt_q
+            if src_q is None or tgt_q is None:
+                raise StreamingEngineError(
+                    "precise mapping has no quantiles; call build_precise_map() first"
+                )
+            from .f0_map import make_remap
+            src_q = np.asarray(src_q, dtype=np.float64)
+            tgt_q = np.asarray(tgt_q, dtype=np.float64)
+            remap = make_remap(src_q, tgt_q)
+        with self._lock:
+            if on:
+                self._precise_src_q = src_q
+                self._precise_tgt_q = tgt_q
+                if method is not None:
+                    self._precise_method = str(method)
+            self._precise_on = on
+            self._pipeline.f0_remap = remap
+
+    def build_precise_map(self, voice_wav, target_wav):
+        """Analyse two .wav files into ``(src_q, tgt_q, method)`` log2-Hz quantile
+        anchors for a precise CDF F0 map (``method`` = the estimator they were built
+        under). OFFLINE (control/worker thread): loads + resamples both to 16 kHz and
+        runs the CURRENTLY-LOADED f0 estimator. Mirrors _update_auto_center: snapshot
+        the (f0_model, f0_method) pair under the lock, then run get_f0 OFF the lock — a
+        multi-second forward pass must never stall the per-block audio lock (concurrent
+        predictor use is the same pattern auto-center already ships). Raises on
+        too-short input. Does NOT attach the map — call set_precise_mapping()."""
+        if not self._loaded or self._pipeline is None:
+            raise StreamingEngineError("engine not loaded; call load() first")
+        from .f0_map import build_quantiles
+        voice = self._load_wav_16k(voice_wav)
+        target = self._load_wav_16k(target_wav)
+        with self._lock:                       # snapshot the coupled (model, method) pair
+            f0_model = getattr(self._pipeline, "f0_model", None)
+            f0_method = getattr(self._pipeline, "f0_method", "rmvpe")
+        if f0_model is None:
+            raise StreamingEngineError("no f0 model loaded")
+        voice_f0 = self._estimate_f0(f0_model, f0_method, voice)    # OFF the lock
+        target_f0 = self._estimate_f0(f0_model, f0_method, target)
+        src_q, tgt_q = build_quantiles(voice_f0, target_f0)
+        return src_q, tgt_q, str(f0_method)
+
+    @staticmethod
+    def _load_wav_16k(path):
+        from ..audio.wav_io import read_wav_mono_float32
+        audio, sr = read_wav_mono_float32(str(path))
+        if sr != 16000:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        return np.ascontiguousarray(audio, dtype=np.float32)
+
+    @staticmethod
+    def _estimate_f0(f0_model, f0_method, audio16k):
+        # off-lock forward pass; mirror _update_auto_center's call + stdout-swallow
+        with contextlib.redirect_stdout(io.StringIO()):
+            if f0_method == "fcpe":
+                return f0_model.get_f0(audio16k, audio16k.shape[0] // 160, filter_radius=0.006)
+            return f0_model.get_f0(audio16k, filter_radius=0.03)
+
     def _fit16(self, t, n: int):
         if t.shape[0] == n:
             return t
@@ -748,17 +914,23 @@ class StreamingRvcEngine:
         def _call():
             return self._pipeline.voice_conversion(
                 self._convert_buffer, self._pitch_buffer, self._pitchf_buffer,
-                # auto-center REPLACES the manual transpose (it IS the centering;
-                # adding pitch_shift on top would double-shift). Manual pitch applies
-                # only when auto-center is off.
-                f0_up_key=(self._auto_offset if self._auto_center_on else self.pitch_shift),
+                # Precise mapping REPLACES every scalar F0 knob: the CDF map (attached
+                # as pipeline.f0_remap) is the sole F0 transform, so transpose=0 and
+                # autotune/proposed are bypassed. Else auto-center REPLACES the manual
+                # transpose (adding pitch_shift on top would double-shift); manual pitch
+                # applies only when both are off.
+                f0_up_key=(
+                    0.0 if self._precise_on
+                    else (self._auto_offset if self._auto_center_on else self.pitch_shift)
+                ),
                 index_rate=self.index_rate,
                 p_len=self._convert_feature_size_16k, silence_front=0,
                 skip_head=self._skip_head, return_length=self._return_length,
                 protect=self.protect, volume_envelope=1,        # 1 => no change_rms
-                f0_autotune=self.f0_autotune,
+                f0_autotune=self.f0_autotune and not self._precise_on,
                 f0_autotune_strength=self.f0_autotune_strength,
-                proposed_pitch=self.proposed_pitch and not self._auto_center_on,
+                proposed_pitch=self.proposed_pitch and not self._auto_center_on
+                and not self._precise_on,
                 proposed_pitch_threshold=self.proposed_pitch_threshold,
                 reduced_noise=None, board=None,                 # no FX / noise-reduce
                 block_size_16k=self.block_frame_16k,

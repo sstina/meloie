@@ -10,12 +10,21 @@ from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonType
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
+from ..app_paths import app_base_dir, setup_frozen_cache_env
 from .backend import Backend
 from .tray import TrayController, load_app_icon
 
+# QML is bundled INSIDE the build. Frozen: it sits at <_MEIPASS>/src/ui/qml (see
+# meloie.spec datas) — resolve via _MEIPASS, not __file__ (which points into the PYZ).
+# Source: resolve next to this module.
 _UI_DIR = os.path.dirname(os.path.abspath(__file__))
-_QML_DIR = os.path.join(_UI_DIR, "qml")
-RVC_ROOT = os.path.dirname(os.path.dirname(_UI_DIR))   # .../RVC
+if getattr(sys, "frozen", False):
+    _QML_DIR = os.path.join(getattr(sys, "_MEIPASS", _UI_DIR), "src", "ui", "qml")
+else:
+    _QML_DIR = os.path.join(_UI_DIR, "qml")
+# External data (icon.svg, models/, rvc/, config/) + the CWD the vendored loaders
+# resolve against live next to the .exe when frozen, else at the source root.
+RVC_ROOT = app_base_dir()
 
 
 def _apply_dark_titlebar(window) -> None:
@@ -55,7 +64,82 @@ def _apply_dark_titlebar(window) -> None:
         pass     # unsupported build / API absent -> keep the default native bar
 
 
+def _run_selftest(engine, deep: bool = False) -> int:
+    """Frozen-build completeness probe (set MELOIE_SELFTEST=1, ideally with
+    QT_QPA_PLATFORM=offscreen): verify the QML graph loaded AND the heavy lazy stack
+    is importable in the bundle — torch + the vendored ``rvc`` realtime pipeline (the
+    exact import the engine does at Start) + the key native deps — WITHOUT touching
+    audio. With ``deep`` (MELOIE_SELFTEST=2) it ALSO loads the first discovered model
+    and runs one ``process_block`` on synthetic audio — true end-to-end, no audio
+    hardware. Prints one ``SELFTEST OK|FAIL`` line and returns 0/1."""
+    results: list[str] = []
+    ok = True
+
+    def probe(name: str, fn) -> None:
+        nonlocal ok
+        try:
+            fn()
+            results.append(f"{name}=OK")
+        except Exception as exc:
+            ok = False
+            results.append(f"{name}=FAIL({type(exc).__name__}: {exc})")
+
+    probe("qml_root", lambda: None if engine.rootObjects() else (_ for _ in ()).throw(RuntimeError("no root object")))
+    probe("torch", lambda: __import__("torch"))
+
+    def _import_vendored_rvc() -> None:
+        # mirror StreamingRvcEngine.load()'s path setup so the import resolves from
+        # source too (frozen: rvc is a bundled package, no sys.path insert needed).
+        import importlib
+        from .. import app_paths as _ap
+        from ..engine import streaming_engine as _se
+        if os.path.isdir(_se.RVC_ROOT) and os.path.abspath(os.getcwd()) != _se.RVC_ROOT:
+            os.chdir(_se.RVC_ROOT)
+        if not _ap.is_frozen() and _se.VENDOR_DIR not in sys.path:
+            sys.path.insert(0, _se.VENDOR_DIR)
+        importlib.import_module("rvc.realtime.pipeline")
+
+    probe("rvc.realtime.pipeline", _import_vendored_rvc)
+    for mod in ("faiss", "torchaudio", "torchfcpe", "transformers", "sounddevice", "librosa"):
+        probe(mod, lambda m=mod: __import__(m))
+
+    if deep:
+        def _engine_probe() -> str:
+            import numpy as np
+            from .config_assembly import build_configs_for_model, list_model_files
+            from ..engine.streaming_engine import StreamingRvcEngine
+            models = list_model_files()
+            if not models:
+                return "SKIP (no models staged next to exe)"
+            scfg, _ = build_configs_for_model(models[0]["path"], None, None)
+            eng = StreamingRvcEngine(scfg)
+            eng.load()                                  # full pipeline: v2 guard, embedder, predictors, faiss
+            x = (np.random.default_rng(0).standard_normal(eng.block_frame).astype(np.float32) * 0.1)
+            out = eng.process_block(x, eng.stream_sr)   # one real inference block (no audio device)
+            finite = bool(np.all(np.isfinite(out)))
+            return f"OK (dev={eng.resolved_device}, model={models[0]['name']}, out_finite={finite}, n={int(out.shape[0])})"
+        try:
+            results.append("engine_load+block=" + _engine_probe())
+        except Exception as exc:
+            ok = False
+            results.append(f"engine_load+block=FAIL({type(exc).__name__}: {exc})")
+
+    print("SELFTEST " + ("OK" if ok else "FAIL") + " :: " + " | ".join(results), flush=True)
+    return 0 if ok else 1
+
+
 def main() -> int:
+    # Frozen exe: redirect caches next to the .exe (the launch ps1 won't have run).
+    setup_frozen_cache_env()
+
+    # Containment (zero C: writes): Qt caches to %LOCALAPPDATA%/<AppName>/cache on
+    # Windows via QStandardPaths, ignoring our HF/XDG redirects. TWO separate caches
+    # land there: the QML disk cache (compiled .qmlc) and the RHI graphics PIPELINE
+    # cache (qtpipelinecache). Disable BOTH (tiny recompile cost) so the .exe never
+    # creates anything on C:. MUST precede any QApplication/QQmlEngine init.
+    os.environ.setdefault("QML_DISABLE_DISK_CACHE", "1")
+    os.environ.setdefault("QSG_RHI_DISABLE_DISK_CACHE", "1")
+
     # Resolve model/profile/index relative paths against the project root.
     if os.path.abspath(os.getcwd()) != os.path.abspath(RVC_ROOT):
         os.chdir(RVC_ROOT)
@@ -92,6 +176,13 @@ def main() -> int:
     if not engine.rootObjects():
         print("ERROR: failed to load Main.qml", file=sys.stderr)
         return 1
+
+    # Frozen-build / CI completeness probe: verify QML + the heavy stack, then exit
+    # WITHOUT entering the event loop (no window, no audio). Guarded by env -> normal
+    # launch is unaffected.
+    _selftest = os.environ.get("MELOIE_SELFTEST")
+    if _selftest in ("1", "2"):
+        return _run_selftest(engine, deep=(_selftest == "2"))
 
     # Recolor the native Windows title bar to match the dark theme (best-effort).
     _apply_dark_titlebar(engine.rootObjects()[0])

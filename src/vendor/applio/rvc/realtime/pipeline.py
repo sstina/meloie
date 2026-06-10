@@ -164,6 +164,15 @@ class Realtime_Pipeline:
             f0 = self.f0_model.get_f0(x, filter_radius=0.03)
         elif self.f0_method == "fcpe":
             f0 = self.f0_model.get_f0(x, x.shape[0] // self.window, filter_radius=0.006)
+        # Precise F0 mapping (CDF / quantile distribution match) — INPUT-side carrier
+        # conditioning: remaps the carrier's ESTIMATED F0 onto a target voice's F0
+        # distribution before pitch guidance; the model's output samples are untouched
+        # (faithful-carrier). Default None -> this block is byte-identical to upstream.
+        # When set, the engine also passes f0_up_key=0 / autotune=False / proposed=False
+        # so this is the sole F0 transform.
+        remap = getattr(self, "f0_remap", None)
+        if remap is not None:
+            f0 = remap(f0)
         # f0 adjustments
         if f0_autotune is True:
             f0 = self.autotune.autotune_f0(f0, f0_autotune_strength)

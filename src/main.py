@@ -336,10 +336,17 @@ def _run_direct(args, config, model_path, profile, pick) -> int:
     )
     from .audio.devices import FeedbackLoopRisk
     from .audio.streaming_stream import run_streaming_stream
+    from .engine.model_profile import find_default_index, models_root_for
 
     index_rate = float(pick("index_rate", 0.0))
-    # only load the index if it actually contributes (index_rate > 0)
-    index_path = (args.index_path or pick("index_path", "")) if index_rate > 0 else ""
+    # Only load the index if it actually contributes (index_rate > 0). The path
+    # is the explicit CLI/profile index, else the .pth's own default .index
+    # (same-stem first, else first; recursive under models/).
+    if index_rate > 0:
+        index_path = (args.index_path or pick("index_path", "")
+                      or find_default_index(model_path, models_root_for(model_path)))
+    else:
+        index_path = ""
     pitch_shift = args.pitch if args.pitch is not None else int(pick("pitch_shift", 0))
 
     # INPUT-side formant / gender: CLI overrides the profile; enable when either

@@ -112,4 +112,10 @@ QtObject {
     // background flowing-light blur strength (quality-stepped)
     readonly property int glassBlurMax:
         glassQuality === "high" ? 72 : (glassQuality === "medium" ? 48 : 28)
+    // scroll-edge dissolve (Main.qml): ONE token for three aligned things — the right
+    // column's Start-button bottom inset, the left column's bottom reserve, and the
+    // mask's fade-band height. Set = s4 (the body side margin) so the Start button is
+    // symmetrically inset (bottom gap == right gap) and the dissolve fills exactly that
+    // bottom strip; a fully-scrolled last card then rests flush on the Start line.
+    readonly property int glassEdgeBand: 16
 }

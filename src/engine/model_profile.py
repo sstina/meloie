@@ -40,9 +40,10 @@ which is normally the project root.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -130,3 +131,99 @@ def load_model_profile(path: str) -> ModelProfile:
         raise ModelProfileError(
             f"profile {path!r} has invalid field value: {exc}"
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Default .index resolution for a selected .pth
+# ---------------------------------------------------------------------------
+#
+# A trained model's retrieval index is part of its bundle, so when no profile
+# explicitly pins one we default to the .index that belongs to the selected
+# .pth, by this priority (first existing match wins):
+#
+#   1. a same-stem .index in the .pth's OWN directory
+#      (stem compared case-SENSITIVELY; Unicode / Chinese names supported)
+#   2. a same-stem .index found RECURSIVELY under the models root
+#   3. the first .index (sorted) in the .pth's OWN directory
+#   4. the first .index (sorted) found RECURSIVELY under the models root
+#
+# This only picks the index FILE; whether it is actually applied is governed by
+# index_rate (a model parameter), so a default-resolved index never silently
+# changes the voice until retrieval is turned on. An explicit profile
+# ``index_path`` is honoured by callers BEFORE this fallback runs.
+
+_INDEX_EXT = ".index"
+
+
+def _is_index(name: str) -> bool:
+    return name.lower().endswith(_INDEX_EXT)
+
+
+def _index_stem(name: str) -> str:
+    """Filename minus a case-insensitively-matched ``.index`` extension."""
+    return name[: -len(_INDEX_EXT)] if _is_index(name) else name
+
+
+def _index_files_recursive(root: str) -> List[str]:
+    """All ``*.index`` paths under ``root``, deterministic (dirs+files sorted)."""
+    out: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            if _is_index(fn):
+                out.append(os.path.join(dirpath, fn))
+    return out
+
+
+def models_root_for(model_path: str) -> str:
+    """The directory that bounds recursive index search for ``model_path``: the
+    nearest ancestor literally named ``models`` (case-insensitive), else the
+    .pth's own directory. Lets the CLI recurse the whole ``models/`` tree the
+    same way the GUI does, regardless of how deep the .pth is nested."""
+    own = os.path.dirname(os.path.abspath(str(model_path)))
+    cur = own
+    while True:
+        if os.path.basename(cur).lower() == "models":
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return own
+        cur = parent
+
+
+def find_default_index(model_path: str, models_root: Optional[str] = None) -> str:
+    """Resolve the default ``.index`` for a selected ``.pth`` (see the priority
+    note above). Returns an absolute path that exists, or ``""`` if none is
+    found. ``models_root`` bounds the recursive tiers; when omitted it is
+    derived via :func:`models_root_for`."""
+    model_path = str(model_path)
+    own_dir = os.path.dirname(os.path.abspath(model_path))
+    stem = os.path.splitext(os.path.basename(model_path))[0]   # exact case / Unicode
+    root = os.path.abspath(models_root) if models_root else models_root_for(model_path)
+
+    try:
+        own = sorted(fn for fn in os.listdir(own_dir) if _is_index(fn))
+    except OSError:
+        own = []
+
+    # 1. same-stem (case-sensitive) in the .pth's own directory
+    for fn in own:
+        if _index_stem(fn) == stem:
+            return os.path.join(own_dir, fn)
+
+    rec = _index_files_recursive(root)
+
+    # 2. same-stem (case-sensitive) recursively under the models root
+    for p in rec:
+        if _index_stem(os.path.basename(p)) == stem:
+            return p
+
+    # 3. first .index in the .pth's own directory
+    if own:
+        return os.path.join(own_dir, own[0])
+
+    # 4. first .index recursively under the models root
+    if rec:
+        return rec[0]
+
+    return ""

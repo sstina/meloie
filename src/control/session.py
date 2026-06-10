@@ -272,6 +272,14 @@ class RealtimeSession:
     def set_f0_method(self, method) -> None:
         self._require_active(); self._engine.set_f0_method(method)
 
+    def set_precise_mapping(self, on, src_q=None, tgt_q=None, method=None) -> None:
+        self._require_active(); self._engine.set_precise_mapping(on, src_q, tgt_q, method)
+
+    def build_precise_map(self, voice_wav, target_wav):
+        """Analyse two .wav files into (src_q, tgt_q, method) quantile anchors (blocking;
+        runs the f0 estimator off the audio lock). Call from a worker thread."""
+        self._require_active(); return self._engine.build_precise_map(voice_wav, target_wav)
+
     # ---------------------------------------------------- monitor (routing only)
     # NOT an input-side engine setter and NOT output shaping: it gates a parallel
     # sink that plays the SAME converted samples to headphones. Faithful-carrier

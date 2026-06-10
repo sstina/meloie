@@ -1,0 +1,8 @@
+{
+  "name": "F",
+  "model_path": "models/F.pth",
+  "pitch_shift": 12,
+  "index_rate": 0.25,
+  "protect": 0.33,
+  "formant_timbre": 1.0
+}

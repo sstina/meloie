@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Effects
 import App
 
 ApplicationWindow {
@@ -48,6 +49,19 @@ ApplicationWindow {
         for (var i = 0; i < devs.length; i++)
             if (devs[i].maxOut > 0 && !devs[i].isCableInput) arr.push(devs[i]);
         return arr;
+    }
+
+    // saved precise-mappings for the load dropdown: a placeholder at index 0 + backend list.
+    property var preciseMapList: {
+        var arr = [{ "name": "（载入已保存映射…）", "file": "" }];
+        var ms = backend.preciseMaps;
+        for (var i = 0; i < ms.length; i++) arr.push(ms[i]);
+        return arr;
+    }
+    function preciseSuggestName() {
+        function stem(n) { return (n || "").replace(/\.wav$/i, ""); }
+        var v = stem(backend.preciseVoiceName), t = stem(backend.preciseTargetName);
+        return (!v && !t) ? "" : (v + "→" + t);
     }
 
     function modelPath() {
@@ -147,8 +161,7 @@ ApplicationWindow {
         function onSidReset() { sidSpin.value = 0; }   // every (re)load resets engine to sid 0
         function onErrorOccurred(msg) { errorLabel.text = msg; }
         function onMetricsChanged(m) {
-            latencyLabel.text = fmt(m.rvc_inference_mean_ms) + " ms";
-            monLatency.text   = fmt(m.rvc_inference_mean_ms) + " ms";
+            monLatency.text   = fmt(m.rvc_inference_mean_ms) + " ms";   // right-column hero latency (header copy was removed as redundant)
             inMeter.dbfs  = m.input_peak_dbfs  !== undefined ? m.input_peak_dbfs  : -200;
             outMeter.dbfs = m.output_peak_dbfs !== undefined ? m.output_peak_dbfs : -200;
             inferLabel.text = "infer " + fmt(m.rvc_inference_last_ms) + "/" + fmt(m.rvc_inference_mean_ms)
@@ -206,10 +219,35 @@ ApplicationWindow {
             }
             BusyIndicator { running: backend.busy; visible: backend.busy; implicitWidth: 22; implicitHeight: 22 }
             StatusPill { statusText: backend.state }
-            Item { Layout.fillWidth: true }
-            Label {
-                id: latencyLabel; text: "— ms"
-                color: Theme.accent; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody; font.weight: Theme.fwMedium
+            Item { Layout.fillWidth: true }    // push the game-mode control to the right
+
+            // ---- 游戏模式 (顶栏右侧三态滑块；降/清零独显占用换游戏时可用实时推理) ----
+            Label { text: "游戏模式"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
+            SegmentedControl {
+                id: gameModeSeg
+                Layout.preferredWidth: 216
+                Layout.preferredHeight: 30
+                enabled: !backend.busy
+                dimFirst: true                 // index 0 = 关 -> neutral pill (not accent)
+                property var keys: ["off", "dgpu_light", "cpu_zero"]
+                options: ["关", "降dGPU", "零dGPU"]
+                currentIndex: 0                // backend.gameMode starts "off" -> index 0
+                onActivated: backend.setGameMode(keys[index])
+                // sync if the backend changes mode itself (avoids the currentIndex
+                // binding-break gotcha after a user pick).
+                Connections {
+                    target: backend
+                    function onGameModeChanged() {
+                        gameModeSeg.currentIndex =
+                            Math.max(0, gameModeSeg.keys.indexOf(backend.gameMode));
+                    }
+                }
+                HoverHandler { id: gmHover }
+                ToolTip {
+                    visible: gmHover.hovered
+                    delay: 350
+                    text: "游戏模式：降 dGPU=独显降负载(块500ms)；零 dGPU=推理移到 CPU(~8核)、独显空闲、延迟~1.3s、精度降低(自动关检索+开静音门限)。切换会重载模型(数秒)。"
+                }
             }
         }
     }
@@ -220,11 +258,16 @@ ApplicationWindow {
         anchors.top: header.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.bottom: errorLabel.top
+        // run to the window bottom so the left viewport's dissolve strip lives in the
+        // Start button's bottom margin; lift only when an error needs the footer room.
+        anchors.bottom: errorLabel.visible ? errorLabel.top : parent.bottom
         anchors.leftMargin: Theme.s4
         anchors.rightMargin: Theme.s4
-        anchors.topMargin: Theme.s3
-        anchors.bottomMargin: Theme.s2
+        // top/bottom run to the header bottom / window edge so the left viewport's
+        // dissolve strips can live in the monitor card's top inset / Start's bottom
+        // inset. Lift the bottom only when an error needs the footer room.
+        anchors.topMargin: 0
+        anchors.bottomMargin: errorLabel.visible ? Theme.s2 : 0
         columns: win.narrow ? 1 : 2
         columnSpacing: Theme.s3
         rowSpacing: Theme.s3
@@ -242,10 +285,35 @@ ApplicationWindow {
             anchors.fill: parent
             contentWidth: availableWidth
             clip: true
+            ScrollBar.vertical.policy: ScrollBar.AlwaysOff   // no scrollbar rail (drift/wheel only)
+            // dissolve the scroll edges INTO the backdrop instead of a hard clip
+            // line: render the whole column to a layer and fade its own alpha to 0
+            // over a band at each edge (via the gradient mask below) — only the edge
+            // that actually has hidden content that way. The card melts into the
+            // flowing-light background (no dividing line, no dark veil). Glass OFF ->
+            // layer disabled -> plain hard clip. (Live-verified path: AppBackground
+            // already uses layer.effect:MultiEffect on this GPU; offscreen can't
+            // render the mask texture, so the headless grab will look clipped/blank
+            // at the edges — that's the known offscreen limitation, not the live look.)
+            layer.enabled: Theme.glassEnabled
+            layer.smooth: true
+            layer.effect: MultiEffect {
+                autoPaddingEnabled: false
+                maskEnabled: true
+                maskSource: edgeFadeMask
+                maskThresholdMin: 0.5
+                maskSpreadAtMin: 0.5
+            }
 
             ColumnLayout {
                 width: leftScroll.availableWidth
                 spacing: Theme.s3
+
+                // top reserve mirroring the bottom: when at the very top, the first
+                // card aligns with the monitor card's top edge, and the strip above it
+                // (header -> first card) is the top dissolve zone. minus s3 = the
+                // ColumnLayout spacing already sits below this spacer.
+                Item { Layout.fillWidth: true; implicitHeight: Math.max(0, Theme.glassEdgeBand - Theme.s3) }
 
                 // ---------------- devices ----------------
                 GlassPanel {
@@ -346,7 +414,8 @@ ApplicationWindow {
                     LabeledSlider {
                         id: pitchSlider; label: "变调 pitch"; from: -24; to: 24; stepSize: 1; decimals: 0; suffix: " st"
                         accentColor: Theme.pitch             // pitch dimension = sky blue
-                        enabled: !autoCenterOn.checked       // auto-center REPLACES manual transpose
+                        // auto-center AND precise mapping both REPLACE the manual transpose
+                        enabled: !autoCenterOn.checked && !backend.preciseMappingOn
                         onMoved: backend.setPitch(value)
                     }
                     RowLayout {
@@ -356,7 +425,7 @@ ApplicationWindow {
                             id: autoCenterOn
                             text: "自动音高居中"
                             accentColor: Theme.pitch          // also the pitch dimension
-                            enabled: win.autoCenterAvail
+                            enabled: win.autoCenterAvail && !backend.preciseMappingOn
                             onToggled: backend.setAutoCenter(checked)
                         }
                         Label {
@@ -382,6 +451,9 @@ ApplicationWindow {
                     }
                     LabeledSlider {
                         id: indexSlider; label: "检索 index"; from: 0.0; to: 1.0; stepSize: 0.01; decimals: 2
+                        // a game mode owns this knob (forces index 0) -> gray out so the
+                        // slider can't lie about / fight the live value while it's active.
+                        enabled: backend.gameMode === "off"
                         onMoved: backend.setIndexRate(value)
                     }
 
@@ -530,28 +602,29 @@ ApplicationWindow {
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: Theme.s3
-                            AppCheckBox { id: silOn; text: "静音门限"; onToggled: win.pushSilence() }
+                            // a game mode owns the silence gate (forces it on) -> gray out while active.
+                            AppCheckBox { id: silOn; text: "静音门限"; enabled: backend.gameMode === "off"; onToggled: win.pushSilence() }
                             LabeledSlider {
                                 id: silDb; label: "dBFS"; from: -80; to: -20; stepSize: 1; decimals: 0; value: -50
-                                enabled: silOn.checked; onMoved: win.pushSilence()
+                                enabled: silOn.checked && backend.gameMode === "off"; onMoved: win.pushSilence()
                             }
                         }
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: Theme.s3
-                            AppCheckBox { id: atOn; text: "autotune"; onToggled: win.pushAutotune() }
+                            AppCheckBox { id: atOn; text: "autotune"; enabled: !backend.preciseMappingOn; onToggled: win.pushAutotune() }
                             LabeledSlider {
                                 id: atStr; label: "strength"; from: 0.0; to: 1.0; stepSize: 0.05; decimals: 2; value: 1.0
-                                enabled: atOn.checked; onMoved: win.pushAutotune()
+                                enabled: atOn.checked && !backend.preciseMappingOn; onMoved: win.pushAutotune()
                             }
                         }
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: Theme.s3
-                            AppCheckBox { id: apOn; text: "auto-pitch"; onToggled: win.pushAutoPitch() }
+                            AppCheckBox { id: apOn; text: "auto-pitch"; enabled: !backend.preciseMappingOn; onToggled: win.pushAutoPitch() }
                             LabeledSlider {
                                 id: apThr; label: "Hz"; from: 80; to: 300; stepSize: 1; decimals: 0; value: 155
-                                enabled: apOn.checked; onMoved: win.pushAutoPitch()
+                                enabled: apOn.checked && !backend.preciseMappingOn; onMoved: win.pushAutoPitch()
                             }
                         }
 
@@ -580,32 +653,40 @@ ApplicationWindow {
                         }
                     }
                 }
+                // bottom reserve so a fully-scrolled last card rests flush on the
+                // Start-button line: net gap below it must == glassEdgeBand (== Start's
+                // bottom inset). Subtract s3 — the ColumnLayout spacing already sits
+                // above this spacer and counts toward that gap.
+                Item { Layout.fillWidth: true; implicitHeight: Math.max(0, Theme.glassEdgeBand - Theme.s3) }
             }
             }
 
-            // top / bottom scroll-edge fade: cards melt into the base color at the
-            // clip line instead of a hard cut. Plain gradient rects (no layer / mask
-            // / effect) so they render identically offscreen and live. Each shows
-            // only when there's hidden content that way (so the top card title isn't
-            // permanently dimmed); the gradient direction points "into" the content.
+            // alpha mask driving the dissolve above: white (= keep) through the
+            // middle, ramping to transparent (= melt away) over a `band`-tall strip
+            // at each edge — but ONLY at an edge that currently has hidden content
+            // (a card at rest never fades). visible:false + layer.enabled -> this is
+            // consumed purely as a texture by leftScroll's MultiEffect.maskSource.
             Rectangle {
-                anchors { top: parent.top; left: parent.left; right: parent.right }
-                height: Theme.s6
-                opacity: leftScroll.contentItem.atYBeginning ? 0.0 : 1.0
-                Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+                id: edgeFadeMask
+                anchors.fill: parent
+                visible: false
+                layer.enabled: true
+                layer.smooth: true
+                readonly property real bandFrac:
+                    Math.min(0.45, Theme.glassEdgeBand / Math.max(1, leftScroll.height))
                 gradient: Gradient {
-                    GradientStop { position: 0.0; color: Theme.bgBase }
-                    GradientStop { position: 1.0; color: "transparent" }
-                }
-            }
-            Rectangle {
-                anchors { bottom: parent.bottom; left: parent.left; right: parent.right }
-                height: Theme.s6
-                opacity: leftScroll.contentItem.atYEnd ? 0.0 : 1.0
-                Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
-                gradient: Gradient {
-                    GradientStop { position: 0.0; color: "transparent" }
-                    GradientStop { position: 1.0; color: Theme.bgBase }
+                    GradientStop {
+                        position: 0.0
+                        color: leftScroll.contentItem.atYBeginning ? "white" : "transparent"
+                        Behavior on color { ColorAnimation { duration: Theme.durBase } }
+                    }
+                    GradientStop { position: edgeFadeMask.bandFrac; color: "white" }
+                    GradientStop { position: 1.0 - edgeFadeMask.bandFrac; color: "white" }
+                    GradientStop {
+                        position: 1.0
+                        color: leftScroll.contentItem.atYEnd ? "white" : "transparent"
+                        Behavior on color { ColorAnimation { duration: Theme.durBase } }
+                    }
                 }
             }
         }
@@ -618,6 +699,13 @@ ApplicationWindow {
             Layout.alignment: Qt.AlignTop
             Layout.horizontalStretchFactor: 2
             Layout.minimumWidth: win.narrow ? 0 : 280
+            // inset the monitor card DOWN (top) and the Start button UP (bottom) by the
+            // dissolve band, so the strips above the monitor top and below the Start
+            // bottom are where the left column melts. The left content carries matching
+            // top/bottom reserves -> its first/last card align with the monitor-top /
+            // Start-bottom lines. Same token as leftScroll's mask -> always aligned.
+            Layout.topMargin: win.narrow ? 0 : Theme.glassEdgeBand
+            Layout.bottomMargin: win.narrow ? 0 : Theme.glassEdgeBand
             spacing: Theme.s3
 
             GlassPanel {
@@ -658,6 +746,113 @@ ApplicationWindow {
                     Label { id: queueLabel; text: "queue 0";          color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
                     Label { id: solaLabel;  text: "sola 0";           color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
                     Label { id: silLabel;   text: "sil-skip 0";       color: Theme.textMuted;  font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption }
+                }
+            }
+
+            // ---------------- 精确映射 / Precise Mapping（输入端 F0 分布匹配，CDF）----------------
+            GlassPanel {
+                id: precisePanel
+                title: "精确映射 / Precise Mapping"
+                Layout.fillWidth: true
+                // content-sized + the fillHeight spacer below pins Start to the bottom,
+                // so this card sits in the UPPER portion of the free area (well under ½).
+
+                // ready to 启用 = a map already in hand (loaded/built; needs no engine), OR
+                // two wavs picked + a loaded model (a fresh build needs the f0 estimator).
+                readonly property bool ready:
+                    !backend.busy && (backend.precisePending
+                        || (backend.preciseVoiceName.length > 0 && backend.preciseTargetName.length > 0
+                            && (backend.state === "loaded" || backend.state === "running")))
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s3
+                    AppSwitch {
+                        id: preciseSw
+                        text: "启用"
+                        checked: backend.preciseMappingOn
+                        enabled: precisePanel.ready || backend.preciseMappingOn
+                        onToggled: backend.setPreciseMapping(checked)
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+                // load a saved mapping (skip re-picking wavs + rebuilding). Selecting only
+                // STAGES it -> flip 启用 to apply.
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s3
+                    Label { text: "已保存"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
+                    AppComboBox {
+                        id: preciseMapCombo
+                        Layout.fillWidth: true
+                        model: win.preciseMapList
+                        textRole: "name"
+                        onActivated: {
+                            if (currentIndex > 0)
+                                backend.loadPreciseMap(win.preciseMapList[currentIndex].file);
+                        }
+                    }
+                    AppButton { text: "↻"; flat: true; onClicked: backend.refreshPreciseMaps() }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s3
+                    AppButton {
+                        text: "🎙 你的声音"; flat: true
+                        onClicked: backend.choosePreciseVoiceWav()
+                    }
+                    Label {
+                        Layout.fillWidth: true; elide: Text.ElideMiddle
+                        color: backend.preciseVoiceName.length > 0 ? Theme.textPrimary : Theme.textMuted
+                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                        text: backend.preciseVoiceName.length > 0 ? backend.preciseVoiceName : "未选择 .wav"
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s3
+                    AppButton {
+                        text: "🎯 模型原声"; flat: true
+                        onClicked: backend.choosePreciseTargetWav()
+                    }
+                    Label {
+                        Layout.fillWidth: true; elide: Text.ElideMiddle
+                        color: backend.preciseTargetName.length > 0 ? Theme.textPrimary : Theme.textMuted
+                        font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody
+                        text: backend.preciseTargetName.length > 0 ? backend.preciseTargetName : "未选择 .wav"
+                    }
+                }
+                // save the current map (loaded or built) under an editable name -> dropdown
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s3
+                    AppTextField {
+                        id: preciseNameField
+                        Layout.fillWidth: true
+                        text: win.preciseSuggestName()       // prefilled; user can override
+                        placeholderText: "映射名字"
+                    }
+                    AppButton {
+                        text: "💾 保存"; flat: true
+                        enabled: backend.precisePending && !backend.busy
+                        onClicked: {
+                            if (backend.savePreciseMap(preciseNameField.text))
+                                errorLabel.text = "已保存映射：" + preciseNameField.text;
+                        }
+                    }
+                }
+                Label {                       // 状态（构建结果 / 进行中）
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap
+                    visible: backend.preciseStatus.length > 0
+                    color: Theme.accent
+                    font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption
+                    text: backend.preciseStatus
+                }
+                Label {                       // 小字提示：要提供什么，否则无正面效果
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap
+                    color: Theme.textMuted
+                    font.family: Theme.fontFamily; font.pixelSize: Theme.fsCaption
+                    text: "用 CDF 把你的音高分布精确对齐到模型音域。需：①你本人一段语音（与实际使用同一人、≥2 秒有声）②模型目标声音干净样本（≥2 秒有声），并先 Start 加载模型。启用后会接管并置灰手动变调/自动音高居中/autotune/auto-pitch；样本太短/有声不足会失败，起不到正面效果。"
                 }
             }
 

@@ -12,19 +12,62 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..audio.devices import is_probable_cable_input, is_probable_cable_output
 from ..audio.streams import AudioRuntimeConfig, list_audio_devices
-from ..engine.model_profile import ModelProfileError, load_model_profile
+from ..engine.model_profile import (
+    ModelProfileError,
+    find_default_index,
+    load_model_profile,
+)
 from ..engine.streaming_engine import StreamingEngineConfig
 
-_THIS = os.path.abspath(__file__)
-RVC_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))   # .../RVC
+from ..app_paths import app_base_dir
+# External data root: next to the .exe when frozen, else the source root (matches
+# models_dir()'s frozen branch). config/ is read AND written at runtime, so it must
+# live next to the exe (writable), never inside the read-only bundle.
+RVC_ROOT = app_base_dir()
 PROFILES_DIR = os.path.join(RVC_ROOT, "config", "model_profiles")
 
 DEFAULT_F0 = "fcpe"            # launcher parity (run_A_direct bakes --direct-f0 fcpe)
 STREAM_SR = 48000
+
+
+# ---------------------------------------------------------------- game modes
+# Game mode trades precision/latency for low (ideally zero) dGPU usage while gaming.
+# Each mode overrides ONLY load-time engine fields (device / block_ms / context_ms /
+# cpu_threads) -- those need a reload anyway. The "sacrifice precision" LIVE knobs
+# (index_rate -> 0, silence gate) are deliberately NOT here: the Backend toggles
+# those through its existing setters so _desired / engine / UI stay consistent and
+# returning to "off" can restore them. Feasibility measured (model A, fcpe, index 0):
+# CPU inference barely scales past ~8 threads and runs ~270 ms/block at block_ms=500
+# (< 500 ms budget, ~50% headroom) -> zero-dGPU realtime, latency ~1.3 s.
+GAME_MODES: Dict[str, Dict[str, Any]] = {
+    # off: normal default path (full dGPU, best quality). No overrides.
+    "off": {},
+    # dgpu_light: stay on the dGPU but halve the inference rate (block 500 -> 2 Hz
+    # bursts) and shrink context -> far less GPU contention with the game, still low
+    # latency. The best-quality of the two active modes.
+    "dgpu_light": {"device": "cuda", "block_ms": 500.0, "context_ms": 1500.0, "cpu_threads": 0},
+    # cpu_zero: zero dGPU. Inference runs entirely on the CPU pinned to ~8 cores; the
+    # whole dGPU and the rest of the CPU stay free for the game. Latency ~1.3 s.
+    "cpu_zero": {"device": "cpu", "block_ms": 500.0, "context_ms": 1000.0, "cpu_threads": 8},
+}
+
+
+def apply_game_mode(scfg: StreamingEngineConfig, mode: Optional[str]) -> StreamingEngineConfig:
+    """Apply the game-mode load-time overrides for ``mode`` to ``scfg``.
+
+    Returns a NEW config with the overrides (the input is left untouched) so the
+    mapping stays a pure transform; ``None`` / ``"off"`` / unknown returns ``scfg``
+    unchanged. Only device / block_ms / context_ms / cpu_threads are touched —
+    every other field (recipe, f0, formant, ...) is preserved."""
+    overrides = GAME_MODES.get(mode or "off") or {}
+    if not overrides:
+        return scfg
+    return replace(scfg, **overrides)
 
 
 # ---------------------------------------------------------------- devices
@@ -104,9 +147,12 @@ def model_default_params(model_path: str) -> Dict[str, Any]:
     present, else neutral defaults (no index, pitch 0)."""
     p = _profile_for_model(model_path)
     if p is None:
+        # No profile: the index defaults to the .pth's own .index (same-stem,
+        # else first; recursive under models/), so the GUI index slider is live.
         return {
             "pitch_shift": 0, "protect": 0.33, "index_rate": 0.0,
-            "formant_timbre": 1.0, "formant_on": False, "has_index": False,
+            "formant_timbre": 1.0, "formant_on": False,
+            "has_index": bool(find_default_index(model_path, models_dir())),
             "target_f0_median": 0.0,
         }
     # formant_on mirrors build_configs_for_model's derivation so the GUI checkbox
@@ -118,7 +164,8 @@ def model_default_params(model_path: str) -> Dict[str, Any]:
         "index_rate": float(p.index_rate),
         "formant_timbre": float(p.formant_timbre),
         "formant_on": formant_on,
-        "has_index": bool(p.index_path),
+        # explicit profile index, else the .pth's own default index
+        "has_index": bool(p.index_path or find_default_index(model_path, models_dir())),
         # >0 means auto-center has a target to aim at -> the GUI can offer the toggle.
         "target_f0_median": float(p.target_f0_median) if p.target_f0_median else 0.0,
     }
@@ -130,13 +177,17 @@ def build_configs_for_model(
     output_substr: Optional[str],
     f0: str = DEFAULT_F0,
     monitor_substr: Optional[str] = None,
+    game_mode: str = "off",
 ) -> Tuple[StreamingEngineConfig, AudioRuntimeConfig]:
     """Build the engine + audio configs from a discovered ``.pth`` model. The
     model's ``<stem>.json`` profile (if any) supplies the recipe (pitch / index /
     protect / formant); otherwise neutral defaults. ``model_path`` is ALWAYS the
     discovered ``.pth`` (the profile only contributes the recipe). The index is
     ALWAYS loaded when present so the GUI's index slider stays live
-    (``set_index_rate`` would otherwise raise with no index loaded)."""
+    (``set_index_rate`` would otherwise raise with no index loaded).
+
+    ``game_mode`` (off / dgpu_light / cpu_zero) layers low/zero-dGPU load-time
+    overrides on top of the recipe via :func:`apply_game_mode` (see GAME_MODES)."""
     p = _profile_for_model(model_path)
     if p is not None:
         index_path = p.index_path or ""
@@ -151,6 +202,13 @@ def build_configs_for_model(
         formant_timbre, formant_qfrency = 1.0, 1.0
         target_f0_median = 0.0
     formant_on = (formant_timbre != 1.0) or (formant_qfrency != 1.0)
+
+    # No explicit profile index -> default to the .pth's own .index (same-stem
+    # first, else the first .index; recursive under models/). The index file is
+    # loaded so the slider stays live; index_rate still governs whether it is
+    # applied, so this never silently changes the voice.
+    if not index_path:
+        index_path = find_default_index(model_path, models_dir())
 
     scfg = StreamingEngineConfig(
         model_path=model_path,
@@ -171,6 +229,7 @@ def build_configs_for_model(
         auto_center_target_hz=target_f0_median,   # seed; auto_center stays OFF (GUI opt-in)
         device="cuda",
     )
+    scfg = apply_game_mode(scfg, game_mode)       # layer low/zero-dGPU overrides (off = no-op)
     acfg = build_audio_config(input_substr, output_substr, monitor_substr)
     return scfg, acfg
 

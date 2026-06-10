@@ -28,8 +28,10 @@ models/local/
 *.bin
 *.onnx
 *.safetensors
-# audit / pseudo-stream report sidecars (see tools/pseudo_stream.py)
-audit_*.json
+
+# PyInstaller build artifacts — regenerable, never commit
+build/
+dist/
 
 # editor / OS
 .vscode/
