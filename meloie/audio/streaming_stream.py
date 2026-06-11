@@ -11,6 +11,7 @@ This is the sole realtime runner (v2-only build).
 from __future__ import annotations
 
 import contextlib
+import os
 import queue
 import sys
 import threading
@@ -21,7 +22,11 @@ import numpy as np
 
 from ..safety.guard import dbfs_peak, dbfs_rms
 from ..safety.metrics import RuntimeMetrics
-from .devices import select_default_input_device, select_device_by_substring
+from .devices import (
+    is_probable_cable_input,
+    select_default_input_device,
+    select_device_by_substring,
+)
 from .streams import (
     AudioRuntimeConfig,
     MonitorState,
@@ -87,7 +92,9 @@ def run_streaming_stream(
             default_in = int(sd.default.device[0])
         except (TypeError, ValueError, IndexError):
             default_in = -1
-        input_info = select_default_input_device(raw_devices, default_in)
+        input_info = select_default_input_device(
+            raw_devices, default_in, allow_virtual_cable=allow_virtual_cable_input,
+        )
         input_source = "system default"
     output_info = resolve_output_device(raw_devices, config.output_device_substring)
 
@@ -97,6 +104,7 @@ def run_streaming_stream(
     # None => use the system default output (device=None on the OutputStream).
     monitor_index = None
     monitor_name = None
+    monitor_blocked = False
     if monitor_state is not None:
         sub = config.monitor_device_substring
         if sub:
@@ -114,6 +122,18 @@ def run_streaming_stream(
                     monitor_name = "system default output"
             except Exception:
                 monitor_name = "system default output"
+        # Double-feed guard: if the monitor would render into CABLE Input (e.g.
+        # the Windows DEFAULT playback device is the cable — a common VB-CABLE
+        # setup), the same converted blocks would hit the cable through TWO
+        # streams on independent clocks -> audible doubling/comb downstream.
+        # Degrade to no monitor instead (mirrors the open-failure degrade path).
+        if monitor_name is not None and is_probable_cable_input(str(monitor_name)):
+            print(
+                f"monitor disabled: {monitor_name!r} is the virtual cable's render "
+                "endpoint (would double-feed the cable); pick a real headphone device."
+            )
+            monitor_blocked = True
+            monitor_index = None
 
     block_frame = int(engine.block_frame)
     block_ms = block_frame * 1000.0 / float(config.sample_rate)
@@ -121,12 +141,19 @@ def run_streaming_stream(
     rvc_queue_blocks = queue_blocks_from_ms(
         float(rvc_queue_ms), config.block_size, config.sample_rate, minimum=config.queue_blocks,
     )
-    prebuffer_ms = float(rvc_prebuffer_ms) if rvc_prebuffer_ms is not None else 800.0
+    # Standing output prebuffer: the steady-state margin is prebuffer minus one
+    # whole accumulate+infer cycle (~block_ms + inference). A fixed 800 ms is
+    # comfortable at block 250 but leaves only ~30 ms at the cpu_zero game
+    # mode's block 500 / ~270 ms CPU inference — so scale with the engine block
+    # when the caller doesn't pin it. 250 ms blocks keep the historic 800 ms.
+    prebuffer_ms = (
+        float(rvc_prebuffer_ms) if rvc_prebuffer_ms is not None
+        else max(800.0, block_ms + 400.0)
+    )
     prebuffer_blocks = max(
         0, int(round(prebuffer_ms * config.sample_rate / 1000.0 / config.block_size))
     )
 
-    import os
     model_basename = os.path.basename(getattr(engine.cfg, "model_path", "") or "")
 
     print(
@@ -154,14 +181,20 @@ def run_streaming_stream(
     out_q: "queue.Queue" = queue.Queue(maxsize=rvc_queue_blocks)
     # Bounded monitor tap (~400 ms): independent clock from the CABLE stream, so
     # drop-oldest on overflow keeps monitor latency bounded; underflow -> silence.
+    # Entries are OUTPUT-stream blocks (config.block_size, ~10 ms), not engine
+    # blocks — size the cap from the right duration.
     monitor_q: Optional["queue.Queue"] = None
-    if monitor_state is not None:
-        _mon_blocks = max(8, int(round(400.0 / max(1e-6, block_ms))))
+    if monitor_state is not None and not monitor_blocked:
+        out_block_ms = config.block_size * 1000.0 / float(config.sample_rate)
+        _mon_blocks = max(8, int(round(400.0 / max(1e-6, out_block_ms))))
         monitor_q = queue.Queue(maxsize=_mon_blocks)
     metrics = metrics if metrics is not None else RuntimeMetrics()
     stop_event = stop_event if stop_event is not None else threading.Event()
     metrics.rvc_chunk_ms = float(block_ms)
     metrics.rvc_model_basename = model_basename
+    metrics.rvc_index_basename = os.path.basename(
+        getattr(engine.cfg, "index_path", "") or ""
+    )
 
     if prebuffer_blocks > 0:
         silence = np.zeros(config.block_size, dtype=np.float32)
@@ -216,8 +249,11 @@ def run_streaming_stream(
             except queue.Full:
                 try:
                     monitor_q.get_nowait()
-                    monitor_q.put_nowait(block)
                 except queue.Empty:
+                    pass     # consumer drained it between Full and here
+                try:
+                    monitor_q.put_nowait(block)   # single producer: cannot re-Full
+                except queue.Full:
                     pass
 
     def monitor_callback(outdata, frames, time_info, status):  # noqa: ANN001
@@ -262,7 +298,7 @@ def run_streaming_stream(
                 device=input_info.index, callback=in_callback, **common))
             stack.enter_context(sd.OutputStream(
                 device=output_info.index, callback=out_callback, **common))
-            if monitor_state is not None:
+            if monitor_state is not None and not monitor_blocked:
                 # Always open the monitor stream (gated by the live ``enabled``
                 # flag) so the toggle is instant; a failure here NEVER kills the
                 # main CABLE link — we just degrade to no monitor.
@@ -278,9 +314,8 @@ def run_streaming_stream(
             while True:
                 now = time.monotonic()
                 metrics.elapsed_seconds = now - start_wall
-                qi = in_q.qsize()
-                if qi > metrics.max_input_queue_depth:
-                    metrics.max_input_queue_depth = qi
+                # max_input_queue_depth has a single producer: the worker (it
+                # sees the drained backlog this 50 ms poll would miss).
                 qo = out_q.qsize()
                 if qo > metrics.max_output_queue_depth:
                     metrics.max_output_queue_depth = qo

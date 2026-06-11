@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+
+pytest.importorskip("PySide6")     # GUI-bridge tests; the pure suite skips cleanly
 from PySide6.QtCore import QCoreApplication
 
 from meloie.control import RealtimeSession

@@ -12,12 +12,10 @@ import App
 //
 // Brightness, not color, carries the hierarchy: label (textSecond) -> placeholder
 // (textMuted, dimmest, so "empty" reads at a glance) -> entered text (textPrimary,
-// brightest). Error borrows coral (the "stop/attention" hue) on the border + caret
-// only -- never the fill (a flooded red field reads as anxious).
+// brightest).
 TextField {
     id: control
     property color accent: Theme.accent
-    property bool hasError: false
 
     implicitHeight: 34
     leftPadding: Theme.s3
@@ -35,7 +33,7 @@ TextField {
     cursorDelegate: Rectangle {
         width: 2
         radius: 1
-        color: control.hasError ? Theme.input : control.accent
+        color: control.accent
         visible: control.cursorVisible
         SequentialAnimation on opacity {
             loops: Animation.Infinite
@@ -48,17 +46,15 @@ TextField {
     }
 
     background: Item {
-        // focus / error glow ring — a translucent accent stroke just outside the field
+        // focus glow ring — a translucent accent stroke just outside the field
         Rectangle {
             anchors.fill: parent
             anchors.margins: -3
             radius: Theme.radiusMd + 3
             color: "transparent"
             border.width: 3
-            border.color: control.hasError
-                ? Qt.rgba(Theme.input.r, Theme.input.g, Theme.input.b, 0.16)
-                : Qt.rgba(control.accent.r, control.accent.g, control.accent.b, 0.18)
-            visible: control.activeFocus || control.hasError
+            border.color: Qt.rgba(control.accent.r, control.accent.g, control.accent.b, 0.18)
+            visible: control.activeFocus
             opacity: visible ? 1.0 : 0.0
             Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
         }
@@ -68,8 +64,7 @@ TextField {
             radius: Theme.radiusMd
             color: Theme.bgElevated
             border.width: 1
-            border.color: control.hasError ? Theme.input
-                         : control.activeFocus ? control.accent
+            border.color: control.activeFocus ? control.accent
                          : (control.hovered ? Qt.rgba(1, 1, 1, 0.18) : Theme.hairline)
             Behavior on border.color { ColorAnimation { duration: Theme.durFast } }
         }

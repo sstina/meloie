@@ -8,7 +8,9 @@
 # inference stack: torch/cu128 + numpy 2.x + transformers + torchfcpe). It is
 # the SOLE runtime venv (the program is v2-only).
 
-$RVC = "D:\Users\Palovil\Desktop\Tvoice\RVC"
+# The script lives at the RVC project root — derive the root from its own
+# location so a moved/renamed checkout keeps redirecting caches correctly.
+$RVC = $PSScriptRoot
 
 # --- cache / temp redirection (keep the C: drive untouched) ---------------
 $env:PIP_CACHE_DIR          = "$RVC\.cache\pip"

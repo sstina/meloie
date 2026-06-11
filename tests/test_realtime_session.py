@@ -140,6 +140,49 @@ def test_reload_stops_then_loads_new_engine():
     assert len(created) == 2             # a fresh engine was built
 
 
+def test_failed_reload_keeps_old_engine_usable():
+    """Build-then-swap: a failed (re)load must not discard the working engine."""
+    calls = {"n": 0}
+    good = FakeEngine(CFG)
+
+    def flaky_factory(cfg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return good
+        raise ValueError("bad checkpoint")
+
+    s = RealtimeSession(engine_factory=flaky_factory, stream_runner=looping_runner)
+    s.load(CFG)
+    assert s.engine is good
+    with pytest.raises(ValueError):
+        s.reload(CFG)                     # new engine fails to build
+    assert s.state is SessionState.LOADED  # NOT ERROR: the old engine survives
+    assert s.engine is good
+    s.start(AUDIO)                        # still startable
+    assert s.state is SessionState.RUNNING
+    s.stop()
+
+
+def test_start_resets_engine_streaming_state():
+    """A fresh stream must not continue from stale buffers: start() calls
+    engine.reset() when the engine exposes one."""
+    resets = []
+
+    class ResettableEngine(FakeEngine):
+        def reset(self):
+            resets.append(True)
+
+    s = RealtimeSession(engine_factory=lambda cfg: ResettableEngine(cfg),
+                        stream_runner=looping_runner)
+    s.load(CFG)
+    s.start(AUDIO)
+    assert resets == [True]
+    s.stop()
+    s.start(AUDIO)
+    assert resets == [True, True]
+    s.stop()
+
+
 # --------------------------------------------------------------------------
 # live setters
 # --------------------------------------------------------------------------

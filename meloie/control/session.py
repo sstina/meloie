@@ -111,25 +111,34 @@ class RealtimeSession:
                 pass
 
     # ------------------------------------------------------------ lifecycle
+    def _build_engine(self, engine_cfg):
+        factory = self._engine_factory
+        if factory is None:
+            from ..engine.streaming_engine import StreamingRvcEngine
+            factory = StreamingRvcEngine
+        engine = factory(engine_cfg)
+        engine.load()
+        return engine
+
     def load(self, engine_cfg) -> None:
         """Build + load the engine (blocking; ~tens of seconds cold). Allowed
         from IDLE / LOADED / ERROR. Call from a worker thread if you must keep a
-        UI responsive — this method itself is synchronous."""
+        UI responsive — this method itself is synchronous.
+
+        Build-then-swap: the new engine is built into a local first, so a failed
+        load KEEPS a previously loaded engine usable (state settles back to
+        LOADED) instead of leaving the session engine-less in ERROR."""
         if not self._transition_if(
             {SessionState.IDLE, SessionState.LOADED, SessionState.ERROR}, SessionState.LOADING
         ):
             raise SessionError(f"cannot load() from state {self._state.value}")
         try:
-            factory = self._engine_factory
-            if factory is None:
-                from ..engine.streaming_engine import StreamingRvcEngine
-                factory = StreamingRvcEngine
-            engine = factory(engine_cfg)
-            engine.load()
+            engine = self._build_engine(engine_cfg)
         except BaseException as exc:  # noqa: BLE001 - surface, don't crash
             self._last_error = f"{type(exc).__name__}: {exc}"
-            self._engine = None
-            self._set_state(SessionState.ERROR)
+            self._set_state(
+                SessionState.LOADED if self._engine is not None else SessionState.ERROR
+            )
             raise
         self._engine = engine
         self._engine_cfg = engine_cfg
@@ -153,6 +162,13 @@ class RealtimeSession:
         with :meth:`set_monitor_enabled`."""
         if self._engine is None:
             raise SessionError("no engine loaded; call load() first")
+        if self._thread is not None and self._thread.is_alive():
+            # A previous stream thread that never finished (join timeout) still
+            # holds the audio devices; starting another would double-open them.
+            raise SessionError(
+                "a previous stream thread is still alive (stop timed out); "
+                "close the app or wait for the device to release"
+            )
         if not self._transition_if({SessionState.LOADED}, SessionState.RUNNING):
             raise SessionError(f"cannot start() from state {self._state.value}")
 
@@ -160,6 +176,18 @@ class RealtimeSession:
         if runner is None:
             from ..audio.streaming_stream import run_streaming_stream
             runner = run_streaming_stream
+
+        # Fresh stream => fresh streaming state: without this, a stop()->start()
+        # continues from a convert buffer / F0 cache / SOLA tail captured at the
+        # moment of the old stop — the first ~context worth of blocks would be
+        # conditioned on stale audio. The reset re-arms warm-up (~context_ms of
+        # zeros), trading a short startup mute for clean conditioning.
+        reset = getattr(self._engine, "reset", None)
+        if callable(reset):
+            try:
+                reset()
+            except Exception:
+                pass
 
         self._metrics = RuntimeMetrics()
         self._stop_event = threading.Event()
@@ -186,7 +214,13 @@ class RealtimeSession:
                 print_metrics=False, **runner_kwargs,
             )
         except BaseException as exc:  # noqa: BLE001 - report, never crash the thread silently
-            if self._stop_event is not None and self._stop_event.is_set():
+            stop_requested = (
+                (self._stop_event is not None and self._stop_event.is_set())
+                # stop() transitions to STOPPING just before it sets the event;
+                # an exception landing in that window is still a requested stop.
+                or self._state is SessionState.STOPPING
+            )
+            if stop_requested:
                 # A stop was requested concurrently; an error raised while tearing
                 # the stream down is not a real failure -> settle back to LOADED,
                 # not ERROR (so the GUI doesn't see a bogus ERROR after a stop).
@@ -210,20 +244,25 @@ class RealtimeSession:
         if t is not None:
             t.join(timeout=join_timeout)
             if t.is_alive():
+                # Keep the reference: the zombie still holds the audio devices,
+                # and start() refuses while it lives (no double-open).
                 self._last_error = "stream thread did not stop within timeout"
                 self._set_state(SessionState.ERROR)
+                return
         self._thread = None
 
     def reload(self, new_engine_cfg) -> None:
-        """Stop (if running), drop the engine, and load a new one."""
+        """Stop (if running) and load a new engine. Build-then-swap (see
+        :meth:`load`): a failed reload keeps the OLD engine usable."""
         if self._state in (SessionState.RUNNING, SessionState.STOPPING):
             self.stop()
-        self._engine = None
         self.load(new_engine_cfg)
 
     def close(self) -> None:
         """Stop the stream and release the engine."""
         self.stop()
+        if self._thread is not None and self._thread.is_alive():
+            return    # zombie stream thread: stay in ERROR (set by stop())
         self._engine = None
         self._set_state(SessionState.IDLE)
 

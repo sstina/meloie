@@ -8,6 +8,24 @@ import pytest
 from meloie.audio.wav_io import read_wav_mono_float32, write_wav_float32
 
 
+def test_ieee_float_wav_raises_actionable_valueerror(tmp_path):
+    """stdlib wave can't read IEEE-float WAVs (format tag 3, the common DAW
+    export); the reader must surface a ValueError with a convert hint instead
+    of a raw wave.Error."""
+    import struct
+    sr, n = 48000, 16
+    data = (np.zeros(n, dtype="<f4")).tobytes()
+    fmt = struct.pack("<HHIIHH", 3, 1, sr, sr * 4, 4, 32)   # tag 3 = IEEE float
+    body = (b"WAVE"
+            + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+            + b"data" + struct.pack("<I", len(data)) + data)
+    path = tmp_path / "float32.wav"
+    path.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+    with pytest.raises(ValueError) as exc:
+        read_wav_mono_float32(str(path))
+    assert "PCM" in str(exc.value)
+
+
 def test_roundtrip_mono_pcm16(tmp_path):
     sr = 48000
     t = np.arange(sr // 4, dtype=np.float64) / sr

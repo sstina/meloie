@@ -1,9 +1,9 @@
 """Pure tests for the 捏脸 per-model save (no Qt, no torch).
 
 Covers ``save_model_profile``: writes a profile that the strict ModelProfile
-loader accepts, updates an existing one preserving its index_path / legacy
-fields, folds formant on/off into formant_timbre, clamps out-of-range values,
-and never leaks non-profile keys.
+loader accepts, updates an existing one preserving its other valid fields
+(dropping stray/legacy keys), folds formant on/off into formant_timbre, clamps
+out-of-range values, and never leaks non-profile keys.
 """
 
 from __future__ import annotations
@@ -44,7 +44,10 @@ def test_save_updates_existing_preserving_index_path(tmp_path):
     prof = load_model_profile(str(tmp_path / "A.json"))
     assert prof.pitch_shift == 12                 # updated
     assert prof.index_path == "models/V2.index"   # preserved
-    assert prof.rms_mix_rate == 1.0               # legacy field preserved
+    # legacy/stray keys are DROPPED on save (the strict loader rejects them,
+    # so preserving rms_mix_rate would make the saved profile unloadable)
+    raw = json.loads((tmp_path / "A.json").read_text(encoding="utf-8"))
+    assert "rms_mix_rate" not in raw
 
 
 def test_save_clamps_and_rejects_nonfinite(tmp_path):

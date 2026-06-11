@@ -143,6 +143,13 @@ def test_default_input_refuses_cable_output():
         select_default_input_device(FAKE_DEVICES, 1)
 
 
+def test_default_input_diagnostic_override_allows_cable_output():
+    # --allow-virtual-cable-input must also cover the system-default branch
+    # (the substring branch already honoured it).
+    info = select_default_input_device(FAKE_DEVICES, 1, allow_virtual_cable=True)
+    assert "CABLE Output" in info.name
+
+
 def test_default_input_rejects_output_only_device():
     # index 2 (Speakers) has no input channels.
     with pytest.raises(LookupError):

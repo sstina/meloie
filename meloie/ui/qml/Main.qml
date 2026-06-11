@@ -121,6 +121,8 @@ ApplicationWindow {
     function initSliders() {
         var p = backend.modelParams;
         if (!p) return;
+        // literal fallbacks below are last-resort only; the canonical neutral values
+        // live in config_assembly.NEUTRAL_DEFAULTS (keep them in sync).
         pitchSlider.value   = p.pitch_shift    !== undefined ? p.pitch_shift    : 0;
         protectSlider.value = p.protect        !== undefined ? p.protect        : 0.33;
         indexSlider.value   = p.index_rate     !== undefined ? p.index_rate     : 0.0;
@@ -197,6 +199,7 @@ ApplicationWindow {
                 Layout.preferredWidth: 150
                 model: backend.models
                 textRole: "name"
+                enabled: !backend.busy      // a switch mid-load would desync knobs vs engine
                 onActivated: {
                     win.mergePick = ({});       // base changed -> clear merge picks
                     backend.selectModel(win.modelPath());
@@ -205,17 +208,16 @@ ApplicationWindow {
                                             win.monitorSubstr(), monitorSw.checked);
                 }
             }
+            AppButton { text: "↻"; flat: true; onClicked: backend.refreshModels() }   // re-scan models/ (hand-copied .pth)
             Label { text: "F0"; color: Theme.textSecond; font.family: Theme.fontFamily; font.pixelSize: Theme.fsBody }
             AppComboBox {
                 id: f0Combo
                 Layout.preferredWidth: 100
                 model: ["fcpe", "rmvpe"]
                 currentIndex: 0     // index 0 MUST equal config_assembly.DEFAULT_F0 ("fcpe")
-                onActivated: {
-                    if (backend.state === "running")
-                        backend.reloadModel(win.modelPath(), win.micSubstr(), win.outSubstr(), f0Combo.currentText,
-                                            win.monitorSubstr(), monitorSw.checked);
-                }
+                // f0 is live-swappable in loaded AND running states (no ~30s reload);
+                // with nothing loaded the backend no-ops and Start picks the value up.
+                onActivated: backend.setF0Method(currentText)
             }
             BusyIndicator { running: backend.busy; visible: backend.busy; implicitWidth: 22; implicitHeight: 22 }
             StatusPill { statusText: backend.state }
@@ -608,6 +610,29 @@ ApplicationWindow {
                                 id: silDb; label: "dBFS"; from: -80; to: -20; stepSize: 1; decimals: 0; value: -50
                                 enabled: silOn.checked && backend.gameMode === "off"; onMoved: win.pushSilence()
                             }
+                            // honest display while a game mode forces the gate on at -45:
+                            // show that, and restore the USER'S UI state on exit (the
+                            // backend restores the engine itself; this mirrors the UI).
+                            // prevMode guards active<->active switches from re-saving.
+                            Connections {
+                                target: backend
+                                property string prevMode: "off"
+                                property bool userOn: false
+                                property real userDb: -50
+                                function onGameModeChanged() {
+                                    var m = backend.gameMode;
+                                    if (m !== "off" && prevMode === "off") {
+                                        userOn = silOn.checked;
+                                        userDb = silDb.value;
+                                        silOn.checked = true;
+                                        silDb.value = -45;
+                                    } else if (m === "off" && prevMode !== "off") {
+                                        silOn.checked = userOn;
+                                        silDb.value = userDb;
+                                    }
+                                    prevMode = m;
+                                }
+                            }
                         }
                         RowLayout {
                             Layout.fillWidth: true
@@ -773,6 +798,13 @@ ApplicationWindow {
                         checked: backend.preciseMappingOn
                         enabled: precisePanel.ready || backend.preciseMappingOn
                         onToggled: backend.setPreciseMapping(checked)
+                        // a user toggle breaks the checked binding (same gotcha as
+                        // gameModeSeg) -> re-sync when the backend flips the mapping
+                        // itself (failed build, wav re-pick, model-swap reset).
+                        Connections {
+                            target: backend
+                            function onPreciseChanged() { preciseSw.checked = backend.preciseMappingOn; }
+                        }
                     }
                     Item { Layout.fillWidth: true }
                 }

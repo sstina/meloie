@@ -15,6 +15,8 @@ test is deterministic. Mirrors tests/smoke_ui_backend.py's fakes.
 from __future__ import annotations
 
 import pytest
+
+pytest.importorskip("PySide6")     # GUI-bridge tests; the pure suite skips cleanly
 from PySide6.QtCore import QCoreApplication
 
 from meloie.control import RealtimeSession
@@ -188,3 +190,62 @@ def test_select_model_reseeds_desired_pitch(make, monkeypatch):
                                       "formant_on": False})
     b.selectModel("whatever/X.pth")
     assert b._desired["pitch"] == 12
+
+
+def test_select_model_while_busy_is_a_noop(make, monkeypatch):
+    # A switch during an in-flight ~30s load must be ignored: it would re-seed
+    # _desired to the NEW model while the OLD one finishes loading, and _onLoaded
+    # would then replay the new knobs onto the old engine.
+    b, session, created = make()
+    monkeypatch.setattr(backend_mod.ca, "model_default_params",
+                        lambda path: {"pitch_shift": 12})
+    b._set_busy(True)
+    params_before = b._modelParams
+    desired_before = dict(b._desired)
+    b.selectModel("other/B.pth")
+    assert b._modelParams is params_before          # params untouched
+    assert b._desired == desired_before             # knobs not re-seeded
+
+
+# --------------------------------------------------------- f0 swap (no reload)
+def test_f0_change_while_stopped_applies_and_fastpath_start_resyncs(make, qapp):
+    # FIX: an F0 dropdown change while merely LOADED (stopped) used to be lost
+    # (QML only acted when running). setF0Method now applies live in LOADED, and
+    # the fast-path Start defensively re-applies the combo's f0 (engine no-ops
+    # when unchanged) so a stream can never start on a stale estimator.
+    b, session, created = make()
+    errors = []
+    b.errorOccurred.connect(errors.append)
+
+    session.load(object())                  # LOADED, not running
+    qapp.processEvents()                    # deliver the queued state -> b._state
+    assert b.state == "loaded"
+    b._loaded_key = "fake.pth"              # fast-path key matches the next Start
+    b.setF0Method("rmvpe")                  # dropdown change while stopped
+
+    assert ("set_f0_method", ("rmvpe",), {}) in created[0].calls   # applied live
+
+    b.startOrStop("fake.pth", "", "", "rmvpe", "", False)          # fast path
+    f0_calls = [c for c in created[0].calls if c[0] == "set_f0_method"]
+    assert f0_calls[-1] == ("set_f0_method", ("rmvpe",), {})       # re-applied pre-start
+    assert len(created) == 1                # fast path -> same engine, no reload
+    assert errors == []
+
+
+def test_f0_change_updates_last_load_args(make):
+    # the remembered routing must carry the NEW estimator so a later in-place
+    # reload (game-mode switch) doesn't resurrect the old one.
+    b, session, created = make()
+    session.load(object())
+    b._lastLoadArgs = ("fake.pth", "mic", "out", "fcpe", "")
+    b.setF0Method("rmvpe")
+    assert b._lastLoadArgs == ("fake.pth", "mic", "out", "rmvpe", "")
+
+
+def test_f0_change_while_idle_is_quiet_noop(make):
+    # nothing loaded -> no toast, no engine; Start passes the combo value anyway.
+    b, session, created = make()
+    errors = []
+    b.errorOccurred.connect(errors.append)
+    b.setF0Method("rmvpe")
+    assert created == [] and errors == []

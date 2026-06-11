@@ -36,7 +36,7 @@ STREAM_SR = 48000  # the engine runs at this stream SR (mirrors the realtime pat
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="tvoice-offline-infer",
+        prog="meloie-offline-infer",
         description="Run v2 RVC inference on a WAV file (offline sanity check) "
                     "via the same direct/persistent-buffer engine as realtime. "
                     "Use --model-profile for the recommended invocation; the "
@@ -224,7 +224,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     bf = engine.block_frame
-    warmup_samples = int(engine._warmup) * bf  # zeros emitted while the buffer fills
+    warmup_samples = int(engine.warmup_blocks_left) * bf  # zeros emitted while the buffer fills
     n_blocks = audio.size // bf
     if n_blocks == 0:
         print(f"error: input too short ({audio.size} samples < one "

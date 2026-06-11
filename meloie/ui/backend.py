@@ -11,7 +11,6 @@ instead of an exception crossing into Qt. NO output-shaping slot exists.
 from __future__ import annotations
 
 import os
-import re
 
 from PySide6.QtCore import (
     Property, QObject, QThread, QTimer, Qt, Signal, Slot,
@@ -63,21 +62,18 @@ class MergeWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            import json
-            import torch
-            from ..engine.model_merge import merge_checkpoints
+            from ..engine.model_merge import (
+                merge_checkpoints, save_merged_checkpoint, write_merge_profile,
+            )
             merged_cpt, _common, _alphas = merge_checkpoints(self._paths, self._strengths)
-            out_dir = os.path.dirname(self._out)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-            torch.save(merged_cpt, self._out)
+            # shared save + integrity re-load (same path as the CLI): a truncated /
+            # non-v2 write surfaces as a merge failure here, not a load error later.
+            save_merged_checkpoint(self._out, merged_cpt)
             # companion recipe so the merged voice loads at a sane pitch (inherited
             # from the base) and the model<->recipe lookup finds it. Best-effort:
             # the .pth is the artifact that matters.
             try:
-                os.makedirs(os.path.dirname(self._prof_path), exist_ok=True)
-                with open(self._prof_path, "w", encoding="utf-8") as f:
-                    json.dump(self._prof, f, ensure_ascii=False, indent=2)
+                write_merge_profile(self._prof_path, **self._prof)
             except Exception:
                 pass
             self.finished.emit(True, self._out, "")
@@ -310,12 +306,25 @@ class Backend(QObject):
     # --------------------------------------------------------------- lifecycle
     @Slot(str)
     def selectModel(self, model_path: str) -> None:
+        # a switch during an in-flight ~30s load would re-seed _desired to the NEW
+        # model while the OLD one finishes loading (then _onLoaded replays the new
+        # knobs onto the old engine) -> ignore, like every other busy-gated slot.
+        if self._busy:
+            return
         try:
             self._modelParams = ca.model_default_params(model_path)
             # re-seed the desired carrier knobs to the new model's recipe (mirrors
             # QML initSliders resetting pitch/protect/index/formant/auto-center) so a
             # subsequent load reproduces THIS model's defaults, not the prior model's.
             self._seed_desired_from_params(self._modelParams)
+            # an active game mode owns index_rate (forced 0): keep the lever applied
+            # over the new model's seed, and retarget the off-restore snapshot at the
+            # NEW profile's value (not the previous model's recipe).
+            if self._gameMode != "off":
+                self._desired["index_rate"] = 0.0
+                if self._preGameKnobs is not None:
+                    self._preGameKnobs["index_rate"] = float(
+                        self._modelParams.get("index_rate", 0.0))
             self.modelParamsChanged.emit()
             # a model swap makes the chosen 模型原声 (target) stale -> drop the precise
             # map + clear the target wav (model-specific); keep the user's voice wav.
@@ -361,6 +370,9 @@ class Backend(QObject):
             # fast path: engine already LOADED -> start without a reload. No knob replay
             # needed here — every prior setter applied live to this same engine (it has
             # existed since the earlier load), so self._desired and the engine are in sync.
+            # Defensively re-apply the combo's f0 (live-swappable; the engine no-ops
+            # when unchanged) so the stream can never start on a stale estimator.
+            self._apply_live(lambda: self._session.set_f0_method(str(f0 or ca.DEFAULT_F0)))
             self._pending_audio = self._build_audio(input_substr, output_substr, monitor_substr)
             self._startStream(self._pending_audio)
             return
@@ -471,8 +483,11 @@ class Backend(QObject):
         # is still running"). Already-finished threads are nil (skipped).
         for t in (self._thread, self._merge_thread, self._precise_thread):
             if t is not None:
-                t.quit()
-                t.wait()
+                try:
+                    t.quit()
+                    t.wait()
+                except RuntimeError:    # C++ QThread already deleted (deleteLater
+                    pass                # race) -> keep cleaning the remaining ones
 
     # ----------------------------------------------- live INPUT-side setters
     # Every setter records its value in self._desired FIRST (so it survives a load),
@@ -487,11 +502,12 @@ class Backend(QObject):
         checkboxes across a model change; auto_center is dropped — QML resets it off.
         Tolerates an empty/partial dict (model with no profile, or enumeration failure)."""
         p = params or {}
-        self._desired["pitch"] = int(p.get("pitch_shift", 0))
-        self._desired["protect"] = float(p.get("protect", 0.33))
-        self._desired["index_rate"] = float(p.get("index_rate", 0.0))
+        nd = ca.NEUTRAL_DEFAULTS                     # single source of the fallbacks
+        self._desired["pitch"] = int(p.get("pitch_shift", nd["pitch_shift"]))
+        self._desired["protect"] = float(p.get("protect", nd["protect"]))
+        self._desired["index_rate"] = float(p.get("index_rate", nd["index_rate"]))
         self._desired["formant"] = (bool(p.get("formant_on", False)),
-                                    float(p.get("formant_timbre", 1.0)))
+                                    float(p.get("formant_timbre", nd["formant_timbre"])))
         self._desired.pop("auto_center", None)
         self._desired.pop("precise", None)        # a model swap invalidates the target voice
 
@@ -518,8 +534,8 @@ class Backend(QObject):
         # precise mapping LAST (it REPLACES the pitch knobs above): cheap replay of the
         # cached quantiles (NEVER re-runs the multi-second build on the GUI thread).
         if d.get("precise", (False,))[0]:
-            pr = d["precise"]
-            plan.append(lambda pr=pr: s.set_precise_mapping(True, pr[1], pr[2], pr[3]))
+            prc = d["precise"]
+            plan.append(lambda prc=prc: s.set_precise_mapping(True, prc[1], prc[2], prc[3]))
         for fn in plan:
             try:
                 fn()
@@ -591,7 +607,8 @@ class Backend(QObject):
         self._apply_live(lambda: self._session.set_auto_center(bool(on)))
 
     # sid / f0 / monitor are NOT tracked in self._desired: sid resets to 0 on every
-    # (re)load by design (sidReset); f0 flows through build_configs + the reload key;
+    # (re)load by design (sidReset); f0 flows through build_configs + _lastLoadArgs
+    # (setF0Method keeps the latter current) + the fast-path defensive re-apply;
     # monitor is remembered in self._monitorOn and re-applied by start(). They still
     # use the live-apply gate so a pre-start poke is a quiet no-op (no error toast).
     @Slot(int)
@@ -601,8 +618,16 @@ class Backend(QObject):
     @Slot(str)
     def setF0Method(self, v):
         # Live F0-estimator swap (rmvpe<->fcpe); input-side carrier conditioning,
-        # no reload (f0 is not part of the reload key).
-        self._apply_live(lambda: self._session.set_f0_method(str(v)))
+        # no reload (f0 is not part of the reload key). Works in LOADED and RUNNING
+        # via the live-apply gate; with nothing loaded it is a quiet no-op (Start
+        # passes the combo value into build_configs anyway).
+        v = str(v)
+        # keep the remembered routing in sync so a later in-place reload (game-mode
+        # switch) rebuilds with the NEW estimator, not the one from the last Start.
+        if self._lastLoadArgs is not None:
+            mp, ins, outs, _f0, mon = self._lastLoadArgs
+            self._lastLoadArgs = (mp, ins, outs, v, mon)
+        self._apply_live(lambda: self._session.set_f0_method(v))
         # rmvpe/fcpe have different F0 statistics -> a map built under one is invalid
         # under the other; rebuild from the live wavs under the new method. A map LOADED
         # from disk has no live wavs -> keep its quantiles (can't rebuild without sources).
@@ -658,8 +683,14 @@ class Backend(QObject):
     def _restore_pre_game_knobs(self) -> None:
         snap = self._preGameKnobs or {}
         self._preGameKnobs = None
-        self.setIndexRate(float(snap.get("index_rate",
-                                         self._modelParams.get("index_rate", 0.0))))
+        rate = float(snap.get("index_rate",
+                              self._modelParams.get("index_rate", 0.0)))
+        # only restore a >0 rate when the (possibly switched-to) model actually has
+        # an index — set_index_rate(>0) raises without one (mirrors setGameMode only
+        # zeroing when >0). Unknown params (hermetic {}) -> trust the snapshot.
+        if rate > 0.0 and self._modelParams and not self._modelParams.get("has_index"):
+            rate = 0.0
+        self.setIndexRate(rate)
         sil = snap.get("silence")
         if sil is None:
             self.setSilenceGate(False, -45.0)          # was never set -> leave it off
@@ -697,7 +728,7 @@ class Backend(QObject):
         if not others:
             self.errorOccurred.emit("选至少一个要融合的模型")
             return
-        name = re.sub(r'[<>:"/\\|?*]+', "_", (out_name or "").strip()) or "merged"
+        name = ca.safe_filename(out_name, "merged")
         out_path = os.path.join(ca.models_dir(), name + ".pth")
         if os.path.exists(out_path):
             self.errorOccurred.emit(f"模型 “{name}” 已存在，换个名字")
@@ -730,8 +761,7 @@ class Backend(QObject):
         if not ok:
             self.errorOccurred.emit(f"融合失败：{err}")
             return
-        self._models = ca.list_model_files()
-        self.modelsChanged.emit()
+        self.refreshModels()                      # re-list models/ (picks up the new .pth)
         self.modelMerged.emit(out_path)           # QML selects it + reloads if running
 
     @Slot()

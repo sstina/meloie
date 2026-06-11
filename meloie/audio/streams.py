@@ -20,7 +20,7 @@ Hard rules baked into this module:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, List, Mapping, Optional
 
 from .devices import (
@@ -79,16 +79,6 @@ class MonitorState:
     runner so the monitor toggles instantly without opening/closing the stream."""
 
     enabled: bool = False
-
-
-@dataclass
-class StreamStatusSnapshot:
-    """Lightweight status snapshot returned alongside metrics."""
-
-    running: bool = False
-    input_device_index: Optional[int] = None
-    output_device_index: Optional[int] = None
-    notes: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +210,10 @@ def _print_summary(
     print(f"rvc_silence_skipped_count= {metrics.rvc_silence_skipped_count}")
     print(f"rvc_output_blocks_enqueued = {metrics.rvc_output_blocks_enqueued}")
     print(f"rvc_output_blocks_dropped  = {metrics.rvc_output_blocks_dropped}")
+    print(f"rvc_engine_resets        = {metrics.rvc_engine_resets}")
     print(f"rvc_sola_offset_last     = {metrics.rvc_sola_offset_last}")
     print(f"max_input_queue_depth    = {metrics.max_input_queue_depth}")
+    print(f"max_output_queue_depth   = {metrics.max_output_queue_depth}")
     print(f"model                    = {metrics.rvc_model_basename or '(none)'}")
     print(f"index                    = {metrics.rvc_index_basename or '(none)'}")
     print(f"chunk_ms                 = {metrics.rvc_chunk_ms}")

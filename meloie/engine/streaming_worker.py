@@ -7,7 +7,11 @@ safety net:
 
 * On ANY engine error -> emit the user's own audio (identity passthrough) for
   that block, scrubbed for NaN/Inf. The link never dies; ``rvc_fallback_count``
-  makes it observable.
+  makes it observable. Persistent failure escalates: after 3 consecutive
+  fallbacks the engine's streaming state is reset once (recovers a poisoned
+  state at the cost of a ~context_ms re-warm), and after ~10 s of continuous
+  fallback ``rvc_engine_unhealthy`` flips so the UI can say "engine down,
+  passthrough" instead of degrading silently forever.
 * Drop-stale fail-safe: if inference falls behind the mic, drop whole oldest
   blocks so latency stays bounded (a dropped block leaves a gap in the engine's
   continuity — acceptable only as an overload backstop).
@@ -60,6 +64,12 @@ def rvc_direct_worker_loop(
     block_ms_budget = float(block_frame) * 1000.0 / float(stream_sr)
     metrics.rvc_chunk_ms_budget = block_ms_budget
 
+    # Persistent-failure escalation thresholds (consecutive fallbacks).
+    reset_after = 3
+    unhealthy_after = max(reset_after + 1, int(round(10_000.0 / max(block_ms_budget, 1.0))))
+    consecutive_fallbacks = 0
+    reset_fired = False    # one reset per failure streak
+
     def _emit(buf: np.ndarray) -> None:
         if buf.size == 0:
             return
@@ -67,7 +77,13 @@ def rvc_direct_worker_loop(
             try:
                 out_queue.put_nowait(sub)
                 metrics.rvc_output_blocks_enqueued += 1
-                metrics.first_real_output_seen = True
+                # "Real output" = past the engine's warm-up zeros; warm-up
+                # underruns must keep classifying as startup, not steady-state.
+                if (
+                    not metrics.first_real_output_seen
+                    and getattr(engine, "warmup_blocks_left", 0) <= 0
+                ):
+                    metrics.first_real_output_seen = True
             except queue.Full:
                 metrics.output_queue_drops += 1
                 metrics.rvc_output_blocks_dropped += 1
@@ -80,9 +96,23 @@ def rvc_direct_worker_loop(
         return buf
 
     def _fallback(block: np.ndarray) -> None:
+        nonlocal consecutive_fallbacks, reset_fired
         metrics.rvc_fallback_count += 1
         metrics.rvc_chunks_processed += 1
         _emit(_scrub(block.astype(np.float32, copy=True)))
+        consecutive_fallbacks += 1
+        if consecutive_fallbacks >= reset_after and not reset_fired:
+            # A short failure streak suggests poisoned streaming state (e.g. a
+            # CUDA hiccup mid-block): reset once. Costs a ~context_ms re-warm
+            # (zeros) on recovery — better than identity passthrough forever.
+            reset_fired = True
+            try:
+                engine.reset()
+                metrics.rvc_engine_resets += 1
+            except Exception:
+                pass
+        if consecutive_fallbacks >= unhealthy_after:
+            metrics.rvc_engine_unhealthy = True
 
     while not stop_event.is_set():
         try:
@@ -134,17 +164,17 @@ def rvc_direct_worker_loop(
             except Exception:
                 if not fallback_to_identity_on_error:
                     raise
-                metrics.record_inference_ms(
-                    (time.perf_counter() - t0) * 1000.0, budget_ms=block_ms_budget
-                )
+                metrics.record_inference_ms((time.perf_counter() - t0) * 1000.0)
                 _fallback(block)
                 continue
-            metrics.record_inference_ms(
-                (time.perf_counter() - t0) * 1000.0, budget_ms=block_ms_budget
-            )
+            metrics.record_inference_ms((time.perf_counter() - t0) * 1000.0)
             if out.size == 0:
                 _fallback(block)
                 continue
+            # A successful block ends any failure streak.
+            consecutive_fallbacks = 0
+            reset_fired = False
+            metrics.rvc_engine_unhealthy = False
             metrics.rvc_chunks_processed += 1
             # Surface the engine's last-block seam/gate state (engine stays
             # metrics-agnostic; the worker is the single reader/writer here).

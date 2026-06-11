@@ -4,9 +4,7 @@ A trained RVC model (``.pth``) plus its retrieval index (``.index``),
 together with the inference parameters it was trained against
 (``f0_method``, ``index_rate``, ``protect``, etc.), define the voice.
 They are properties of that trained unit — not user-facing sound-design
-knobs. (The v2 direct engine embeds via contentvec + staged predictors;
-the optional ``hubert_path`` / ``rmvpe_path`` fields below are legacy and
-unused by it.)
+knobs.
 
 This module loads a JSON model profile that groups those paths and
 parameters into a single named bundle. The two CLIs (``meloie.main`` for
@@ -21,14 +19,13 @@ Schema (all fields optional except ``model_path``)::
       "model_path":  "models/A.pth",
       "index_path":  "models/V2.index",
       "f0_method":   "rmvpe",
-      "index_rate":  0.5,
+      "index_rate":  0.08,
       "protect":     0.33,
-      "filter_radius": 3,
-      "rms_mix_rate":  1.0,
-      "pitch_shift":   0,
-      "resample_sr":   0,
-      "notes":         "Example profile. Do not tune these knobs to "
-                       "'tune' the voice."
+      "pitch_shift": 12,
+      "formant_timbre": 1.0,
+      "target_f0_median": 200,
+      "notes":       "Example profile. Do not tune these knobs to "
+                     "'tune' the voice."
     }
 
 Relative paths inside the profile are NOT resolved here — they remain
@@ -68,19 +65,10 @@ class ModelProfile:
     # emb_pitch weight-probe could not derive it (see docs/f0_remap_plan.md).
     target_f0_median: Optional[float] = None
     notes: str = ""
-    # --- legacy fields, accepted for back-compat but IGNORED by the v2 direct
-    # engine (kept so older profile JSONs still load). hubert_path/rmvpe_path:
-    # v1-era encoder paths (the v2 engine uses contentvec + staged predictors).
-    # filter_radius: old F0 median window (the realtime F0 estimators set their
-    # own). rms_mix_rate: MUST stay 1.0 -- <1.0 would impose the source mic's
-    # loudness on the OUTPUT (change_rms), breaking the faithful contract, so the
-    # direct engine never honors it. resample_sr: output SR is structural (model
-    # SR -> stream SR). ---
-    hubert_path: Optional[str] = None
-    rmvpe_path: Optional[str] = None
-    filter_radius: int = 3
-    rms_mix_rate: float = 1.0
-    resample_sr: int = 0
+    # (v1-era legacy keys — hubert_path / rmvpe_path / filter_radius /
+    # rms_mix_rate / resample_sr — were removed 2026-06-10: nothing read them,
+    # and accepting them defeated the unknown-key typo guard below. The engine
+    # forces faithful loudness structurally, so rms_mix_rate has no meaning.)
 
 
 _PROFILE_FIELD_NAMES = {f.name for f in fields(ModelProfile)}

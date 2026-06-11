@@ -120,7 +120,7 @@ def test_runtime_metrics_to_json_round_trip():
 def test_record_inference_ms_updates_mean_max_last():
     m = RuntimeMetrics()
     for ms in (100.0, 200.0, 300.0, 400.0, 500.0):
-        m.record_inference_ms(ms, budget_ms=1000.0)
+        m.record_inference_ms(ms)
     assert m.rvc_inference_count == 5
     assert m.rvc_inference_last_ms == pytest.approx(500.0)
     assert m.rvc_inference_max_ms == pytest.approx(500.0)

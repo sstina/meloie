@@ -15,7 +15,7 @@ models/A.pth is absent.
 import os
 import sys
 
-RVC = r"D:\Users\Palovil\Desktop\Tvoice\RVC"
+RVC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RVC)
 os.chdir(RVC)
 
@@ -46,10 +46,10 @@ def run_smoke() -> int:
     e = StreamingRvcEngine(cfg)
     e.load()
     bf = e.block_frame
-    print(f"loaded: device={e.resolved_device} block_frame={bf} warmup={e._warmup}")
+    print(f"loaded: device={e.resolved_device} block_frame={bf} warmup={e.warmup_blocks_left}")
 
     # warm up
-    for _ in range(int(e._warmup) + 2):
+    for _ in range(int(e.warmup_blocks_left) + 2):
         out = e.process_block(_sine(bf, SR), SR)
         assert out.shape[0] == bf and out.dtype == np.float32
 

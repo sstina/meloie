@@ -23,12 +23,22 @@ def read_wav_mono_float32(path: str) -> Tuple[np.ndarray, int]:
     Supports 8-, 16-, 24-, and 32-bit signed PCM (the formats stdlib
     ``wave`` understands).
     """
-    with wave.open(str(path), "rb") as wav:
-        nchannels = wav.getnchannels()
-        sampwidth = wav.getsampwidth()
-        sample_rate = wav.getframerate()
-        nframes = wav.getnframes()
-        raw = wav.readframes(nframes)
+    try:
+        with wave.open(str(path), "rb") as wav:
+            nchannels = wav.getnchannels()
+            sampwidth = wav.getsampwidth()
+            sample_rate = wav.getframerate()
+            nframes = wav.getnframes()
+            raw = wav.readframes(nframes)
+    except wave.Error as exc:
+        # stdlib wave only reads integer PCM; IEEE-float WAVs (a common DAW
+        # export) raise "unknown format: 3". Re-raise as a ValueError with an
+        # actionable hint so user-facing flows can show it (callers with
+        # librosa available may catch this and fall back).
+        raise ValueError(
+            f"unsupported WAV format in {path!r}: {exc}. "
+            "Convert to 16/24-bit PCM WAV (this is likely a 32-bit float WAV)."
+        ) from exc
 
     if sampwidth == 1:
         # 8-bit WAV is unsigned in the stdlib.

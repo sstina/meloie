@@ -38,7 +38,7 @@ def _force_utf8_stdio() -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="tvoice-merge-models",
+        prog="meloie-merge-models",
         description="Blend 2+ identical-architecture v2 RVC .pth models into one "
                     "hybrid voice (weighted average of the model weights). The "
                     "result is a standard .pth the realtime engine loads as-is.",
@@ -97,11 +97,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     try:
-        import torch
+        import torch  # noqa: F401  - fail early with a clear venv hint
     except Exception as exc:
         print(f"error: torch unavailable (run in .venv-applio): {exc}", file=sys.stderr)
         return 5
-    from meloie.engine.model_merge import MergeError, merge_checkpoints, weight_dict
+    from meloie.engine.model_merge import (
+        MergeError, merge_checkpoints, save_merged_checkpoint,
+    )
 
     for m in args.models:
         if not os.path.isfile(m):
@@ -126,23 +128,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"merging (v2, sr={common['sr']}, f0={common['f0']}, "
           f"{len(merged_cpt['weight'])} tensors): {recipe}")
 
-    out_dir = os.path.dirname(os.path.abspath(args.output))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    # Shared save + integrity re-load (same path the GUI merge worker uses).
     try:
-        torch.save(merged_cpt, args.output)
+        save_merged_checkpoint(os.path.abspath(args.output), merged_cpt)
+    except MergeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 5
     except Exception as exc:
         print(f"error: failed to save {args.output}: {exc}", file=sys.stderr)
-        return 5
-
-    # lightweight integrity re-load (fast; not the full engine)
-    try:
-        back = torch.load(args.output, map_location="cpu", weights_only=True)
-        w = weight_dict(back)
-        assert str(back.get("version", "")).lower() == "v2", "merged version != v2"
-        assert "emb_g.weight" in w, "merged weight missing emb_g.weight"
-    except Exception as exc:
-        print(f"error: merged file failed its integrity check: {exc}", file=sys.stderr)
         return 5
     print(f"wrote {args.output}")
 
@@ -170,7 +163,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _write_profile(args) -> int:
-    import json
+    from meloie.engine.model_merge import write_merge_profile
 
     stem = Path(args.output).stem
     prof_path = os.path.join(RVC_ROOT, "config", "model_profiles", f"{stem}.json")
@@ -179,18 +172,16 @@ def _write_profile(args) -> int:
               file=sys.stderr)
         return 2
     rel = os.path.relpath(os.path.abspath(args.output), RVC_ROOT).replace("\\", "/")
-    profile = {
-        "name": args.name or stem,
-        "model_path": rel,
-        "f0_method": args.profile_f0,
-        "index_rate": 0.0,
-        "pitch_shift": int(args.profile_pitch_shift),
-        "notes": "merged model; index_rate 0 (no shared index). Tune pitch_shift by ear.",
-    }
     try:
-        os.makedirs(os.path.dirname(prof_path), exist_ok=True)
-        with open(prof_path, "w", encoding="utf-8") as f:
-            json.dump(profile, f, ensure_ascii=False, indent=2)
+        write_merge_profile(
+            prof_path,
+            name=args.name or stem,
+            model_path=rel,
+            f0_method=args.profile_f0,
+            index_rate=0.0,
+            pitch_shift=int(args.profile_pitch_shift),
+            notes="merged model; index_rate 0 (no shared index). Tune pitch_shift by ear.",
+        )
     except Exception as exc:
         print(f"error: failed to write profile {prof_path}: {exc}", file=sys.stderr)
         return 5

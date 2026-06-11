@@ -56,6 +56,13 @@ class RuntimeMetrics:
     rvc_inference_last_ms: float = 0.0
     rvc_chunk_ms_budget: float = 0.0
     rvc_fallback_count: int = 0
+    # Persistent-failure escalation (worker): after N consecutive fallbacks the
+    # engine's streaming state is reset once (re-warms ~context_ms — cheap
+    # insurance against a poisoned persistent state); after many more, the
+    # unhealthy flag flips so the GUI/console can surface "engine down,
+    # identity passthrough" instead of silently degrading forever.
+    rvc_engine_resets: int = 0
+    rvc_engine_unhealthy: bool = False
     rvc_stale_chunk_drops: int = 0
     rvc_output_blocks_enqueued: int = 0
     rvc_output_blocks_dropped: int = 0
@@ -92,13 +99,9 @@ class RuntimeMetrics:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
 
-    def record_inference_ms(self, ms: float, budget_ms: float = 0.0) -> None:
-        """Update inference timing counters with one new sample.
-
-        ``budget_ms`` is the per-chunk audio budget (= chunk_ms). It is
-        accepted for callsite clarity; mean/max already surface spikes,
-        so no separate over-budget bookkeeping is kept.
-        """
+    def record_inference_ms(self, ms: float) -> None:
+        """Update inference timing counters with one new sample. The per-chunk
+        budget lives in ``rvc_chunk_ms_budget``; mean/max surface spikes."""
         ms = float(ms)
         self.rvc_inference_count += 1
         self.rvc_inference_last_ms = ms

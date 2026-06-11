@@ -8,12 +8,15 @@ output shaping) -> this is contract-safe. Only same-architecture v2 models merge
 is ``strict=False``) is dropped.
 
 Pure + torch-free at import: torch is imported lazily inside :func:`blend_weights`
-only, so this module (and the CLI that wraps it) imports without the heavy stack.
-The blend logic lives here (not in the CLI) so it is unit-testable on plain dicts.
+/ :func:`merge_checkpoints` / :func:`save_merged_checkpoint` only, so this module
+(and the CLI that wraps it) imports without the heavy stack. The blend logic lives
+here (not in the CLI) so it is unit-testable on plain dicts.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Dict, List
 
 ENC_Q_PREFIX = "enc_q."
@@ -169,3 +172,50 @@ def merge_checkpoints(model_paths, strengths):
     alphas = normalize_strengths(strengths)
     merged_weight = blend_weights([weight_dict(c) for c in cpts], alphas)
     return build_merged_checkpoint(cpts[0], merged_weight), common, alphas
+
+
+def save_merged_checkpoint(out_path: str, merged_cpt: Dict[str, Any]) -> None:
+    """``torch.save`` the merged checkpoint, then RE-LOAD it (weights_only) as a
+    lightweight integrity check: it must read back as a v2 checkpoint whose weight
+    dict still carries ``emb_g.weight``. Raises :class:`MergeError` if the saved
+    file fails the check. The shared save path for both the CLI and the GUI merge
+    worker. torch is imported lazily so the module import stays torch-free."""
+    import torch
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    torch.save(merged_cpt, out_path)
+    # lightweight integrity re-load (fast; not the full engine)
+    try:
+        back = torch.load(out_path, map_location="cpu", weights_only=True)
+        w = weight_dict(back)
+        if str(back.get("version", "")).lower() != "v2":
+            raise MergeError("merged version != v2")
+        if "emb_g.weight" not in w:
+            raise MergeError("merged weight missing emb_g.weight")
+    except MergeError:
+        raise
+    except Exception as exc:
+        raise MergeError(f"merged file failed its integrity check: {exc}") from exc
+
+
+def write_merge_profile(profile_path: str, *, name: str, model_path: str,
+                        f0_method: str, index_rate: float, pitch_shift: int,
+                        notes: str) -> None:
+    """Write the companion ``<stem>.json`` recipe for a merged model (creating
+    parent dirs). Pure json, no torch. Both the CLI and the GUI merge worker call
+    this so the profile shape stays identical (only valid ModelProfile keys)."""
+    profile = {
+        "name": str(name),
+        "model_path": str(model_path),
+        "f0_method": str(f0_method),
+        "index_rate": float(index_rate),
+        "pitch_shift": int(pitch_shift),
+        "notes": str(notes),
+    }
+    parent = os.path.dirname(profile_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(profile_path, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 from meloie.engine.streaming_engine import (
@@ -132,6 +133,83 @@ def test_set_silence_gate():
     assert e._silence_thresh_lin is None
     with pytest.raises(ValueError):
         e.set_silence_gate(-40.0, -1.0)
+
+
+def test_silence_gate_keeps_exact_trailing_hangover_blocks():
+    """A loud block converts + re-arms; then exactly ceil(hangover/block) quiet
+    blocks stay voiced; the next quiet block is gated (no off-by-one)."""
+    e = _engine()                                      # block_ms 250
+    e.set_silence_gate(-40.0, 500.0)                   # -> 2 hangover blocks
+    loud = np.full(480, 0.5, dtype=np.float32)         # ~ -6 dBFS
+    quiet = np.full(480, 1e-5, dtype=np.float32)       # ~ -100 dBFS
+    assert e._silence_gate_decision(loud) is True      # loud always converts
+    assert e._silence_gate_decision(quiet) is True     # trailing block 1
+    assert e._silence_gate_decision(quiet) is True     # trailing block 2
+    assert e._silence_gate_decision(quiet) is False    # gate closes
+    assert e._silence_gate_decision(loud) is True      # re-arms
+    assert e._silence_gate_decision(quiet) is True
+
+
+def test_silence_gate_zero_hangover_never_mutes_loud_blocks():
+    e = _engine()
+    e.set_silence_gate(-40.0, 0.0)                     # 0 hangover blocks
+    loud = np.full(480, 0.5, dtype=np.float32)
+    quiet = np.full(480, 1e-5, dtype=np.float32)
+    assert e._silence_gate_decision(loud) is True      # NOT muted (old bug)
+    assert e._silence_gate_decision(quiet) is False    # no hangover
+    assert e._silence_gate_decision(loud) is True
+
+
+def test_denoise_rebuilds_after_off_state_param_change(monkeypatch):
+    """Strength changed while OFF must rebuild on the next enable (the gate
+    bakes its params in the constructor — a stale gate must never resurrect)."""
+    e = _engine()
+    builds = []
+
+    def fake_build():
+        builds.append((float(e.cfg.denoise_strength), bool(e.cfg.denoise_nonstationary)))
+        e._denoiser = object()
+        e._denoiser_params = builds[-1]                # mirror the real builder
+
+    monkeypatch.setattr(e, "_build_denoiser", fake_build)
+    e.set_denoise(True, strength=0.5)                  # build #1 @ 0.5
+    e.set_denoise(False, strength=0.8)                 # cfg changes while OFF
+    e.set_denoise(True, strength=0.8)                  # must rebuild @ 0.8
+    assert builds == [(0.5, True), (0.8, True)]
+    e.set_denoise(True, strength=0.8)                  # unchanged -> no rebuild
+    assert len(builds) == 2
+
+
+def test_formant_reenable_zeroes_stale_history(monkeypatch):
+    e = _engine()
+    monkeypatch.setattr(e, "_build_formant", lambda: None)
+    e._formant = object()
+    e._formant_hist = np.ones(8, dtype=np.float32)     # stale tail from last on
+    e._formant_on = False
+    e.set_formant(True)
+    assert float(np.max(np.abs(e._formant_hist))) == 0.0
+
+
+def test_auto_center_disable_clears_offset():
+    e = _engine()
+    e._auto_offset = 5.0
+    e._user_f0_ema = 180.0
+    e.set_auto_center(False)
+    assert e._auto_offset == 0.0
+    assert e._user_f0_ema is None
+
+
+def test_validate_rejects_degenerate_crossfade():
+    with pytest.raises(ValueError):
+        _engine(crossfade_ms=0.0)        # zero-width SOLA kernel -> permanent fallback
+    with pytest.raises(ValueError):
+        _engine(crossfade_ms=300.0, block_ms=250.0)   # seam tail would overlap head
+    _engine(crossfade_ms=250.0, block_ms=250.0)        # boundary is allowed
+
+
+def test_warmup_blocks_left_property():
+    e = _engine()
+    assert e.warmup_blocks_left == 0     # before load/_realloc
 
 
 # --------------------------------------------------------------------------

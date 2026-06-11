@@ -11,6 +11,7 @@ cheap and unit-testable; the Qt ``Backend`` calls into it.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +34,33 @@ PROFILES_DIR = os.path.join(RVC_ROOT, "config", "model_profiles")
 
 DEFAULT_F0 = "fcpe"            # launcher parity (run_A_direct bakes --direct-f0 fcpe)
 STREAM_SR = 48000
+
+# Neutral carrier defaults for a model with no profile — the single source the
+# recipe paths below AND Backend._seed_desired_from_params consume. The QML
+# initSliders literal fallbacks intentionally mirror these (last resort only).
+NEUTRAL_DEFAULTS: Dict[str, Any] = {
+    "pitch_shift": 0,
+    "protect": 0.33,
+    "index_rate": 0.0,
+    "formant_timbre": 1.0,
+    "formant_qfrency": 1.0,
+}
+
+
+def formant_on(timbre: float, qfrency: float = 1.0) -> bool:
+    """The engine enables formant shifting when timbre/qfrency != 1.0; the GUI
+    checkbox and the load config derive their on/off from this same rule."""
+    return float(timbre) != 1.0 or float(qfrency) != 1.0
+
+
+_ILLEGAL_FILENAME = re.compile(r'[<>:"/\\|?*]+')   # illegal Windows filename chars
+
+
+def safe_filename(name: str, fallback: str = "merged") -> str:
+    """Sanitize a user-typed display name into a safe filename stem (illegal
+    Windows chars -> ``_``; empty -> ``fallback``). Shared by the GUI merge save
+    (``Backend.mergeModels``) and the precise-map store."""
+    return _ILLEGAL_FILENAME.sub("_", (name or "").strip()) or fallback
 
 
 # ---------------------------------------------------------------- game modes
@@ -150,20 +178,22 @@ def model_default_params(model_path: str) -> Dict[str, Any]:
         # No profile: the index defaults to the .pth's own .index (same-stem,
         # else first; recursive under models/), so the GUI index slider is live.
         return {
-            "pitch_shift": 0, "protect": 0.33, "index_rate": 0.0,
-            "formant_timbre": 1.0, "formant_on": False,
+            "pitch_shift": NEUTRAL_DEFAULTS["pitch_shift"],
+            "protect": NEUTRAL_DEFAULTS["protect"],
+            "index_rate": NEUTRAL_DEFAULTS["index_rate"],
+            "formant_timbre": NEUTRAL_DEFAULTS["formant_timbre"],
+            "formant_on": False,
             "has_index": bool(find_default_index(model_path, models_dir())),
             "target_f0_median": 0.0,
         }
-    # formant_on mirrors build_configs_for_model's derivation so the GUI checkbox
-    # reflects a saved gender shift (engine enables formant when timbre/qfrency != 1.0).
-    formant_on = (float(p.formant_timbre) != 1.0) or (float(p.formant_qfrency) != 1.0)
     return {
         "pitch_shift": int(p.pitch_shift),
         "protect": float(p.protect),
         "index_rate": float(p.index_rate),
         "formant_timbre": float(p.formant_timbre),
-        "formant_on": formant_on,
+        # shared derivation (formant_on) so the GUI checkbox reflects a saved
+        # gender shift exactly like build_configs_for_model enables the engine.
+        "formant_on": formant_on(p.formant_timbre, p.formant_qfrency),
         # explicit profile index, else the .pth's own default index
         "has_index": bool(p.index_path or find_default_index(model_path, models_dir())),
         # >0 means auto-center has a target to aim at -> the GUI can offer the toggle.
@@ -198,10 +228,13 @@ def build_configs_for_model(
         formant_qfrency = float(p.formant_qfrency)
         target_f0_median = float(p.target_f0_median) if p.target_f0_median else 0.0
     else:
-        index_path, index_rate, protect, pitch_shift = "", 0.0, 0.33, 0
-        formant_timbre, formant_qfrency = 1.0, 1.0
+        index_path = ""
+        index_rate = NEUTRAL_DEFAULTS["index_rate"]
+        protect = NEUTRAL_DEFAULTS["protect"]
+        pitch_shift = NEUTRAL_DEFAULTS["pitch_shift"]
+        formant_timbre = NEUTRAL_DEFAULTS["formant_timbre"]
+        formant_qfrency = NEUTRAL_DEFAULTS["formant_qfrency"]
         target_f0_median = 0.0
-    formant_on = (formant_timbre != 1.0) or (formant_qfrency != 1.0)
 
     # No explicit profile index -> default to the .pth's own .index (same-stem
     # first, else the first .index; recursive under models/). The index file is
@@ -223,7 +256,7 @@ def build_configs_for_model(
         block_ms=250.0,
         context_ms=2500.0,
         crossfade_ms=50.0,
-        formant_shift=formant_on,
+        formant_shift=formant_on(formant_timbre, formant_qfrency),
         formant_qfrency=formant_qfrency,
         formant_timbre=formant_timbre,
         auto_center_target_hz=target_f0_median,   # seed; auto_center stays OFF (GUI opt-in)

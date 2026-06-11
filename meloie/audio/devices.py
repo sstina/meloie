@@ -97,6 +97,7 @@ class FeedbackLoopRisk(ValueError):
 def select_default_input_device(
     devices: Iterable[Mapping],
     default_index: Optional[int],
+    allow_virtual_cable: bool = False,
 ) -> AudioDeviceInfo:
     """Return the system default input device (the user's "系统默认 mic").
 
@@ -107,7 +108,9 @@ def select_default_input_device(
 
     Refuses ``CABLE Output`` (the virtual cable's capture side): if that
     were ever the system default, capturing it while we render to
-    ``CABLE Input`` would form a feedback loop.
+    ``CABLE Input`` would form a feedback loop. ``allow_virtual_cable``
+    (the --allow-virtual-cable-input diagnostic) skips that refusal, the
+    same override resolve_input_device honours for explicit substrings.
     """
     infos = list(iter_device_infos(devices))
     if default_index is None or default_index < 0 or default_index >= len(infos):
@@ -124,7 +127,7 @@ def select_default_input_device(
             "reports no input channels; pass --input-device to choose a "
             "physical microphone explicitly."
         )
-    if is_probable_cable_output(info.name):
+    if is_probable_cable_output(info.name) and not allow_virtual_cable:
         raise FeedbackLoopRisk(
             f"the system default input is {info.name!r} (the VB-CABLE capture "
             "side). Using it as the app's mic while rendering to 'CABLE Input' "

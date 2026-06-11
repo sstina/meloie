@@ -40,21 +40,28 @@ def test_loads_full_profile(tmp_path):
         "name": "A",
         "model_path": "models/A.pth",
         "index_path": "models/V2.index",
-        "hubert_path": "models/legacy/hubert_base.pt",
-        "rmvpe_path":  "models/legacy/rmvpe.pt",
         "f0_method": "rmvpe",
         "index_rate": 0.5,
         "protect": 0.33,
-        "filter_radius": 3,
-        "rms_mix_rate": 0.25,
         "pitch_shift": 0,
-        "resample_sr": 0,
+        "formant_timbre": 1.19,
+        "target_f0_median": 200,
         "notes": "example",
     }
     profile = load_model_profile(str(_write(tmp_path / "full.json", payload)))
     assert profile.name == "A"
     assert profile.model_path == "models/A.pth"
     assert profile.notes == "example"
+    assert profile.formant_timbre == 1.19
+
+
+def test_v1_legacy_keys_are_rejected(tmp_path):
+    """The v1-era keys were removed; the typo guard must now catch them."""
+    p = _write(tmp_path / "legacy.json",
+               {"model_path": "x.pth", "rms_mix_rate": 1.0})
+    with pytest.raises(ModelProfileError) as exc:
+        load_model_profile(str(p))
+    assert "rms_mix_rate" in str(exc.value)
 
 
 def test_relative_paths_pass_through_verbatim(tmp_path):

@@ -15,6 +15,8 @@ in test_setgamemode_threads_mode_into_config_build below).
 from __future__ import annotations
 
 import pytest
+
+pytest.importorskip("PySide6")     # GUI-bridge tests; the pure suite skips cleanly
 from PySide6.QtCore import QCoreApplication
 
 from meloie.control import RealtimeSession
@@ -195,6 +197,59 @@ def test_setgamemode_loaded_drops_fastpath_key(make, monkeypatch):
     b.setGameMode("cpu_zero")
     assert b._loaded_key is None              # fast path invalidated
     assert calls == []                         # not reloaded now (deferred to next Start)
+
+
+def test_model_switch_during_game_mode_keeps_index_lever(make, monkeypatch):
+    # FIX: switching models while a game mode is active must keep the forced
+    # index_rate=0 lever (selectModel re-seeds from the new profile) AND retarget
+    # the off-restore snapshot at the NEW profile's value, so "off" restores the
+    # new model's recipe instead of the old model's.
+    b, session, created = make()
+    b._desired["index_rate"] = 0.5
+    eng = _running(b, session, created)
+    b._lastLoadArgs = ("m.pth", "mic", "out", "fcpe", "")
+    monkeypatch.setattr(b, "_beginLoad", lambda *a, **k: None)
+
+    b.setGameMode("cpu_zero")                 # lever on: index 0, snapshot 0.5
+    monkeypatch.setattr(backend_mod.ca, "model_default_params",
+                        lambda path: {"pitch_shift": 3, "protect": 0.33,
+                                      "index_rate": 0.8, "formant_timbre": 1.0,
+                                      "formant_on": False, "has_index": True})
+    b.selectModel("other/B.pth")              # model swap mid-game-mode
+
+    assert b._desired["index_rate"] == 0.0    # lever survives the re-seed
+    assert b._preGameKnobs["index_rate"] == 0.8   # off now targets B's recipe
+
+    eng.calls.clear()
+    errors = []
+    b.errorOccurred.connect(errors.append)
+    b.setGameMode("off")
+    assert ("set_index_rate", (0.8,), {}) in eng.calls   # B's profile value restored
+    assert errors == []
+
+
+def test_setgamemode_off_clamps_index_restore_when_no_index(make, monkeypatch):
+    # restoring a >0 index_rate onto a (switched-to) model with no index would
+    # raise in set_index_rate -> the restore clamps to 0 instead of toasting.
+    b, session, created = make()
+    b._desired["index_rate"] = 0.5
+    eng = _running(b, session, created)
+    b._lastLoadArgs = ("m.pth", "mic", "out", "fcpe", "")
+    monkeypatch.setattr(b, "_beginLoad", lambda *a, **k: None)
+
+    b.setGameMode("cpu_zero")
+    monkeypatch.setattr(backend_mod.ca, "model_default_params",
+                        lambda path: {"pitch_shift": 0, "protect": 0.33,
+                                      "index_rate": 0.6, "formant_timbre": 1.0,
+                                      "formant_on": False, "has_index": False})
+    b.selectModel("other/NoIdx.pth")          # malformed-ish: rate>0, no index
+
+    eng.calls.clear()
+    errors = []
+    b.errorOccurred.connect(errors.append)
+    b.setGameMode("off")
+    assert ("set_index_rate", (0.0,), {}) in eng.calls   # clamped, not raised
+    assert errors == []
 
 
 def test_setgamemode_threads_mode_into_config_build(make, monkeypatch):

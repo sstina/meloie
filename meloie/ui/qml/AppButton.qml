@@ -5,7 +5,6 @@ import App
 // Accent-filled primary button (Basic style). `flat: true` -> ghost/tool button.
 Button {
     id: control
-    property bool accent: true
     property color accentColor: Theme.accent     // filled-button hue (Start=mint, Stop=coral, ...)
 
     font.family: Theme.fontFamily
@@ -29,8 +28,7 @@ Button {
     contentItem: Text {
         text: control.text
         font: control.font
-        color: control.flat ? Theme.textSecond
-                            : (control.accent ? Theme.bgBase : Theme.textPrimary)
+        color: control.flat ? Theme.textSecond : Theme.bgBase
         opacity: control.enabled ? 1.0 : 0.4
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter

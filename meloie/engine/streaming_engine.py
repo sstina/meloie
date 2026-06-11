@@ -159,8 +159,14 @@ class StreamingEngineConfig:
             raise ValueError("index_rate must be in [0,1]")
         if not (0.0 <= self.protect <= 0.5):
             raise ValueError("protect must be in [0,0.5]")
-        if self.block_ms <= 0 or self.context_ms < 0 or self.crossfade_ms < 0:
-            raise ValueError("block_ms>0, context_ms>=0, crossfade_ms>=0 required")
+        if self.block_ms <= 0 or self.context_ms < 0:
+            raise ValueError("block_ms>0 and context_ms>=0 required")
+        # crossfade_ms=0 would build a zero-width SOLA kernel -> F.conv1d raises
+        # on every block -> the worker masks it as PERMANENT identity fallback
+        # (user silently hears their own voice). crossfade > block would make the
+        # stored seam tail overlap the just-blended head (seam smear).
+        if not (0.0 < self.crossfade_ms <= self.block_ms):
+            raise ValueError("crossfade_ms must be in (0, block_ms]")
         if self.f0_method not in ("rmvpe", "fcpe"):
             raise ValueError(
                 f"unsupported f0_method {self.f0_method!r}; the realtime engine "
@@ -216,6 +222,7 @@ class StreamingRvcEngine:
         self._pipeline = None
         self._f0_models = {}          # method -> built RMVPE/FCPE predictor (lazy cache)
         self._denoiser = None
+        self._denoiser_params = None  # (strength, nonstationary) the gate was BUILT with
         self._denoise_on = bool(config.denoise)   # runtime gate (live-toggleable)
         self._formant = None          # stftpitchshift instance (input-side gender)
         self._formant_on = bool(config.formant_shift)  # runtime gate (live-toggleable)
@@ -426,6 +433,13 @@ class StreamingRvcEngine:
         # The realtime converter is float32 by design (see core/pipeline.py dtype).
         return "fp32"
 
+    @property
+    def warmup_blocks_left(self) -> int:
+        """Blocks still emitting zeros while the convert buffer fills. Public:
+        the worker uses it to classify startup vs steady-state underruns and
+        tools use it to trim warm-up output."""
+        return int(self._warmup)
+
     # -------------------------------------------------------------- internals
     def _realloc(self) -> None:
         torch = self._torch
@@ -481,7 +495,11 @@ class StreamingRvcEngine:
         self._track_interval_blocks = max(1, int(round(1.0 / max(self.cfg.block_ms / 1000.0, 1e-3))))
 
     def reset(self) -> None:
-        """Clear streaming state (e.g. after a silence skip or fallback)."""
+        """Clear ALL streaming state and re-arm warm-up. Called by the session
+        on every stream start (a fresh stream must not be conditioned on stale
+        context from a previous run) and by the worker after a persistent
+        fallback streak (recover a possibly poisoned state). Costs ~context_ms
+        of warm-up zeros on the next blocks."""
         if not self._loaded:
             return
         self._convert_buffer.zero_()
@@ -525,6 +543,13 @@ class StreamingRvcEngine:
             nonstationary=bool(self.cfg.denoise_nonstationary),
             prop_decrease=float(self.cfg.denoise_strength),
         ).to(self._device)
+        # Record what the gate was BUILT with: set_denoise compares against this
+        # (not against the incoming args) so a strength changed while OFF still
+        # rebuilds on the next enable instead of resurrecting a stale gate.
+        self._denoiser_params = (
+            float(self.cfg.denoise_strength),
+            bool(self.cfg.denoise_nonstationary),
+        )
 
     def _build_formant(self) -> None:
         """Build the input-side stftpitchshift formant shifter + overlap-save
@@ -593,7 +618,13 @@ class StreamingRvcEngine:
         if not self._loaded or self._pipeline is None:
             raise StreamingEngineError("engine not loaded; call load() first")
         from ..core.pipeline import load_faiss_index, normalize_index_path
-        index, big_npy = load_faiss_index(normalize_index_path(path))
+        cleaned = normalize_index_path(path)
+        index, big_npy = load_faiss_index(cleaned)
+        if cleaned and index is None:
+            # A non-empty path that fails to load is a caller error — raise like
+            # the embedder/predictor preflights do, instead of silently turning
+            # retrieval off ('' remains the explicit drop).
+            raise StreamingEngineError(f"FAISS index failed to load: {cleaned}")
         with self._lock:
             self._pipeline.big_npy = big_npy
             self._pipeline.index = index
@@ -641,6 +672,7 @@ class StreamingRvcEngine:
                 self.cfg.auto_center_tau_s = tau_s
             if not on:
                 self._user_f0_ema = None
+                self._auto_offset = 0.0   # else re-enable replays a stale offset
             self._auto_center_on = bool(on)
 
     def _update_auto_center(self, a16) -> None:
@@ -694,10 +726,16 @@ class StreamingRvcEngine:
             return
         dt = self._track_interval_blocks * (self.cfg.block_ms / 1000.0)
         alpha = 1.0 - float(np.exp(-dt / tau))
-        ema = self._user_f0_ema                # snapshot (single read; race-safe)
-        ema = med if ema is None else ema + alpha * (med - ema)
-        self._user_f0_ema = ema
-        self._auto_offset = max(-limit, min(limit, 12.0 * float(np.log2(target / ema))))
+        # Publish under the lock and re-check the flag: a concurrent
+        # set_auto_center(False) must not have its EMA/offset reset clobbered
+        # by this in-flight update.
+        with self._lock:
+            if not self._auto_center_on:
+                return
+            ema = self._user_f0_ema
+            ema = med if ema is None else ema + alpha * (med - ema)
+            self._user_f0_ema = ema
+            self._auto_offset = max(-limit, min(limit, 12.0 * float(np.log2(target / ema))))
 
     def set_formant(self, on, timbre=None, qfrency=None) -> None:
         """Input-side formant / gender shift (性别因子). timbre>1 brighter, <1
@@ -717,6 +755,11 @@ class StreamingRvcEngine:
                 self.cfg.formant_qfrency = qfrency
             if on and self._formant is None:
                 self._build_formant()        # build BEFORE flipping the flag on
+            elif on and not self._formant_on and self._formant_hist is not None:
+                # Re-enable: zero the overlap-save history — it still holds audio
+                # from whenever the shifter was last on (one clean seam beats
+                # conditioning the first block on stale context).
+                self._formant_hist[:] = 0.0
             self._formant_on = bool(on)
 
     def set_denoise(self, on, strength=None, nonstationary=None) -> None:
@@ -727,14 +770,12 @@ class StreamingRvcEngine:
             if not (0.0 <= strength <= 1.0):
                 raise ValueError(f"denoise strength must be in [0, 1], got {strength}")
         with self._lock:
-            rebuild = False
-            if strength is not None and strength != float(self.cfg.denoise_strength):
+            if strength is not None:
                 self.cfg.denoise_strength = strength
-                rebuild = True
-            if nonstationary is not None and bool(nonstationary) != bool(self.cfg.denoise_nonstationary):
+            if nonstationary is not None:
                 self.cfg.denoise_nonstationary = bool(nonstationary)
-                rebuild = True
-            if on and (self._denoiser is None or rebuild):
+            want = (float(self.cfg.denoise_strength), bool(self.cfg.denoise_nonstationary))
+            if on and (self._denoiser is None or self._denoiser_params != want):
                 self._build_denoiser()       # build/rebuild BEFORE flipping on
             self._denoise_on = bool(on)
 
@@ -851,11 +892,14 @@ class StreamingRvcEngine:
         """Analyse two .wav files into ``(src_q, tgt_q, method)`` log2-Hz quantile
         anchors for a precise CDF F0 map (``method`` = the estimator they were built
         under). OFFLINE (control/worker thread): loads + resamples both to 16 kHz and
-        runs the CURRENTLY-LOADED f0 estimator. Mirrors _update_auto_center: snapshot
-        the (f0_model, f0_method) pair under the lock, then run get_f0 OFF the lock — a
-        multi-second forward pass must never stall the per-block audio lock (concurrent
-        predictor use is the same pattern auto-center already ships). Raises on
-        too-short input. Does NOT attach the map — call set_precise_mapping()."""
+        runs the CURRENTLY-LOADED f0 estimator. Snapshot the (f0_model, f0_method)
+        pair under the lock, then run get_f0 OFF the lock — a multi-second forward
+        pass must never stall the per-block audio lock. NOTE: called while RUNNING,
+        this is genuinely CONCURRENT with the worker's per-block get_f0 on the same
+        predictor (eval-mode modules, correctness-safe) and the whole-file forward
+        contends for the GPU — transient block-budget overshoot is possible during
+        the build; worker fallback keeps the audio alive. Raises on too-short
+        input. Does NOT attach the map — call set_precise_mapping()."""
         if not self._loaded or self._pipeline is None:
             raise StreamingEngineError("engine not loaded; call load() first")
         from .f0_map import build_quantiles
@@ -874,7 +918,13 @@ class StreamingRvcEngine:
     @staticmethod
     def _load_wav_16k(path):
         from ..audio.wav_io import read_wav_mono_float32
-        audio, sr = read_wav_mono_float32(str(path))
+        try:
+            audio, sr = read_wav_mono_float32(str(path))
+        except ValueError:
+            # Non-integer-PCM WAV (e.g. 32-bit float DAW export): librosa is in
+            # the runtime venv anyway — read via soundfile instead of failing.
+            import librosa
+            audio, sr = librosa.load(str(path), sr=None, mono=True)
         if sr != 16000:
             import librosa
             audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
@@ -887,6 +937,23 @@ class StreamingRvcEngine:
             if f0_method == "fcpe":
                 return f0_model.get_f0(audio16k, audio16k.shape[0] // 160, filter_radius=0.006)
             return f0_model.get_f0(audio16k, filter_radius=0.03)
+
+    def _silence_gate_decision(self, block: np.ndarray) -> bool:
+        """One gate step (worker thread). A loud block always converts AND
+        re-arms the full hangover; the hangover then keeps exactly
+        ``_silence_hangover_blocks`` trailing quiet blocks converting (soft
+        syllable tails). hangover_ms=0 means "no hangover", never "mute
+        everything". True = convert ("voiced")."""
+        if self._silence_thresh_lin is None:
+            return True
+        rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
+        if rms >= self._silence_thresh_lin:
+            self._silence_hangover_left = self._silence_hangover_blocks
+            return True
+        if self._silence_hangover_left > 0:
+            self._silence_hangover_left -= 1
+            return True
+        return False
 
     def _fit16(self, t, n: int):
         if t.shape[0] == n:
@@ -980,16 +1047,8 @@ class StreamingRvcEngine:
         self.last_silence_skipped = False
 
         # Silence gate (响应阈值): decide on the RAW input level (before formant /
-        # denoise). Below threshold -> not voiced; a hangover keeps soft trailing
-        # syllables converting for a few blocks after the last loud block.
-        voiced = True
-        if self._silence_thresh_lin is not None:
-            rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
-            if rms >= self._silence_thresh_lin:
-                self._silence_hangover_left = self._silence_hangover_blocks
-            voiced = self._silence_hangover_left > 0
-            if self._silence_hangover_left > 0:
-                self._silence_hangover_left -= 1
+        # denoise).
+        voiced = self._silence_gate_decision(block)
 
         # input-side FORMANT / gender shift (性别因子) BEFORE conversion: moves the
         # spectral envelope only (pitch untouched). Overlap-save -- prepend the
@@ -1013,7 +1072,10 @@ class StreamingRvcEngine:
                 # ambient noise is not faithfully converted into warbly voice.
                 x = self._denoiser(x.unsqueeze(0)).squeeze(0).to(torch.float32)
             a16 = self._fit16(self._resample_in(x).to(self._dtype), self.block_frame_16k)
-            if self._auto_center_on:
+            # Track only when the offset can matter: skip on gated silence (the
+            # EMA would freeze anyway — don't burn an F0 pass the silence gate
+            # exists to save) and while precise mapping overrides the offset.
+            if self._auto_center_on and voiced and not self._precise_on:
                 self._update_auto_center(a16)
 
             if self._warmup > 0:

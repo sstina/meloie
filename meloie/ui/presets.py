@@ -15,7 +15,16 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import fields as _dc_fields
 from typing import Any, Dict
+
+from ..app_paths import app_base_dir
+from ..engine.model_profile import ModelProfile
+
+# Only these keys may appear in a saved profile — the strict loader rejects
+# anything else, so an existing file's stray/legacy keys are dropped on save.
+_VALID_PROFILE_KEYS = {f.name for f in _dc_fields(ModelProfile)}
+
 
 def _clamp_finite(v: Any, lo: float, hi: float, default: float) -> float:
     """Clamp ``v`` to ``[lo, hi]``; fall back to ``default`` for non-finite input
@@ -30,8 +39,9 @@ def _clamp_finite(v: Any, lo: float, hi: float, default: float) -> float:
 def save_model_profile(model_path: str, params: Dict[str, Any], profiles_dir: str) -> str:
     """Write the current carrier knobs in ``params`` to the model's
     ``<stem>.json`` profile under ``profiles_dir`` (creating it, or updating an
-    existing one while preserving its ``name`` / ``index_path`` / legacy fields).
-    Returns the profile path. Only valid ``ModelProfile`` keys are written.
+    existing one while preserving its other valid fields — ``name`` /
+    ``index_path`` / ``target_f0_median`` / ``notes``...). Returns the profile
+    path. Only valid ``ModelProfile`` keys are written.
 
     ``params`` (from the GUI): ``pitch_shift``, ``index_rate``, ``protect``,
     ``formant_timbre`` + ``formant_on`` (the on/off pair is folded into
@@ -45,12 +55,23 @@ def save_model_profile(model_path: str, params: Dict[str, Any], profiles_dir: st
         try:
             loaded = json.loads(open(prof_path, encoding="utf-8").read())
             if isinstance(loaded, dict):
-                out = loaded
+                # keep only keys the strict loader accepts (drops stray/legacy)
+                out = {k: v for k, v in loaded.items() if k in _VALID_PROFILE_KEYS}
         except Exception:
             out = {}
 
     out.setdefault("name", stem)
-    out["model_path"] = "models/" + os.path.basename(model_path)
+    # the model's REAL location relative to the app root (recursive discovery can
+    # find models in subfolders, so a hardcoded "models/<basename>" would lie);
+    # forward slashes for portability. Outside the root (other drive/tree) -> keep
+    # the path as given. Profile filenames stay basename-keyed regardless.
+    try:
+        rel = os.path.relpath(os.path.abspath(model_path), app_base_dir())
+    except ValueError:                          # different drive on Windows
+        rel = model_path
+    if rel.startswith(".."):                    # outside the app root
+        rel = model_path
+    out["model_path"] = rel.replace(os.sep, "/")
 
     # clamp every numeric knob to the engine's accepted range and drop NaN/inf, so a
     # saved profile is always loadable (input-side conditioning only — contract-safe).

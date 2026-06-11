@@ -6,10 +6,11 @@ input device (default ``CABLE Output``). Confirms that the cable
 route is alive: the captured buffer must be non-silent.
 
 This is the through-cable transport check from the legacy validation
-ladder. It does NOT exercise the realtime identity worker — that is
-what ``python -m meloie.main --mode identity`` is for. It exercises the
-VB-CABLE pipe itself so that, when the identity worker is also alive,
-we know both halves are good.
+ladder. It does NOT exercise the realtime conversion path — that is what
+a live run (``run_gui.bat`` / ``python -m meloie.main --config ...``) or
+``tools/offline_infer.py`` (the inference half, no devices) is for. It
+exercises the VB-CABLE pipe itself so that, when the realtime path is
+also alive, we know both halves are good.
 
 Run with::
 
@@ -25,7 +26,6 @@ import argparse
 import json
 import sys
 import time
-import wave
 from pathlib import Path
 from typing import List, Optional
 
@@ -37,11 +37,12 @@ from meloie.audio.measurement import (
     summarize_capture,
 )
 from meloie.audio.streams import resolve_input_device, resolve_output_device
+from meloie.audio.wav_io import write_wav_float32
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="tvoice-verify-cable-route",
+        prog="meloie-verify-cable-route",
         description="Verify Python -> CABLE Input -> CABLE Output is non-silent.",
     )
     p.add_argument("--output-device-substring", default="CABLE Input")
@@ -69,16 +70,6 @@ def _build_parser() -> argparse.ArgumentParser:
              "Default behaviour does NOT write any artifact.",
     )
     return p
-
-
-def _write_wav(path: Path, audio_f32: np.ndarray, sample_rate: int) -> None:
-    pcm = np.clip(audio_f32, -1.0, 1.0)
-    pcm16 = (pcm * 32767.0).astype("<i2")
-    with wave.open(str(path), "wb") as fh:
-        fh.setnchannels(1)
-        fh.setsampwidth(2)
-        fh.setframerate(int(sample_rate))
-        fh.writeframes(pcm16.tobytes())
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -164,7 +155,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ts = time.strftime("%Y%m%dT%H%M%S")
         wav_path = out_dir / f"verify_cable_{ts}.wav"
         json_path = out_dir / f"verify_cable_{ts}.json"
-        _write_wav(wav_path, captured, sr)
+        write_wav_float32(wav_path, captured, sr)
         payload = {
             "timestamp": ts,
             "sample_rate": sr,

@@ -15,7 +15,7 @@ Named smoke_*.py with no test_* functions, so the default pytest run ignores it.
 import os
 import sys
 
-RVC = r"D:\Users\Palovil\Desktop\Tvoice\RVC"
+RVC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RVC)
 os.chdir(RVC)
 

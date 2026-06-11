@@ -34,6 +34,7 @@ inside the run handler.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from typing import List, Optional
@@ -58,7 +59,7 @@ def _force_utf8_stdio() -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tvoice-rvc",
+        prog="meloie",
         description="Realtime RVC voice changer: system default mic -> RVC "
                     "model -> CABLE Input.",
     )
@@ -89,7 +90,13 @@ def _build_parser() -> argparse.ArgumentParser:
     voice.add_argument("--model-path", default=None,
                        help="Path to RVC .pth (use instead of a profile for a "
                             "quick run; profile params then use defaults).")
-    voice.add_argument("--index-path", default=None, help="Path to .index file.")
+    voice.add_argument("--index-path", default=None,
+                       help="Path to .index file (loaded when the effective "
+                            "index_rate is > 0; see --index-rate).")
+    voice.add_argument("--index-rate", type=float, default=None, metavar="R",
+                       help="FAISS retrieval strength 0..1 (input-side feature "
+                            "blend). Overrides the profile's index_rate; default: "
+                            "the profile's value (0 without a profile).")
     voice.add_argument("--pitch", type=int, default=None, metavar="SEMITONES",
                        help="Transpose (变调) in semitones applied to the input "
                             "F0 before conversion -- THE main creative knob. A "
@@ -225,17 +232,22 @@ def _load_config(path: str) -> AudioRuntimeConfig:
 def _apply_device_overrides(
     config: AudioRuntimeConfig, args: argparse.Namespace
 ) -> AudioRuntimeConfig:
-    in_sub = args.input_device if args.input_device is not None else config.input_device_substring
-    out_sub = args.output_device or config.output_device_substring
+    # Symmetric None-handling for both sides ("" normalises to "unset", like
+    # _load_config); dataclasses.replace so future config fields survive.
+    in_sub = (
+        (str(args.input_device) if args.input_device else None)
+        if args.input_device is not None else config.input_device_substring
+    )
+    out_sub = (
+        str(args.output_device)
+        if args.output_device else config.output_device_substring
+    )
     if in_sub == config.input_device_substring and out_sub == config.output_device_substring:
         return config
-    return AudioRuntimeConfig(
-        sample_rate=config.sample_rate,
-        block_size=config.block_size,
-        channels=config.channels,
+    return dataclasses.replace(
+        config,
         input_device_substring=in_sub,
         output_device_substring=out_sub,
-        queue_blocks=config.queue_blocks,
     )
 
 
@@ -338,7 +350,9 @@ def _run_direct(args, config, model_path, profile, pick) -> int:
     from .audio.streaming_stream import run_streaming_stream
     from .engine.model_profile import find_default_index, models_root_for
 
-    index_rate = float(pick("index_rate", 0.0))
+    index_rate = float(
+        args.index_rate if args.index_rate is not None else pick("index_rate", 0.0)
+    )
     # Only load the index if it actually contributes (index_rate > 0). The path
     # is the explicit CLI/profile index, else the .pth's own default .index
     # (same-stem first, else first; recursive under models/).
@@ -347,6 +361,13 @@ def _run_direct(args, config, model_path, profile, pick) -> int:
                       or find_default_index(model_path, models_root_for(model_path)))
     else:
         index_path = ""
+        if args.index_path:
+            # An explicit flag that would otherwise be silently inert.
+            print(
+                "note: --index-path is ignored because the effective index_rate "
+                "is 0; pass --index-rate R (0..1) to enable retrieval.",
+                file=sys.stderr,
+            )
     pitch_shift = args.pitch if args.pitch is not None else int(pick("pitch_shift", 0))
 
     # INPUT-side formant / gender: CLI overrides the profile; enable when either
@@ -383,6 +404,9 @@ def _run_direct(args, config, model_path, profile, pick) -> int:
         proposed_pitch_threshold=float(args.direct_auto_pitch_threshold),
         silence_threshold_dbfs=args.direct_silence_dbfs,
         silence_hangover_ms=float(args.direct_silence_hangover_ms),
+        # Seed the auto-center target from the profile like the GUI does
+        # (auto_center itself stays OFF; this only parks the per-model target).
+        auto_center_target_hz=float(pick("target_f0_median", 0.0) or 0.0),
         device=args.device,
     )
     print(f"voice params (direct): pitch={scfg.pitch_shift:+d}  index_rate={scfg.index_rate}  "

@@ -36,6 +36,18 @@ def test_parser_accepts_model_and_index_path():
     assert args.index_path == "models/local/x.index"
 
 
+def test_parser_accepts_index_rate():
+    """--index-rate makes --index-path actually usable in quick-run mode
+    (without it the effective rate defaulted to 0 and the path was inert)."""
+    args = _build_parser().parse_args([
+        "--config", CONFIG, "--model-path", "x.pth", "--index-rate", "0.3",
+    ])
+    assert args.index_rate == pytest.approx(0.3)
+    # default: None -> fall back to the profile's value
+    args = _build_parser().parse_args(["--config", CONFIG, "--model-path", "x.pth"])
+    assert args.index_rate is None
+
+
 # ---------------------------------------------------------------------------
 # Parser: engineering-knob defaults (no voice-shaping flags exist)
 # ---------------------------------------------------------------------------
@@ -114,11 +126,12 @@ def test_parser_accepts_pitch():
 
 def test_parser_has_no_output_shaping_flags():
     """Still a faithful carrier on the OUTPUT — no --mode, --crossfade-ms,
-    --frame-restore-method, --index-rate, --f0-method. (--pitch is allowed: it
-    is input-F0 conditioning, the essential transpose, not output shaping.)"""
+    --frame-restore-method, --f0-method, --rms-mix-rate. (--pitch and
+    --index-rate are allowed: input-side conditioning — F0 transpose and the
+    FAISS feature blend — not output shaping; offline_infer has the same pair.)"""
     parser = _build_parser()
     for bad in ("--mode", "--crossfade-ms", "--frame-restore-method",
-                "--index-rate", "--f0-method", "--rms-mix-rate"):
+                "--f0-method", "--rms-mix-rate"):
         with pytest.raises(SystemExit):
             parser.parse_args([bad, "x"])
 
@@ -147,3 +160,25 @@ def test_apply_device_overrides_noop_returns_same_object():
     args = _build_parser().parse_args(["--config", CONFIG])
     merged = _apply_device_overrides(base, args)
     assert merged is base
+
+
+def test_apply_device_overrides_preserves_other_fields():
+    """dataclasses.replace semantics: fields the override doesn't name (e.g.
+    monitor_device_substring) must survive the merge."""
+    base = AudioRuntimeConfig(monitor_device_substring="Headphones", queue_blocks=99)
+    args = _build_parser().parse_args(["--config", CONFIG, "--input-device", "Realtek"])
+    merged = _apply_device_overrides(base, args)
+    assert merged.input_device_substring == "Realtek"
+    assert merged.monitor_device_substring == "Headphones"
+    assert merged.queue_blocks == 99
+
+
+def test_apply_device_overrides_empty_strings_are_symmetric():
+    """--input-device '' and --output-device '' both mean 'unset/keep default'
+    (the old code treated them asymmetrically)."""
+    base = AudioRuntimeConfig(input_device_substring="OldMic")
+    args = _build_parser().parse_args(["--config", CONFIG,
+                                       "--input-device", "", "--output-device", ""])
+    merged = _apply_device_overrides(base, args)
+    assert merged.input_device_substring is None         # "" -> unset
+    assert merged.output_device_substring == "CABLE Input"

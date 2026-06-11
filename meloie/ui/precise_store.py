@@ -6,37 +6,32 @@ so the user can reload a mapping later WITHOUT re-picking the two .wav files and
 re-running the (multi-second) build. The quantiles ARE the map — loading them is
 instant and needs no estimator, so a saved map can be applied even before Start.
 
-Pure: json + numpy only, no Qt — unit-testable in isolation. The backend lists /
-saves / loads through here; the engine attaches the quantiles via set_precise_mapping.
+Pure: json + numpy (+ the Qt-free ``config_assembly.safe_filename``), no Qt —
+unit-testable in isolation. The backend lists / saves / loads through here; the
+engine attaches the quantiles via set_precise_mapping.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any, Dict, List
 
 import numpy as np
 
 from ..app_paths import app_base_dir
+from .config_assembly import safe_filename
 # next to the .exe when frozen (writable), else the source root — saved maps are
 # read AND written at runtime, so never inside the read-only bundle.
 RVC_ROOT = app_base_dir()
 PRECISE_DIR = os.path.join(RVC_ROOT, "config", "precise_maps")
-
-_BAD = re.compile(r'[<>:"/\\|?*]+')        # illegal Windows filename chars (mirror mergeModels)
-
-
-def _safe_name(name: str) -> str:
-    return _BAD.sub("_", (name or "").strip()) or "mapping"
 
 
 def save_precise_map(name, method, voice_name, target_name, src_q, tgt_q,
                      maps_dir: str = PRECISE_DIR) -> str:
     """Write a saved map to ``maps_dir/<sanitized name>.json`` (overwriting a same-name
     file) and return its path. ``src_q``/``tgt_q`` are stored as plain float lists."""
-    safe = _safe_name(name)
+    safe = safe_filename(name, "mapping")
     path = os.path.join(maps_dir, safe + ".json")
     payload = {
         "name": (name or "").strip() or safe,

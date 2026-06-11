@@ -2,11 +2,15 @@
 
 Exercises the validation + bookkeeping (strength normalization, architecture
 compatibility, enc_q exclusion, metadata carry-over) on fabricated checkpoint
-dicts whose "tensors" are plain objects. The actual tensor blend (blend_weights,
-which imports torch) is covered by the .venv-applio smoke, not here.
+dicts whose "tensors" are plain objects, plus the shared profile writer
+(write_merge_profile, pure json). The actual tensor blend (blend_weights) and
+save+integrity check (save_merged_checkpoint) import torch and are covered by
+the .venv-applio smoke / their CLI+GUI callers, not here.
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 
@@ -18,6 +22,7 @@ from meloie.engine.model_merge import (
     checkpoint_meta,
     normalize_strengths,
     weight_dict,
+    write_merge_profile,
 )
 
 
@@ -127,6 +132,37 @@ def test_blend_weights_rejects_asymmetric_keys():
     # a key present ONLY in a later model must raise, not be silently dropped
     with pytest.raises(MergeError):
         blend_weights([{"a": object()}, {"a": object(), "b": object()}], [0.5, 0.5])
+
+
+# ---- write_merge_profile (shared CLI/GUI profile writer; pure json) ----
+
+def test_write_merge_profile_shape(tmp_path):
+    p = tmp_path / "profiles" / "AB.json"     # parent dir is created
+    write_merge_profile(str(p), name="A+B", model_path="models/AB.pth",
+                        f0_method="fcpe", index_rate=0.0, pitch_shift=12,
+                        notes="merged in GUI; index_rate 0 (no shared index).")
+    d = json.loads(p.read_text(encoding="utf-8"))
+    assert d == {
+        "name": "A+B",
+        "model_path": "models/AB.pth",
+        "f0_method": "fcpe",
+        "index_rate": 0.0,
+        "pitch_shift": 12,
+        "notes": "merged in GUI; index_rate 0 (no shared index).",
+    }
+
+
+def test_write_merge_profile_loads_via_strict_loader(tmp_path):
+    # the written shape must be exactly what the strict ModelProfile loader
+    # (rejects unknown keys) accepts — pins the CLI/GUI profile contract.
+    from meloie.engine.model_profile import load_model_profile
+    p = tmp_path / "M.json"
+    write_merge_profile(str(p), name="M", model_path="models/M.pth",
+                        f0_method="rmvpe", index_rate=0.0, pitch_shift=0,
+                        notes="merged model; index_rate 0 (no shared index).")
+    prof = load_model_profile(str(p))
+    assert prof.pitch_shift == 0 and prof.index_rate == 0.0
+    assert prof.f0_method == "rmvpe" and prof.model_path == "models/M.pth"
 
 
 # ---- build_merged_checkpoint ----
