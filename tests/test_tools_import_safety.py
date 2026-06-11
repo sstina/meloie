@@ -47,3 +47,11 @@ def test_importing_offline_infer_is_lazy(monkeypatch):
 
 def test_importing_merge_models_is_lazy(monkeypatch):
     _import_under_trip_wire("tools.merge_models", monkeypatch)
+
+
+def test_importing_analyze_model_f0_is_lazy(monkeypatch):
+    _import_under_trip_wire("tools.analyze_model_f0", monkeypatch)
+
+
+def test_importing_measure_formant_is_lazy(monkeypatch):
+    _import_under_trip_wire("tools.measure_formant", monkeypatch)

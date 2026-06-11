@@ -152,7 +152,7 @@ def _band_stats(activity):
     }
 
 
-def run() -> int:
+def main() -> int:
     import numpy as np
 
     print("=" * 78)
@@ -259,4 +259,4 @@ def run() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main())

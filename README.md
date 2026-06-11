@@ -96,17 +96,20 @@ Voice identity is a JSON file under `config/model_profiles/`
   "name": "A",
   "model_path":  "models/A.pth",
   "index_path":  "models/V2.index",
-  "f0_method": "rmvpe", "index_rate": 0.5, "protect": 0.33,
-  "filter_radius": 3, "rms_mix_rate": 1.0, "pitch_shift": 0, "resample_sr": 0
+  "f0_method": "rmvpe", "index_rate": 0.08, "protect": 0.33,
+  "pitch_shift": 12, "target_f0_median": 200, "formant_timbre": 1.19
 }
 ```
 
-Paths are relative to the directory you run `python -m` from (the project
-root). Place model assets under `models/` (gitignored). The **index is loaded
-only when `index_rate > 0`** — A uses `0.5` so `V2.index` is active; raise it for
-a stronger timbre lock, lower it if it warbles. `pitch_shift=0` is A's default;
-override per run with **`--pitch SEMITONES`** to find what suits your voice (it
-conditions the model's input pitch — not an output pitch-shift).
+(See [`A.json`](config/model_profiles/A.json) for the live values — the file is
+the source of truth.) Paths are relative to the project root. Place model assets
+under `models/` (gitignored); the F0 predictors and the contentvec embedder live
+in `models/predictors/` and `models/embedders/`. The **index is loaded only when
+`index_rate > 0`** — A uses a light `0.08` blend; raise it for a stronger timbre
+lock, lower/zero it if it averages the identity away. `pitch_shift=12` is A's
+default (a high/female-range model needs the carrier F0 lifted into its trained
+range); override per run with **`--pitch SEMITONES`** (it conditions the model's
+input pitch — not an output pitch-shift).
 
 **In the GUI**, the model dropdown lists the `.pth` files in `models/`. Tune the
 carrier knobs live, then click **💾 记住当前** to save the current knobs as that
@@ -226,15 +229,17 @@ python -m pytest -q
 
 Pure tests only — no audio hardware, no GPU, no internet, no model files. The
 RVC stack is faked via duck-typed engines so the suite runs anywhere with
-numpy + pytest. The runtime itself (the direct engine) needs `.venv-applio`.
+numpy + pytest (the GUI-backend tests additionally need PySide6 and skip
+themselves cleanly without it). The runtime itself needs `.venv-applio`.
 
 ## Dependencies
 
-`requirements.txt` lists only `numpy`, `sounddevice`, `pytest`. The v2 RVC stack
-(the vendored **Applio** inference core under `meloie/vendor/applio/`, `torch`+CUDA,
-`torchaudio`, `transformers`, `faiss-cpu`, `torchfcpe`, `noisereduce`, `librosa`,
-`scipy`) is installed once into `.venv-applio` (the runtime venv). All caches/temp
-are redirected into `RVC\.cache` and `RVC\.tmp` by `setup_env_applio.ps1` —
+`requirements.txt` lists only `numpy`, `sounddevice`, `pytest`. The v2 inference
+core is first-party code under `meloie/core/` (internalized from **Applio**, MIT —
+see `meloie/core/NOTICE.md`); its heavy dependencies (`torch`+CUDA, `torchaudio`,
+`transformers`, `faiss-cpu`, `torchfcpe`, `noisereduce`, `librosa`, `scipy`) are
+installed once into `.venv-applio` (the runtime venv). All caches/temp are
+redirected into `RVC\.cache` and `RVC\.tmp` by `setup_env_applio.ps1` —
 nothing is written to the C: drive.
 
 ## Principles

@@ -1,3 +1,8 @@
+# Pure-test dependencies only (the suite fakes the RVC stack).
+# The runtime stack (torch/cu128, transformers, faiss-cpu, torchfcpe, librosa,
+# noisereduce, stftpitchshift, PySide6, ...) is installed once into .venv-applio
+# — see setup_env_applio.ps1 / rvc.md §1. The GUI-backend tests importorskip
+# PySide6, so this minimal set still collects and passes everywhere.
 numpy
 sounddevice
 pytest

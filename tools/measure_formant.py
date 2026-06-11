@@ -84,7 +84,7 @@ def _f1_peak(freqs, P, lo=300.0, hi=1400.0):
     return float(fb[int(np.argmax(eb))]) if len(fb) else float("nan")
 
 
-def run() -> int:
+def main() -> int:
     try:
         from stftpitchshift import StftPitchShift
     except Exception as exc:
@@ -139,4 +139,4 @@ def run() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main())
