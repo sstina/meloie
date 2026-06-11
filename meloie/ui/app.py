@@ -22,8 +22,8 @@ if getattr(sys, "frozen", False):
     _QML_DIR = os.path.join(getattr(sys, "_MEIPASS", _UI_DIR), "meloie", "ui", "qml")
 else:
     _QML_DIR = os.path.join(_UI_DIR, "qml")
-# External data (icon.svg, models/, rvc/, config/) + the CWD the vendored loaders
-# resolve against live next to the .exe when frozen, else at the source root.
+# External data (icon.svg, models/ incl. predictors+embedders, config/) lives
+# next to the .exe when frozen, else at the source root.
 RVC_ROOT = app_base_dir()
 
 
@@ -67,11 +67,11 @@ def _apply_dark_titlebar(window) -> None:
 def _run_selftest(engine, deep: bool = False) -> int:
     """Frozen-build completeness probe (set MELOIE_SELFTEST=1, ideally with
     QT_QPA_PLATFORM=offscreen): verify the QML graph loaded AND the heavy lazy stack
-    is importable in the bundle — torch + the vendored ``rvc`` realtime pipeline (the
-    exact import the engine does at Start) + the key native deps — WITHOUT touching
-    audio. With ``deep`` (MELOIE_SELFTEST=2) it ALSO loads the first discovered model
-    and runs one ``process_block`` on synthetic audio — true end-to-end, no audio
-    hardware. Prints one ``SELFTEST OK|FAIL`` line and returns 0/1."""
+    is importable in the bundle — torch + ``meloie.core.pipeline`` (the exact import
+    the engine does at Start) + the key native deps — WITHOUT touching audio. With
+    ``deep`` (MELOIE_SELFTEST=2) it ALSO loads the first discovered model and runs
+    one ``process_block`` on synthetic audio — true end-to-end, no audio hardware.
+    Prints one ``SELFTEST OK|FAIL`` line and returns 0/1."""
     results: list[str] = []
     ok = True
 
@@ -87,19 +87,8 @@ def _run_selftest(engine, deep: bool = False) -> int:
     probe("qml_root", lambda: None if engine.rootObjects() else (_ for _ in ()).throw(RuntimeError("no root object")))
     probe("torch", lambda: __import__("torch"))
 
-    def _import_vendored_rvc() -> None:
-        # mirror StreamingRvcEngine.load()'s path setup so the import resolves from
-        # source too (frozen: rvc is a bundled package, no sys.path insert needed).
-        import importlib
-        from .. import app_paths as _ap
-        from ..engine import streaming_engine as _se
-        if os.path.isdir(_se.RVC_ROOT) and os.path.abspath(os.getcwd()) != _se.RVC_ROOT:
-            os.chdir(_se.RVC_ROOT)
-        if not _ap.is_frozen() and _se.VENDOR_DIR not in sys.path:
-            sys.path.insert(0, _se.VENDOR_DIR)
-        importlib.import_module("rvc.realtime.pipeline")
-
-    probe("rvc.realtime.pipeline", _import_vendored_rvc)
+    probe("meloie.core.pipeline",
+          lambda: __import__("importlib").import_module("meloie.core.pipeline"))
     for mod in ("faiss", "torchaudio", "torchfcpe", "transformers", "sounddevice", "librosa"):
         probe(mod, lambda m=mod: __import__(m))
 

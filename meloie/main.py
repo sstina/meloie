@@ -27,7 +27,7 @@ persistent-buffer engine (run in .venv-applio). A v1 / 256-dim model is
 rejected at load.
 
 Importing this module must NOT open audio devices and must NOT import
-sounddevice / torch / the vendored Applio stack. Those imports live
+sounddevice / torch / the meloie.core inference stack. Those imports live
 inside the run handler.
 """
 
@@ -123,7 +123,7 @@ def _build_parser() -> argparse.ArgumentParser:
                      choices=["contentvec"],
                      help="Embedder model (HuBERT/ContentVec). Only 'contentvec' is "
                           "staged + verified for v2/768-dim. Staged under "
-                          "RVC/rvc/models/embedders.")
+                          "models/embedders.")
     eng.add_argument("--direct-f0", default=None,
                      choices=["rmvpe", "fcpe"],
                      help="Override the profile's F0 method. The realtime engine backs "

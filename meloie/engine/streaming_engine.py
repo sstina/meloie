@@ -1,4 +1,4 @@
-"""Path-A faithful realtime engine over the vendored Applio inference stack.
+"""Path-A faithful realtime engine over the meloie.core inference stack.
 
 ``StreamingRvcEngine`` owns the streaming STATE a stateless per-chunk engine
 never had: a persistent 16 kHz ``convert_buffer`` plus persistent F0 caches and
@@ -16,18 +16,19 @@ Faithful-carrier contract — this engine carries the model's samples and does O
   * SOLA seam alignment + a short sin² crossfade at the block seam. The crossfade
     is a *seam-only* blend of two renders of the same audio — explicitly sanctioned
     by the user as the one allowed relaxation; it never alters pitch/timbre.
-  * a hard clip to [-1, 1] inside the vendored ``inference()`` — a DAC sample-validity
-    guard (out-of-range samples would wrap/clip downstream anyway), NOT tonal shaping:
-    it is identity for every in-range sample and adds no EQ/limiter/gain/normalize.
-OUTPUT-side colouring is stripped: the output×input-RMS scaling (``change_rms`` /
-volume_envelope), the Pedalboard FX rack, and output-side noise reduction are all
-disabled / never invoked. INPUT-side conditioning (pitch transpose, optional denoise,
-formant/gender, autotune, proposed-pitch, silence gate) IS allowed — it changes *what
-speech* is converted, never the model's voice — and is live-adjustable via ``set_*``.
+  * a hard clip to [-1, 1] inside ``RealtimeVoiceConverter.inference`` — a DAC
+    sample-validity guard (out-of-range samples would wrap/clip downstream anyway),
+    NOT tonal shaping: identity for in-range samples, no EQ/limiter/gain/normalize.
+OUTPUT-side colouring does not exist: the internalized core's ``voice_conversion``
+has NO volume-envelope / FX-board / output-denoise parameters at all (the contract
+is structural, not a pinned-off flag). INPUT-side conditioning (pitch transpose,
+optional denoise, formant/gender, autotune, proposed-pitch, silence gate) IS
+allowed — it changes *what speech* is converted, never the model's voice — and is
+live-adjustable via ``set_*``.
 
-Runs only in ``.venv-applio`` (torch 2.7 + transformers, the vendored Applio stack).
-The vendored package + torch are imported lazily inside :meth:`load` so importing
-this module is cheap and safe elsewhere.
+Runs only in ``.venv-applio`` (torch 2.7 + transformers). meloie.core + torch are
+imported lazily inside :meth:`load` so importing this module is cheap and safe
+elsewhere.
 """
 
 from __future__ import annotations
@@ -35,24 +36,18 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import sys
 import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
 
-# Absolute roots derived from this file: .../RVC/meloie/engine/streaming_engine.py
-_THIS = os.path.abspath(__file__)
-_SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))   # .../RVC (source tree)
-# External data (rvc/models, rvc/configs) lives next to the .exe when frozen, else at
-# the source root -> app_base_dir(). CODE (the vendored `rvc` package) always lives in
-# the source tree (VENDOR_DIR) and, when frozen, is collected into the bundle by
-# meloie.spec so it imports without VENDOR_DIR on sys.path.
-from ..app_paths import app_base_dir, is_frozen
+# External data (models/, config/) lives next to the .exe when frozen, else at
+# the source root -> app_base_dir(). The inference CODE is first-party
+# (meloie.core) and imports normally everywhere, frozen included.
+from ..app_paths import app_base_dir
 RVC_ROOT = app_base_dir()
-VENDOR_DIR = os.path.join(_SOURCE_ROOT, "meloie", "vendor", "applio")        # holds the `rvc` pkg
 
 STREAM_SR_DEFAULT = 48000
 SR16 = 16000
@@ -267,26 +262,21 @@ class StreamingRvcEngine:
     def load(self) -> None:
         if self._loaded:
             return
-        # Applio's loaders resolve model files against CWD ("rvc/models/...") and
-        # capture os.getcwd() at import time. Ensure CWD == RVC_ROOT BEFORE importing
-        # the vendored stack so those relative paths point at RVC/rvc/models/.
+        # Pin CWD to the app root so RELATIVE model/index paths from profiles or
+        # CLI configs ("models/A.pth") resolve against RVC_ROOT regardless of
+        # where the process was launched. (meloie.core itself is CWD-independent:
+        # all its data paths are passed in absolute below.)
         if os.path.abspath(os.getcwd()) != RVC_ROOT:
             os.chdir(RVC_ROOT)
-        # Source run: put the vendored `rvc` pkg on sys.path. Frozen: it is already a
-        # bundled importable package (meloie.spec collects it), and VENDOR_DIR points
-        # inside the bundle's source mirror which must NOT shadow it -> skip the insert.
-        if not is_frozen() and VENDOR_DIR not in sys.path:
-            sys.path.insert(0, VENDOR_DIR)
 
         try:
             import torch
             import torch.nn.functional as F
             import torchaudio.transforms as tat
-            from rvc.realtime.pipeline import create_pipeline
-            from rvc.realtime.utils.torch import circular_write
+            from ..core.pipeline import circular_write, create_pipeline
         except Exception as exc:  # pragma: no cover - env-specific
             raise StreamingEngineError(
-                f"failed to import torch / vendored Applio stack (run in .venv-applio): {exc}"
+                f"failed to import torch / meloie.core stack (run in .venv-applio): {exc}"
             ) from exc
 
         self._torch = torch
@@ -302,23 +292,14 @@ class StreamingRvcEngine:
             except Exception:
                 self._cuda_name = None
 
-        # --- Game-mode device + thread override (zero vendored edit) ----------
-        # The vendored realtime stack reads its device EXCLUSIVELY from the
-        # Config() singleton (pipeline.py: VC.config.device drives net_g, hubert,
-        # BOTH f0 predictors via setup_f0, every tensor/resampler). Config is a
-        # @singleton -> its __init__ runs once per process, so an env var read on a
-        # later reload would be ignored; we mutate the live singleton's .device
-        # directly. This single point switches the whole stack consistently (the
-        # cpu_zero game mode forces CPU; the normal path forces cuda:0 when CUDA is
-        # present) with NO edit to the vendored source. Falls back to CPU when CUDA
-        # is unavailable so a forced "cuda:0" can never break a no-GPU host.
+        # --- Device resolution (game mode: cpu_zero forces CPU) ---------------
+        # meloie.core takes the device as an explicit create_pipeline parameter
+        # (it drives net_g, hubert, both f0 predictors and every tensor), so a
+        # reload switches the whole stack consistently with no global state.
+        # Falls back to CPU when CUDA is unavailable so a requested "cuda" can
+        # never break a no-GPU host.
         want_cpu = str(self.cfg.device).lower().startswith("cpu")
         target_dev = "cpu" if (want_cpu or not torch.cuda.is_available()) else "cuda:0"
-        try:
-            from rvc.configs.config import Config as _VConfig
-            _VConfig().device = target_dev
-        except Exception:
-            pass
 
         # torch intra-op threads are process-wide. On the CPU game path pin them to
         # cpu_threads (a few cores -> the rest of the CPU AND the whole dGPU stay
@@ -340,15 +321,22 @@ class StreamingRvcEngine:
         except Exception:
             pass
 
-        # Preflight: only allow an embedder that is actually staged under
-        # rvc/models/embedders, so an unknown/unstaged name fails with a clear
-        # error instead of a deep KeyError or a surprise mid-run HF download
-        # (the vendored load_embedding would otherwise wget it).
-        emb_dir = os.path.join(RVC_ROOT, "rvc", "models", "embedders", self.cfg.embedder)
-        if not os.path.isdir(emb_dir):
+        # Preflight the staged data so a missing embedder/predictor fails with a
+        # clear error instead of a deep loader error (the core never downloads
+        # anything — offline by contract).
+        emb_dir = os.path.join(RVC_ROOT, "models", "embedders", self.cfg.embedder)
+        for fname in ("pytorch_model.bin", "config.json"):
+            if not os.path.isfile(os.path.join(emb_dir, fname)):
+                raise StreamingEngineError(
+                    f"embedder {self.cfg.embedder!r} is not fully staged under "
+                    f"{emb_dir} (missing {fname}); stage it first or use 'contentvec'."
+                )
+        predictor_dir = os.path.join(RVC_ROOT, "models", "predictors")
+        f0_weight = os.path.join(predictor_dir, f"{self.cfg.f0_method}.pt")
+        if not os.path.isfile(f0_weight):
             raise StreamingEngineError(
-                f"embedder {self.cfg.embedder!r} is not staged under "
-                f"rvc/models/embedders ({emb_dir}); stage it first or use 'contentvec'."
+                f"f0_method {self.cfg.f0_method!r} needs {f0_weight}, which is "
+                "missing; stage it first."
             )
 
         try:
@@ -356,15 +344,16 @@ class StreamingRvcEngine:
                 self.cfg.model_path,
                 self.cfg.index_path or "",
                 self.cfg.f0_method,
-                self.cfg.embedder,
-                None,
+                emb_dir,
                 self.cfg.sid,
+                target_dev,
+                predictor_dir,
             )
         except Exception as exc:
             raise StreamingEngineError(f"create_pipeline failed: {exc}") from exc
 
         # v2-only build: this program runs ONLY v2-series (768-dim) RVC models.
-        # The vendored loader sets `version` from the checkpoint, defaulting to
+        # The core loader sets `version` from the checkpoint, defaulting to
         # 'v1' for a version-less .pth (pipeline.py: cpt.get("version", "v1")).
         # Reject anything that is not v2 HERE -- before any buffers are
         # allocated -- so a v1 / 256-dim model fails loudly with a clear message
@@ -389,7 +378,7 @@ class StreamingRvcEngine:
 
         self._device = self._pipeline.device
         self._resolved_device = "cuda" if str(self._device).startswith("cuda") else "cpu"
-        self._dtype = self._pipeline.dtype          # torch.float32 (Applio realtime)
+        self._dtype = self._pipeline.dtype          # torch.float32 (realtime core)
         self.tgt_sr = int(self._pipeline.tgt_sr)
         self._tat = tat
 
@@ -434,8 +423,8 @@ class StreamingRvcEngine:
 
     @property
     def resolved_precision(self) -> str:
-        # Applio's realtime converter is float32 by design (see pipeline.py dtype).
-        return "fp32 (applio realtime)"
+        # The realtime converter is float32 by design (see core/pipeline.py dtype).
+        return "fp32"
 
     # -------------------------------------------------------------- internals
     def _realloc(self) -> None:
@@ -603,10 +592,8 @@ class StreamingRvcEngine:
         Control-thread only (faiss.read_index can take tens of ms)."""
         if not self._loaded or self._pipeline is None:
             raise StreamingEngineError("engine not loaded; call load() first")
-        from rvc.realtime.pipeline import load_faiss_index
-        index, big_npy = load_faiss_index(
-            str(path or "").strip().strip('"').replace("trained", "added")
-        )
+        from ..core.pipeline import load_faiss_index, normalize_index_path
+        index, big_npy = load_faiss_index(normalize_index_path(path))
         with self._lock:
             self._pipeline.big_npy = big_npy
             self._pipeline.index = index
@@ -766,7 +753,7 @@ class StreamingRvcEngine:
 
     def set_sid(self, sid) -> None:
         """Select the trained speaker (声线) of a multi-speaker model. Live —
-        the vendored pipeline reads ``torch_sid`` fresh per block. Faithful: it
+        the core pipeline reads ``torch_sid`` fresh per block. Faithful: it
         picks among the model's OWN trained voices; it does not reshape output."""
         if not self._loaded or self._pipeline is None:
             raise StreamingEngineError("engine not loaded; call load() first")
@@ -788,7 +775,7 @@ class StreamingRvcEngine:
         Input-side carrier conditioning -- it changes how the carrier's F0 is
         ESTIMATED, never the model's output -> faithful-carrier contract intact.
 
-        The vendored get_f0 reads a COUPLED (f0_method string, f0_model object)
+        The core get_f0 reads a COUPLED (f0_method string, f0_model object)
         pair per block; the swap is published under self._lock and the audio
         worker reads it under the same lock (see _convert), so a block never sees
         a crossed pair. The new predictor is BUILT off the lock (file load); only
@@ -808,7 +795,7 @@ class StreamingRvcEngine:
         # Preflight the predictor weight: RMVPE/FCPE only torch.load this path
         # (no surprise download), so a clean error beats a deep loader error.
         weight = "rmvpe.pt" if method == "rmvpe" else "fcpe.pt"
-        wpath = os.path.join(RVC_ROOT, "rvc", "models", "predictors", weight)
+        wpath = os.path.join(RVC_ROOT, "models", "predictors", weight)
         if not os.path.isfile(wpath):
             raise StreamingEngineError(
                 f"f0_method {method!r} needs {wpath}, which is missing; stage it first."
@@ -924,15 +911,14 @@ class StreamingRvcEngine:
                     else (self._auto_offset if self._auto_center_on else self.pitch_shift)
                 ),
                 index_rate=self.index_rate,
-                p_len=self._convert_feature_size_16k, silence_front=0,
+                p_len=self._convert_feature_size_16k,
                 skip_head=self._skip_head, return_length=self._return_length,
-                protect=self.protect, volume_envelope=1,        # 1 => no change_rms
+                protect=self.protect,
                 f0_autotune=self.f0_autotune and not self._precise_on,
                 f0_autotune_strength=self.f0_autotune_strength,
                 proposed_pitch=self.proposed_pitch and not self._auto_center_on
                 and not self._precise_on,
                 proposed_pitch_threshold=self.proposed_pitch_threshold,
-                reduced_noise=None, board=None,                 # no FX / noise-reduce
                 block_size_16k=self.block_frame_16k,
             )
         # Hold the engine lock across the inference so a concurrent live setter
@@ -941,12 +927,11 @@ class StreamingRvcEngine:
         # inside voice_conversion -- the worker never sees a half-applied change.
         # Uncontended ~100ns/block; a setter waits <= one inference (~45ms). The
         # audio callback runs on a separate thread and is unaffected.
-        # Also swallow stdout during the call: the vendored pipeline
-        # (proposed_pitch's 'calculated pitch offset:') and torchfcpe (a benign
-        # per-block mel range warning when a loud carrier overshoots ±1 after the
-        # 48k->16k resample) print noise every block. Real failures RAISE (-> worker
-        # fallback + metrics); they never print -- so this only hides cosmetic spam,
-        # never an actionable error, and the audio is untouched.
+        # Also swallow stdout during the call: torchfcpe prints a benign per-block
+        # mel range warning when a loud carrier overshoots ±1 after the 48k->16k
+        # resample. Real failures RAISE (-> worker fallback + metrics); they never
+        # print -- so this only hides cosmetic spam, never an actionable error,
+        # and the audio is untouched.
         with self._lock, contextlib.redirect_stdout(io.StringIO()):
             return _call()
 

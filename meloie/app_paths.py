@@ -1,17 +1,17 @@
 """Frozen-aware base-dir + cache-env resolution (Qt-free, stdlib only).
 
 Shared by the engine, UI, and config layers so a PyInstaller ONEDIR build finds its
-EXTERNAL data (``models/``, ``rvc/configs``, ``rvc/models/{predictors,embedders}``,
-``config/``, ``icon.svg``) next to the ``.exe`` instead of inside the bundle.
+EXTERNAL data (``models/`` incl. ``models/{predictors,embedders}``, ``config/``,
+``icon.svg``) next to the ``.exe`` instead of inside the bundle.
 
 * Run from SOURCE: the base dir is the RVC project root (two dirs up from this file).
 * Run FROZEN (``sys.frozen``): the base dir is the folder containing the ``.exe``
   (``dirname(sys.executable)``), where the user stages the external data tree. This
   matches ``config_assembly.models_dir()``'s long-standing frozen branch.
 
-Code (the vendored ``rvc`` package, the QML files) is bundled INSIDE the build and
-resolves by ``__file__`` / by the PyInstaller-collected ``rvc`` package — only the
-external, often-writable data roots route through :func:`app_base_dir`.
+Code (``meloie`` itself, the QML files) is bundled INSIDE the build and resolves by
+``__file__`` — only the external, often-writable data roots route through
+:func:`app_base_dir`.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import os
 import sys
 
 _THIS = os.path.abspath(__file__)
-_SOURCE_ROOT = os.path.dirname(os.path.dirname(_THIS))   # meloie/app_paths.py -> src -> RVC
+_SOURCE_ROOT = os.path.dirname(os.path.dirname(_THIS))   # meloie/app_paths.py -> meloie -> RVC
 
 
 def is_frozen() -> bool:
@@ -29,14 +29,14 @@ def is_frozen() -> bool:
 
 
 def source_root() -> str:
-    """The RVC source tree root (for code/vendor paths shipped with the sources)."""
+    """The RVC source tree root (for code paths shipped with the sources)."""
     return _SOURCE_ROOT
 
 
 def app_base_dir() -> str:
     """External-data root: the folder next to the ``.exe`` when frozen, else the
-    RVC source root. All external data (models/, rvc/{configs,models}, config/,
-    icon.svg) and the CWD the vendored loaders resolve against live here."""
+    RVC source root. All external data (models/ incl. predictors+embedders,
+    config/, icon.svg) lives here; relative profile paths resolve against it."""
     if is_frozen():
         return os.path.dirname(os.path.abspath(sys.executable))
     return _SOURCE_ROOT
