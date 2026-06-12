@@ -16,6 +16,12 @@ Run in .venv-applio:
     . .\\setup_env_applio.ps1
     python tools\\check_qml.py
 
+NOTE (glass / vibrancy): the offscreen platform cannot render ShaderEffectSource
+/ MultiEffect mask textures, so with the vibrancy glass enabled the contrast
+number here UNDERESTIMATES the real composited brightness. This tool remains
+the authoritative LOAD + 0-warning gate; the authoritative CONTRAST gate on
+glass is tools/real_shoot.py --probe (real GPU, blob-parked worst case).
+
 Exit codes: 0 OK / 1 load failure or warnings / 2 contrast below 4.5 for an
 essential text role.
 """
@@ -39,10 +45,22 @@ from meloie.ui.backend import Backend                        # noqa: E402
 
 QML_DIR = os.path.join(RVC, "meloie", "ui", "qml")
 
-# Theme tokens (keep in sync with meloie/ui/qml/Theme.qml).
-TEXT_PRIMARY = QColor("#F1F5F9")
-TEXT_SECOND = QColor("#B7C2CE")
-TEXT_MUTED = QColor("#64748B")
+
+def theme_color(token: str) -> QColor:
+    """Read a color token straight out of Theme.qml — a hardcoded copy here once
+    drifted (#B7C2CE vs the real textSecond #94A3B8) and silently inflated the
+    contrast gate, so the source file is the only allowed source of truth."""
+    import re
+    with open(os.path.join(QML_DIR, "Theme.qml"), encoding="utf-8") as fh:
+        m = re.search(rf'property color {token}:\s*"(#[0-9A-Fa-f]{{6,8}})"', fh.read())
+    if not m:
+        raise RuntimeError(f"Theme.qml token not found: {token}")
+    return QColor(m.group(1))
+
+
+TEXT_PRIMARY = theme_color("textPrimary")
+TEXT_SECOND = theme_color("textSecond")
+TEXT_MUTED = theme_color("textMuted")
 
 N_FRAMES = 5            # spread across the flowing-light drift
 FRAME_SPACING_MS = 450
@@ -63,10 +81,17 @@ def _contrast(fg: QColor, bg: QColor) -> float:
     return (l1 + 0.05) / (l2 + 0.05)
 
 
+def _near(c: QColor, t: QColor, delta: int = 48) -> bool:
+    return (abs(c.red() - t.red()) + abs(c.green() - t.green())
+            + abs(c.blue() - t.blue())) <= delta
+
+
 def _worst_bg_pixel(img):
-    """Brightest BACKGROUND-LIKE pixel: dark (a text/accent pixel is not a
-    background) and locally uniform (excludes text AA edges, where a bright
-    glyph blends into the dark panel and reads as a false mid-gray)."""
+    """Brightest BACKGROUND-LIKE pixel. Text pixels are excluded by COLOR
+    PROXIMITY to the three text tokens (a plain luminance cutoff would also
+    skip a vibrancy-brightened card background — exactly the pixels under
+    test); very bright pixels (accents / level bars / pills) are excluded by a
+    generous luminance ceiling; AA edges by local uniformity."""
     w, h = img.width(), img.height()
     worst = None
     worst_lum = -1.0
@@ -74,8 +99,10 @@ def _worst_bg_pixel(img):
         for x in range(2, w - 2, PIXEL_STEP):
             c = img.pixelColor(x, y)
             lum = _lum(c)
-            if lum > 0.18:                       # bright = text/accent/level bar
+            if lum > 0.30:                       # accent fills / level bars / glyph cores
                 continue
+            if _near(c, TEXT_PRIMARY) or _near(c, TEXT_SECOND) or _near(c, TEXT_MUTED):
+                continue                          # text pixel, not background
             # local uniformity: all 4 neighbors within a small delta
             uniform = True
             for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2)):

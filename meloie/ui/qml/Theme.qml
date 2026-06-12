@@ -31,10 +31,14 @@ QtObject {
     readonly property color resonance: lilac           // 性别/共振 + 融合
     readonly property color input:     coral           // IN 电平 / Stop
 
-    // ---- text (WCAG verified on dark; see plan) ----
-    readonly property color textPrimary: "#F1F5F9"   // 16.9:1 on bgBase
-    readonly property color textSecond:  "#94A3B8"   // 7.2:1  on bgBase
-    readonly property color textMuted:   "#64748B"   // 3.9:1  -> non-essential labels only
+    // ---- text (WCAG gated on the REAL composited glass via real_shoot --probe) ----
+    readonly property color textPrimary: "#F1F5F9"
+    // textSecond is vibrancy-adjusted (2026-06 glass rework): on the brightened
+    // see-through cards the old #94A3B8 maxes out ~3.8:1 on the worst reachable
+    // frame; secondary text on glass must be lighter (same move Apple makes for
+    // secondaryLabel over vibrancy). Hierarchy to textPrimary is preserved.
+    readonly property color textSecond:  "#BCC9D6"
+    readonly property color textMuted:   "#64748B"   // non-essential labels only (by design)
 
     // ---- status ----
     readonly property color success: mint            // 运行/正向 (shares the mint hue)
@@ -50,6 +54,7 @@ QtObject {
     readonly property int s2: 8
     readonly property int s3: 12
     readonly property int s4: 16
+    readonly property int s5: 20      // glass-card interior padding (airier, premium)
 
     // ---- typography ----
     readonly property string fontFamily: "Segoe UI Variable Text"
@@ -78,20 +83,28 @@ QtObject {
     property bool glassEnabled: true
     property string glassQuality: "high"            // "high" | "medium" | "low"
 
-    // Morning Bloom glass (brief §2.3 intent): frosted card that lets the drifting
-    // flowing-light show through. Implementation note: the brief's literal
-    // "white-alpha" fill is rendered here as a SMOKED-glass tint (semi-transparent
-    // dark). On a dark theme this composites identically to "translucent white over the
-    // faint backdrop", but a semi-opaque fill (a) casts a real drop shadow and
-    // (b) occludes its own shadow (no bleed-through), and (c) keeps light text
-    // >=4.5:1 even when a bright blob drifts behind it. Verified via check_qml.
-    readonly property color glassCard:   Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.50)   // normal card
-    readonly property color glassPanelBg:Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.38)   // monitor side panel (thinner -> recedes)
+    // High-transparency smoked glass (2026-06): the card is a LIVE vibrancy
+    // sample of the flowing-light backdrop (saturated + lifted, quality "high"
+    // only) under a translucent smoked tint that thickens toward the bottom
+    // (glass depth), a soft top reflection wash, a lit top edge, and an
+    // analytic RectangularShadow. Every alpha below is GATE-TUNED: the real-GPU
+    // probe (tools/real_shoot.py --probe) holds text >=4.5:1 on the worst
+    // reachable composited frame — tune there, not by eye alone.
+    readonly property bool vibrancy: glassEnabled && glassQuality === "high"
+    readonly property color glassCardTop:    Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.42)
+    readonly property color glassCardBottom: Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.54)
+    readonly property color glassThinTop:    Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.40)
+    readonly property color glassThinBottom: Qt.rgba(bgSurface.r, bgSurface.g, bgSurface.b, 0.52)
     readonly property color glassField:  Qt.rgba(bgElevated.r, bgElevated.g, bgElevated.b, 0.55) // input / combo / small container
     readonly property color groove:      Qt.rgba(1, 1, 1, 0.12)   // slider/meter trough
 
-    readonly property color glassBorder: Qt.rgba(1, 1, 1, 0.10)   // soft hairline (no hard outline)
-    readonly property int glassRadius: 18                         // larger, Apple-smooth corners
+    readonly property color glassBorder: Qt.rgba(1, 1, 1, 0.09)   // soft hairline (no hard outline)
+    readonly property color glassTopGlow: Qt.rgba(1, 1, 1, 0.22)  // 1px lit rim where light meets the top edge
+    readonly property color glassSheen:  Qt.rgba(1, 1, 1, 0.05)   // soft reflection wash peak (top ~35% gradient)
+    readonly property color glassShadow: Qt.rgba(0, 0, 0, 0.38)   // RectangularShadow color
+    readonly property real glassVibSaturation: 0.7                // backdrop chroma x1.7 through the glass
+    readonly property real glassVibBrightness: 0.03               // backdrop lift through the glass (gate-critical)
+    readonly property int glassRadius: 20                         // larger, Apple-smooth corners
     // background flowing-light blur strength (quality-stepped)
     readonly property int glassBlurMax:
         glassQuality === "high" ? 72 : (glassQuality === "medium" ? 48 : 28)

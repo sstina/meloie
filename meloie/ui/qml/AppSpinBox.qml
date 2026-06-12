@@ -60,7 +60,7 @@ SpinBox {
     background: Rectangle {
         implicitWidth: 124
         radius: Theme.radiusMd
-        color: Theme.bgElevated
+        color: Theme.glassEnabled ? Theme.glassField : Theme.bgElevated
         border.width: 1
         border.color: control.activeFocus ? Theme.accent : Theme.hairline
         Behavior on border.color { ColorAnimation { duration: Theme.durFast } }

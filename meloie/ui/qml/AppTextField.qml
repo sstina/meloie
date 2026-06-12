@@ -58,11 +58,11 @@ TextField {
             opacity: visible ? 1.0 : 0.0
             Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
         }
-        // the field itself — same dark fill + radius as AppComboBox
+        // the field itself — same fill + radius as AppComboBox (glass-gated)
         Rectangle {
             anchors.fill: parent
             radius: Theme.radiusMd
-            color: Theme.bgElevated
+            color: Theme.glassEnabled ? Theme.glassField : Theme.bgElevated
             border.width: 1
             border.color: control.activeFocus ? control.accent
                          : (control.hovered ? Qt.rgba(1, 1, 1, 0.18) : Theme.hairline)

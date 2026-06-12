@@ -41,7 +41,9 @@ Button {
         border.color: Theme.hairline
         color: {
             if (control.flat)
-                return control.hovered ? Theme.bgElevated : "transparent";
+                return control.hovered
+                       ? (Theme.glassEnabled ? Qt.rgba(1, 1, 1, 0.07) : Theme.bgElevated)
+                       : "transparent";
             if (!control.enabled) return Theme.bgElevated;
             if (control.pressed)  return Qt.darker(control.accentColor, 1.2);
             return control.hovered ? Qt.lighter(control.accentColor, 1.15) : control.accentColor;

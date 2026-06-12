@@ -178,11 +178,13 @@ ApplicationWindow {
     }
 
     // ===================== flowing-light background =====================
-    AppBackground { anchors.fill: parent }
+    AppBackground { id: appBg; anchors.fill: parent }
 
     // ===================== fixed glass command bar (chrome) =====================
     GlassPanel {
         id: header
+        objectName: "panelHeader"
+        backdrop: appBg
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -284,6 +286,7 @@ ApplicationWindow {
 
             ScrollView {
             id: leftScroll
+            objectName: "leftScroll"
             anchors.fill: parent
             contentWidth: availableWidth
             clip: true
@@ -319,6 +322,8 @@ ApplicationWindow {
 
                 // ---------------- devices ----------------
                 GlassPanel {
+                    objectName: "panelDevices"
+                    backdrop: appBg
                     title: "设备 / Devices"
                     RowLayout {
                         Layout.fillWidth: true
@@ -392,6 +397,8 @@ ApplicationWindow {
 
                 // ---------------- creative (live) ----------------
                 GlassPanel {
+                    objectName: "panelCreative"
+                    backdrop: appBg
                     title: "创意 / Creative（实时）"
                     RowLayout {
                         Layout.fillWidth: true
@@ -491,7 +498,7 @@ ApplicationWindow {
                             font.weight: Theme.fwSemibold; font.letterSpacing: 0.5
                         }
                         Item { Layout.fillWidth: true }
-                        AppSwitch { id: mergeToggle; checked: false }
+                        AppSwitch { id: mergeToggle; objectName: "mergeToggle"; checked: false }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true
@@ -573,6 +580,8 @@ ApplicationWindow {
 
                 // ---------------- advanced (collapsible, live) ----------------
                 GlassPanel {
+                    objectName: "panelAdvanced"
+                    backdrop: appBg
                     RowLayout {
                         Layout.fillWidth: true
                         Label {
@@ -580,7 +589,7 @@ ApplicationWindow {
                             font.family: Theme.fontFamily; font.pixelSize: Theme.fsLabel; font.weight: Theme.fwSemibold; font.letterSpacing: 0.5
                         }
                         Item { Layout.fillWidth: true }
-                        AppSwitch { id: advToggle; checked: false }
+                        AppSwitch { id: advToggle; objectName: "advToggle"; checked: false }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true
@@ -735,6 +744,8 @@ ApplicationWindow {
 
             GlassPanel {
                 id: monitorPanel
+                objectName: "panelMonitor"
+                backdrop: appBg
                 thin: true
                 title: "实时监控 / Monitor"
                 Layout.fillWidth: true
@@ -777,6 +788,8 @@ ApplicationWindow {
             // ---------------- 精确映射 / Precise Mapping（输入端 F0 分布匹配，CDF）----------------
             GlassPanel {
                 id: precisePanel
+                objectName: "panelPrecise"
+                backdrop: appBg
                 title: "精确映射 / Precise Mapping"
                 Layout.fillWidth: true
                 // content-sized + the fillHeight spacer below pins Start to the bottom,

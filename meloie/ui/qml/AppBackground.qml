@@ -19,6 +19,10 @@ import App
 // samples the composited panel background across several animation frames.
 Item {
     id: root
+    objectName: "appBackground"          // probe hook (tools/real_shoot.py --probe)
+    // contrast-probe hook: freeze the drift so the probe can PARK each blob at
+    // its worst reachable position and measure the true worst composited frame.
+    property bool probeFreeze: false
 
     // always-present flat floor (the only thing visible when glass is off)
     Rectangle {
@@ -56,14 +60,19 @@ Item {
         }
 
         Repeater {
+            // op raised from the 0.17–0.22 era (2026-06 glass rework): the
+            // high-transparency vibrancy cards need a LIVING backdrop to show
+            // through. Bounded by the real-GPU contrast gate (real_shoot --probe),
+            // which parks blobs at their reachable extremes — tune op there.
             model: [
-                { hue: Theme.mint,  op: 0.22, x0: -0.18, y0: -0.16, sz: 0.86, ax: 0.05, ay: 0.06, px: 19000, py: 23000 },
-                { hue: Theme.sky,   op: 0.19, x0:  0.60, y0: -0.10, sz: 0.70, ax: 0.06, ay: 0.05, px: 21000, py: 17000 },
-                { hue: Theme.lilac, op: 0.18, x0: -0.12, y0:  0.58, sz: 0.74, ax: 0.05, ay: 0.06, px: 25000, py: 20000 },
-                { hue: Theme.coral, op: 0.17, x0:  0.60, y0:  0.60, sz: 0.66, ax: 0.06, ay: 0.05, px: 18000, py: 24000 }
+                { hue: Theme.mint,  op: 0.28, x0: -0.18, y0: -0.16, sz: 0.86, ax: 0.08, ay: 0.09, px: 19000, py: 23000 },
+                { hue: Theme.sky,   op: 0.26, x0:  0.60, y0: -0.10, sz: 0.70, ax: 0.09, ay: 0.08, px: 21000, py: 17000 },
+                { hue: Theme.lilac, op: 0.25, x0: -0.12, y0:  0.58, sz: 0.74, ax: 0.08, ay: 0.09, px: 25000, py: 20000 },
+                { hue: Theme.coral, op: 0.24, x0:  0.60, y0:  0.60, sz: 0.66, ax: 0.09, ay: 0.08, px: 18000, py: 24000 }
             ]
             delegate: Rectangle {
                 id: blob
+                objectName: "bgBlob"          // probe hook: parked via x/y writes
                 required property var modelData
                 readonly property real bx:   root.width  * modelData.x0
                 readonly property real by:   root.height * modelData.y0
@@ -77,7 +86,7 @@ Item {
                 opacity: modelData.op
 
                 SequentialAnimation on x {
-                    running: Theme.glassEnabled
+                    running: Theme.glassEnabled && !root.probeFreeze
                     loops: Animation.Infinite
                     NumberAnimation { from: blob.bx - blob.ampx; to: blob.bx + blob.ampx
                                       duration: blob.modelData.px; easing.type: Easing.InOutSine }
@@ -85,7 +94,7 @@ Item {
                                       duration: blob.modelData.px; easing.type: Easing.InOutSine }
                 }
                 SequentialAnimation on y {
-                    running: Theme.glassEnabled
+                    running: Theme.glassEnabled && !root.probeFreeze
                     loops: Animation.Infinite
                     NumberAnimation { from: blob.by - blob.ampy; to: blob.by + blob.ampy
                                       duration: blob.modelData.py; easing.type: Easing.InOutSine }

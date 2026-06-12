@@ -45,7 +45,11 @@ ComboBox {
 
     background: Rectangle {
         radius: Theme.radiusMd
-        color: control.pressed ? Theme.bgSurface : Theme.bgElevated
+        // translucent glass field when the glass theme is on (opaque fallback off)
+        color: Theme.glassEnabled
+               ? (control.pressed ? Qt.rgba(Theme.bgSurface.r, Theme.bgSurface.g, Theme.bgSurface.b, 0.65)
+                                  : Theme.glassField)
+               : (control.pressed ? Theme.bgSurface : Theme.bgElevated)
         border.width: 1
         border.color: (control.activeFocus || control.pressed) ? Theme.accent : Theme.hairline
         Behavior on color { ColorAnimation { duration: Theme.durFast } }
