@@ -21,6 +21,25 @@ Files derived from Applio carry a short attribution header pointing here.
 Applio © 2026 AI Hispano, MIT License. https://github.com/IAHispano/Applio
 Vendored 2026-05-30, internalized 2026-06-10.
 
+## Third-party components (transitive lineage)
+
+`meloie/core/` forked from Applio, which itself integrates several upstream
+projects. All are permissively licensed and redistributable here:
+
+- **RMVPE** (F0 estimator — `predictors/rmvpe.py`): Dream-High/RMVPE,
+  **Apache License 2.0**, © the RMVPE authors.
+  https://github.com/Dream-High/RMVPE — redistributed with attribution and a
+  statement of modifications per Apache-2.0 §4 (see the file header).
+- **HiFi-GAN** (vocoder decoders — `synth/hifigan*.py`): jik876/hifi-gan,
+  MIT License, © 2020 Jungil Kong. https://github.com/jik876/hifi-gan
+- **NSF source-filter** (the `SineGenerator` in the NSF decoder): from the
+  RVC / Applio lineage of Xin Wang et al.'s neural source-filter work.
+- **ContentVec** (speech-embedder config under
+  `models/embedders/contentvec/`): auspicious3000/contentvec, MIT License.
+  https://github.com/auspicious3000/contentvec
+
+Weight files (`*.pth`, `*.index`, `rmvpe.pt`) are NOT part of this repository.
+
 ---
 
 MIT License

@@ -34,7 +34,8 @@ The contract distinguishes **output** from **input**:
 - **INPUT (the carrier) may be conditioned before conversion.** This does not
   vary the model's voice, only *what speech* it faithfully converts:
   - **`pitch_shift` (变调)** — transposes the input F0 (a female model driven by a
-    male voice typically needs about **+12**). Model A defaults to `0`.
+    male voice typically needs about **+12**). Model A defaults to `+12` (set in
+    its profile, `config/model_profiles/A.json`).
   - **real-audio context warm-up + look-ahead** for continuity, and
   - **optional input noise reduction** (`--direct-denoise`) so ambient noise is
     not converted into warbly voice. Default off, so a clean mic / soft speech is

@@ -1,6 +1,10 @@
 # Derived from Applio (https://github.com/IAHispano/Applio), MIT License,
-# (c) 2026 AI Hispano. See meloie/core/NOTICE.md. Internalized: dead
-# resample_kernel attrs, commented debug prints and the per-call
+# (c) 2026 AI Hispano. See meloie/core/NOTICE.md. The F0 model graph
+# (DeepUnet + BiGRU + E2E, the unet./cnn./fc. module names, the cents_mapping
+# constant and to_local_average_cents) originates from Dream-High/RMVPE
+# (https://github.com/Dream-High/RMVPE), Apache License 2.0, (c) the RMVPE
+# authors — redistributed here with attribution per Apache-2.0 §4.
+# Modified: dead resample_kernel attrs, commented debug prints and the per-call
 # torch.cuda.empty_cache() removed (the latter forced an allocator flush every
 # block for no benefit); everything else verbatim — the unet./cnn./fc. module
 # names and all constants are pinned by rmvpe.pt.
