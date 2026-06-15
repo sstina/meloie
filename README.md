@@ -15,6 +15,18 @@ default model **A** (`models/A.pth` + `models/V2.index`). A v1 / 256-dim model i
 rejected at load with a clear message. The single realtime engine is the
 **direct** Applio persistent-buffer engine, which runs in `.venv-applio`.
 
+Meloie is a **real-time RVC voice changer** (real-time **Retrieval-based Voice
+Conversion**) for Windows, built to run a trained RVC model *faithfully*. It reuses
+the environment and inference-core lineage of
+[Applio](https://github.com/IAHispano/Applio) as a starting point, then improves on
+the realtime RVC ecosystem in three deliberate ways — a **distribution-level
+(CDF / quantile) F0 mapping** for accurate **male→female** pitch conversion (not
+found in the other realtime RVC changers benchmarked), a **structurally faithful
+output** (the runtime never reshapes the model's voice), and an **identity-first
+realtime engine** (inference off the audio thread, with auto-fallback to your own
+voice on any failure). See [How Meloie compares](#how-meloie-compares) for the
+code-level breakdown.
+
 ## Design stance: a faithful carrier, not a sound-design tool
 
 **The trained model is the voice.** A model bundle is a `.pth` + its `.index`,
@@ -242,6 +254,62 @@ see `meloie/core/NOTICE.md`); its heavy dependencies (`torch`+CUDA, `torchaudio`
 installed once into `.venv-applio` (the runtime venv). All caches/temp are
 redirected into `RVC\.cache` and `RVC\.tmp` by `setup_env_applio.ps1` —
 nothing is written to the C: drive.
+
+## How Meloie compares
+
+Meloie began as a faithful-RVC runtime on top of
+[Applio](https://github.com/IAHispano/Applio)'s inference core, and was shaped by a
+**code-level cross-audit** of the major open-source voice-conversion projects (state
+as of 2026-06): Applio, [w-okada/voice-changer](https://github.com/w-okada/voice-changer),
+codename-rvc-fork, [seed-vc](https://github.com/Plachtaa/seed-vc), RT-VC, and the
+BigVGAN vocoder. It keeps what they get right — the SOLA + sin² seam-crossfade
+chunk-streaming lineage — and tightens three things they don't:
+
+1. **Distribution-level F0 mapping (the headline feature).** Every other RVC changer
+   maps pitch with a single scalar transpose (`f0 *= 2**(key/12)`), at best plus a
+   median-center or autotune-to-scale. A scalar shift moves the *median* but cannot
+   fix the *spread and shape* of the pitch distribution — a core reason male→female
+   conversion sounds off. Meloie instead builds the empirical **CDF** of your own
+   voice and of the target model's voice, then quantile-maps your whole F0
+   distribution onto the target's in the log2(Hz) domain
+   ([meloie/engine/f0_map.py](meloie/engine/f0_map.py)). Across every project audited,
+   none implement distribution / quantile F0 matching — the closest (Applio, seed-vc,
+   RT-VC) only align the median.
+2. **A structurally faithful output.** Realtime RVC changers routinely reshape the
+   *output*: w-okada multiplies the model's audio by the input's loudness
+   (`* sqrt(vol)`); Applio scales the output by the input RMS and applies
+   `change_rms` / peak-normalize. Meloie forbids all output-side shaping at the API
+   level — no `change_rms`, no normalize, no EQ / limiter / denoise / FX
+   (`volume_envelope=1`, `reduced_noise=None`, `board=None`). The model defines the
+   voice; the runtime only carries it. Input-side conditioning (transpose, the CDF
+   map, optional denoise) is allowed because it changes *what speech is converted*,
+   not the model's voice.
+3. **An identity-first realtime engine.** Several changers run heavy GPU inference
+   *inside* the audio callback (w-okada, seed-vc) and emit silence — or tear down the
+   stream — when inference fails. Meloie runs inference on a worker off the audio
+   thread (mic → in-queue → worker → out-queue → output) and, on any failure
+   (CUDA OOM, NaN, model fault), falls back to passing through *your own voice* for
+   that block. The link never goes silent or crashes.
+
+| | F0 mapping | Output | Inference vs. audio thread |
+|---|---|---|---|
+| **Meloie** | **CDF / quantile distribution match** | **no shaping (enforced)** | **off-thread + identity fallback** |
+| Applio (realtime) | scalar + median-center + autotune | input-RMS / `change_rms` | off-process worker; no identity fallback |
+| w-okada/voice-changer | scalar transpose | `* sqrt(input RMS)` | in-callback; no identity fallback |
+| seed-vc (zero-shot) | median-center / none (realtime) | clean (not enforced) | in-callback; no fallback |
+| RT-VC (zero-shot) | scalar median-ratio | clean (synth vocoder) | no shipped realtime loop |
+
+**Credit where due — what the others do better.** Meloie is deliberately narrow
+(quality-first, latency-tolerant, single-model, v2-only, realtime). It does **not**
+try to match Applio and the RVC toolkits' breadth (training, UVR separation, ONNX,
+multi-backend F0, v1+v2); w-okada's model-merging and many SVC backends; seed-vc and
+RT-VC's **zero-shot** cloning (no per-voice model needed); RT-VC's ultra-low latency;
+or BigVGAN's vocoder fidelity. For its focused niche — a *faithful* realtime RVC
+changer with accurate male→female pitch — it aims to be the most correct option, not
+the most feature-rich.
+
+<sub>Comparison based on a code-level reading of each project's then-current source
+(2026-06); "RVC" = Retrieval-based Voice Conversion. Corrections welcome via an issue.</sub>
 
 ## Principles
 
