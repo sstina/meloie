@@ -256,3 +256,12 @@ nothing is written to the C: drive.
 - **No system mutation.** Never changes the Windows default device, app
   settings, registry, PATH, or drivers.
 ```
+
+## License
+
+First-party Meloie code is released under the **MIT License** (see `LICENSE`).
+The inference core under `meloie/core/` is derived from third-party projects
+under their own permissive licenses — **Applio** (MIT), **HiFi-GAN** (MIT),
+**ContentVec** (MIT) and **RMVPE** (Apache-2.0); full attribution is in
+`meloie/core/NOTICE.md`. Trained model weights (`*.pth` / `*.index` / `*.pt`)
+are **not** part of this repository and are not covered by these licenses.

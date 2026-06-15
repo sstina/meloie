@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This MIT license covers the first-party Meloie code. The inference core under
-meloie/core/ is derived from third-party projects under their own permissive
-licenses (Applio/MIT, HiFi-GAN/MIT, ContentVec/MIT, RMVPE/Apache-2.0); see
-meloie/core/NOTICE.md for full attribution. Trained model weights
-(*.pth / *.index / *.pt) are NOT part of this repository and are not covered
-by this license.
